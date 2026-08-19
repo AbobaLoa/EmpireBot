@@ -16,12 +16,42 @@ BUTTONS = [
     "coord_y",
     "search_go",
     "target_center",
-    "attack",
-    "send",
-    "close",
+    "target_attack",
+    "start_attack_confirm",
+    "attack_cancel",
+    "formation_close",
+    "wave_clear",
+    "center_flank",
+    "unit_slot",
+    "unit_slot_second",
+    "picker_max",
+    "picker_max_second",
+    "picker_add",
+    "unit_picker_confirm",
+    "picker_confirm",
+    "picker_cancel",
+    "formation_attack",
+    "feather_option",
+    "gold_option",
+    "travel_confirm",
+    "movement_confirm",
+    "travel_cancel",
 ]
 
-REGIONS = ["commander_number", "march_time", "castle_preview"]
+REGIONS = [
+    "main_castle_coords",
+    "viewport_x",
+    "viewport_y",
+    "commander_number",
+    "formation_units",
+    "formation_tools",
+    "picker_units",
+    "feather_count",
+    "travel_duration",
+    "march_time",
+    "return_timer",
+    "castle_preview",
+]
 
 
 def main() -> None:

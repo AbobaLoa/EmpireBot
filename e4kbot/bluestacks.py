@@ -67,11 +67,13 @@ def find_adb_binary(configured: str = "") -> str | None:
 
 class AdbClient:
     def __init__(self, config: dict[str, Any]) -> None:
+        self.config = config
         bs = config.get("bluestacks") or {}
         self.host = str(bs.get("adb_host") or "127.0.0.1")
         self.ports = [int(p) for p in (bs.get("adb_ports") or [5555, 5556])]
         self.adb = find_adb_binary(str(bs.get("adb_path") or ""))
         self.serial: str | None = None
+        self.display_size: tuple[int, int] = (900, 1600)
 
     def available(self) -> bool:
         return bool(self.adb)
@@ -107,6 +109,8 @@ class AdbClient:
         if not self.serial:
             return ""
         proc = self._run(["-s", self.serial, "shell", command], timeout=timeout)
+        if proc.returncode:
+            logger.debug(f"ADB shell failed: {proc.stderr.strip()}")
         return proc.stdout or ""
 
     def game_running(self, package: str) -> bool:
@@ -121,9 +125,15 @@ class AdbClient:
         return any(hint in blob for hint in GAME_PACKAGE_HINTS)
 
     def tap(self, x: int, y: int) -> None:
-        if not self.serial:
-            raise RuntimeError("ADB не подключён")
-        self.shell(f"input tap {int(x)} {int(y)}")
+        if self.serial:
+            proc = self._run(
+                ["-s", self.serial, "shell", "input", "tap", str(int(x)), str(int(y))],
+                timeout=8,
+            )
+            if proc.returncode == 0:
+                return
+            logger.debug(f"ADB tap unavailable, using window click: {proc.stderr.strip()}")
+        click_game_window(self.config, int(x), int(y), self.display_size)
 
     def text(self, value: str) -> None:
         if not self.serial:
@@ -133,6 +143,27 @@ class AdbClient:
 
     def key(self, keycode: int) -> None:
         self.shell(f"input keyevent {int(keycode)}")
+
+    def swipe(self, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 450) -> None:
+        if self.serial:
+            proc = self._run(
+                [
+                    "-s",
+                    self.serial,
+                    "shell",
+                    "input",
+                    "swipe",
+                    str(int(x1)),
+                    str(int(y1)),
+                    str(int(x2)),
+                    str(int(y2)),
+                    str(int(duration_ms)),
+                ],
+                timeout=8,
+            )
+            if proc.returncode == 0:
+                return
+        drag_game_window(self.config, x1, y1, x2, y2, self.display_size, duration_ms)
 
     def screencap(self) -> Image.Image | None:
         if not self.adb or not self.serial:
@@ -144,10 +175,129 @@ class AdbClient:
             )
             from io import BytesIO
 
-            return Image.open(BytesIO(raw)).convert("RGB")
+            image = Image.open(BytesIO(raw)).convert("RGB")
+            self.display_size = image.size
+            return image
         except Exception as exc:
             logger.debug(f"ADB screencap failed: {exc}")
             return None
+
+
+def _render_window(hwnd: int) -> int:
+    """Return the BlueStacks render child instead of its toolbar frame."""
+    try:
+        import win32gui
+
+        children: list[int] = []
+
+        def _cb(child: int, _: Any) -> None:
+            if win32gui.GetClassName(child) == "BlueStacksApp":
+                children.append(child)
+
+        win32gui.EnumChildWindows(hwnd, _cb, None)
+        return children[0] if children else hwnd
+    except Exception:
+        return hwnd
+
+
+def click_game_window(
+    config: dict[str, Any],
+    x: int,
+    y: int,
+    source_size: tuple[int, int],
+) -> None:
+    """Click an Android-space point through the visible BlueStacks window."""
+    import win32api
+    import win32con
+    import win32gui
+
+    hints = (config.get("bluestacks") or {}).get("window_title_hints")
+    window = find_game_window(list(hints) if hints else None)
+    if not window:
+        raise RuntimeError("Окно BlueStacks не найдено для клика")
+    hwnd = _render_window(window[0])
+    px, py, mapping = game_window_point(hwnd, x, y, source_size)
+    logger.debug(
+        "BlueStacks point screenshot=({}, {}) source={} -> screen=({}, {}), "
+        "render_client={} origin={}",
+        x,
+        y,
+        source_size,
+        px,
+        py,
+        mapping["client_size"],
+        mapping["screen_origin"],
+    )
+    win32api.SetCursorPos((px, py))
+    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0)
+    time.sleep(0.06)
+    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0)
+
+
+def game_window_point(
+    hwnd: int,
+    x: int,
+    y: int,
+    source_size: tuple[int, int],
+) -> tuple[int, int, dict[str, tuple[int, int]]]:
+    """Map screenshot pixels to the render child's client rectangle."""
+    import win32gui
+
+    left, top, right, bottom = win32gui.GetClientRect(hwnd)
+    width, height = right - left, bottom - top
+    if width < 50 or height < 50:
+        raise RuntimeError("Окно BlueStacks свёрнуто")
+    screen_left, screen_top = win32gui.ClientToScreen(hwnd, (left, top))
+    src_w, src_h = source_size
+    sx = max(0, min(src_w - 1, int(x)))
+    sy = max(0, min(src_h - 1, int(y)))
+    px = screen_left + round(sx * width / src_w)
+    py = screen_top + round(sy * height / src_h)
+    return px, py, {
+        "client_size": (width, height),
+        "screen_origin": (screen_left, screen_top),
+    }
+
+
+def drag_game_window(
+    config: dict[str, Any],
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    source_size: tuple[int, int],
+    duration_ms: int = 450,
+) -> None:
+    import win32api
+    import win32con
+    import win32gui
+
+    hints = (config.get("bluestacks") or {}).get("window_title_hints")
+    window = find_game_window(list(hints) if hints else None)
+    if not window:
+        raise RuntimeError("Окно BlueStacks не найдено для жеста")
+    hwnd = _render_window(window[0])
+    left, top, right, bottom = win32gui.GetClientRect(hwnd)
+    width, height = right - left, bottom - top
+    screen_left, screen_top = win32gui.ClientToScreen(hwnd, (left, top))
+    src_w, src_h = source_size
+
+    def point(x: int, y: int) -> tuple[int, int]:
+        return (
+            screen_left + round(x * width / src_w),
+            screen_top + round(y * height / src_h),
+        )
+
+    start, finish = point(x1, y1), point(x2, y2)
+    win32api.SetCursorPos(start)
+    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0)
+    steps = max(4, int(duration_ms / 40))
+    for index in range(1, steps + 1):
+        nx = round(start[0] + (finish[0] - start[0]) * index / steps)
+        ny = round(start[1] + (finish[1] - start[1]) * index / steps)
+        win32api.SetCursorPos((nx, ny))
+        time.sleep(duration_ms / steps / 1000)
+    win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0)
 
 
 def _window_enum() -> list[tuple[int, str]]:

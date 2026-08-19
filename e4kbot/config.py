@@ -60,6 +60,7 @@ DEFAULTS: dict[str, Any] = {
         "horses_type": -1,
         "use_feathers": True,
         "feathers_percent": 1,
+        "gold_fallback_when_no_feathers": True,
     },
     "event_attacks": {
         "use_currency_boost": True,
@@ -78,6 +79,16 @@ DEFAULTS: dict[str, Any] = {
         "package": "air.com.goodgamestudios.empirefourkingdoms",
         "layout": "default",
         "center_jitter": 0.06,
+    },
+    "vision": {
+        "robber_threshold": 0.65,
+        "screen_timeout_seconds": 8,
+        "popup_retries": 4,
+        "map_anchor": [0.50, 0.54],
+        "map_coordinate_scale": [0.044, 0.044],
+        "picker_timeout_seconds": 15,
+        "picker_max_actions": 4,
+        "minimum_flank_fill": 0.70,
     },
     "telegram": {
         "enabled": False,
