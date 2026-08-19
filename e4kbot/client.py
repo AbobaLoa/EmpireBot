@@ -20,15 +20,19 @@ from e4kbot.vision import (
     crop_rel,
     find_picker_cards,
     find_picker_confirm_button,
+    find_formation_unit_slots,
+    formation_wave_diagnostics,
     find_main_castle_marker,
     find_robber_candidates,
     find_target_attack_button,
     flank_fill_allowed,
+    generic_modal_diagnostics,
     is_formation_screen,
     is_burning_candidate,
     is_map_screen,
     is_travel_dialog,
     movement_confirm_diagnostics,
+    no_commanders_diagnostics,
     ocr_text,
     parse_count,
     parse_coordinate_pair,
@@ -100,6 +104,12 @@ class BlueStacksEngine:
         self.layout = load_layout(str((config.get("bluestacks") or {}).get("layout") or "default"))
         self._next_commander = 1
         self._selected_target_coords: tuple[int, int] | None = None
+        self._last_open_error = ""
+        self._blocked_screen_targets: list[tuple[int, int, float, float]] = []
+        self._selection_viewport: tuple[int, int] | None = None
+
+    def _vision_delay(self, key: str, default: float) -> float:
+        return float((self.config.get("vision") or {}).get(key) or default)
 
     def _size(self) -> tuple[int, int]:
         image = capture_game_image(self.config, self.adb)
@@ -116,13 +126,13 @@ class BlueStacksEngine:
         x, y = _abs_point(size, [nx, ny])
         jx, jy = tap_jitter(5)
         self.adb.tap(x + jx, y + jy)
-        time.sleep(random.uniform(0.25, 0.7))
+        time.sleep(self._vision_delay("click_settle_seconds", 0.12))
 
     def _tap_norm_exact(self, nx: float, ny: float) -> None:
         size = self._size()
         x, y = _abs_point(size, [nx, ny])
         self.adb.tap(x, y)
-        time.sleep(0.5)
+        time.sleep(self._vision_delay("click_settle_seconds", 0.12))
 
     def diagnose_unit_picker_confirm(self, click: bool = False) -> tuple[bool, str, Any | None]:
         """Detect/annotate picker confirmation; detection-only unless click=True."""
@@ -155,11 +165,11 @@ class BlueStacksEngine:
         if not click:
             return True, "diagnostic_only", image
         self._tap_norm_exact(*point)
-        after = self._wait_for(self._is_plain_formation, timeout=5)
+        after = self._wait_for(self._is_plain_formation, timeout=3.5)
         if after is None or is_map_screen(self._image()):
             save_shot(self._image(), "unit-picker-confirm-transition-failed.png")
             return False, "unit_picker_confirm_transition_failed", None
-        units = self._read_ratio_from_image(after, "formation_units")
+        units = self._formation_ratio_from_image(after, tools=False)
         if not units or units[0] <= 0:
             save_shot(after, "unit-picker-confirm-fill-not-retained.png")
             return False, "unit_picker_fill_not_retained", None
@@ -204,6 +214,58 @@ class BlueStacksEngine:
             return False, "movement_confirm_transition_failed", None
         save_shot(after, "movement-confirm-after.png")
         return True, "confirmed", after
+
+    def _handle_no_commanders(self, image: Any) -> bool:
+        diagnostic = no_commanders_diagnostics(image)
+        if not diagnostic["valid"] or diagnostic["point"] is None:
+            return False
+        annotated = image.copy()
+        draw = ImageDraw.Draw(annotated)
+        x, y = _abs_point(image.size, diagnostic["point"])
+        draw.ellipse((x - 25, y - 25, x + 25, y + 25), outline=(255, 0, 0), width=6)
+        save_shot(annotated, "no-commanders-close.png")
+        self._tap_norm_exact(*diagnostic["point"])
+        closed = self._wait_for(
+            lambda fresh: not no_commanders_diagnostics(fresh)["valid"],
+            timeout=4,
+        )
+        if closed is None:
+            save_shot(self._image(), "no-commanders-close-failed.png")
+            return False
+        message = "Военачальники закончились"
+        returns = [march.return_at for march in self.store.in_flight() if march.return_at > time.time()]
+        self.store.live.stopped_reason = message
+        if returns:
+            self.store.live.next_attack_at = min(returns)
+        self.store.save()
+        self.telegram.report_status(message)
+        self._last_open_error = "no_commanders"
+        return True
+
+    def _recover_unexpected_modal(self, image: Any) -> bool:
+        diagnostic = generic_modal_diagnostics(image)
+        if not diagnostic["valid"] or diagnostic["point"] is None:
+            return False
+        annotated = image.copy()
+        draw = ImageDraw.Draw(annotated)
+        left, top, right, bottom = diagnostic["modal_bounds"]
+        draw.rectangle(
+            (left * image.width, top * image.height, right * image.width, bottom * image.height),
+            outline=(255, 210, 0),
+            width=4,
+        )
+        x, y = _abs_point(image.size, diagnostic["point"])
+        draw.ellipse((x - 24, y - 24, x + 24, y + 24), outline=(255, 0, 0), width=5)
+        save_shot(annotated, "unexpected-modal-action.png")
+        self._tap_norm_exact(*diagnostic["point"])
+        disappeared = self._wait_for(
+            lambda fresh: not generic_modal_diagnostics(fresh)["valid"],
+            timeout=4,
+        )
+        if disappeared is None:
+            save_shot(self._image(), "unexpected-modal-recovery-failed.png")
+            return False
+        return True
 
     def _swipe_norm(
         self,
@@ -252,7 +314,7 @@ class BlueStacksEngine:
             image = self._image()
             if predicate(image):
                 return image
-            time.sleep(0.35)
+            time.sleep(self._vision_delay("poll_interval_seconds", 0.15))
         return None
 
     def ensure_map(self) -> Any | None:
@@ -279,9 +341,11 @@ class BlueStacksEngine:
             elif is_formation_screen(image):
                 self.tap_rel("formation_close")
             else:
-                action = popup_action(image)
-                if action:
-                    self._tap_norm(*action)
+                if no_commanders_diagnostics(image)["valid"]:
+                    self._handle_no_commanders(image)
+                    return None
+                if self._recover_unexpected_modal(image):
+                    pass
                 else:
                     self.tap_rel("map")
             time.sleep(0.9)
@@ -319,6 +383,14 @@ class BlueStacksEngine:
         cooling = 0
         burning = 0
         for candidate in candidates:
+            if any(
+                viewport_x == vx
+                and viewport_y == vy
+                and (candidate[0] - nx) ** 2 + (candidate[1] - ny) ** 2 < 0.035**2
+                for vx, vy, nx, ny in self._blocked_screen_targets
+            ):
+                cooling += 1
+                continue
             if is_burning_candidate(image, (candidate[0], candidate[1])):
                 burning += 1
                 continue
@@ -359,6 +431,7 @@ class BlueStacksEngine:
             logger.info(f"Все видимые замки на перезарядке: {cooling}")
             return None
         self._selected_target_coords = projected[chosen]
+        self._selection_viewport = (viewport_x, viewport_y)
         logger.info(
             f"Найдено замков разбойников: {len(candidates)}, горят: {burning}, "
             f"на локальной перезарядке: {cooling}; "
@@ -368,6 +441,7 @@ class BlueStacksEngine:
         return chosen
 
     def _open_formation(self, point: tuple[float, float], kind: str) -> bool:
+        self._last_open_error = ""
         self._tap_norm(*point)
         popup = self._wait_for(lambda image: find_target_attack_button(image) is not None, timeout=5)
         if popup is None:
@@ -383,22 +457,64 @@ class BlueStacksEngine:
         target_y = parse_count(ocr_text(crop_rel(popup, y_region), psm=6)) if y_region else None
         if target_x is None or target_y is None:
             return False
+        fresh_popup = self._image()
+        stable_x = parse_count(ocr_text(crop_rel(fresh_popup, x_region), psm=6)) if x_region else None
+        stable_y = parse_count(ocr_text(crop_rel(fresh_popup, y_region), psm=6)) if y_region else None
+        if (stable_x, stable_y) != (target_x, target_y):
+            save_shot(fresh_popup, "target-identity-unstable.png")
+            self._last_open_error = "target_identity_unstable"
+            return False
+        save_shot(fresh_popup, f"target-popup-{target_x}-{target_y}.png")
         self._selected_target_coords = (target_x, target_y)
         kingdom = int((self.config.get("baron_attacks") or {}).get("kingdom", 0))
         if not self.store.target_available(kind, kingdom, target_x, target_y):
             logger.info(f"Цель {target_x}:{target_y} ещё на локальной перезарядке")
+            if self._selection_viewport:
+                self._blocked_screen_targets.append((*self._selection_viewport, *point))
             self.tap_rel("map")
             return False
         attack_point = find_target_attack_button(popup)
         if attack_point is None:
             return False
         self._tap_norm(*attack_point)
-        time.sleep(1.0)
+        time.sleep(self._vision_delay("state_settle_seconds", 0.20))
         self.tap_rel("start_attack_confirm")
-        return self._wait_for(is_formation_screen) is not None
+        deadline = time.time() + self._vision_delay("screen_timeout_seconds", 8)
+        generic_actions = 0
+        generic_limit = int(self._vision_delay("generic_modal_retries", 2))
+        while time.time() < deadline:
+            image = self._image()
+            if is_formation_screen(image):
+                return True
+            if no_commanders_diagnostics(image)["valid"]:
+                self._handle_no_commanders(image)
+                return False
+            if generic_actions < generic_limit and self._recover_unexpected_modal(image):
+                generic_actions += 1
+                continue
+            time.sleep(self._vision_delay("poll_interval_seconds", 0.15))
+        self._last_open_error = "formation_not_found"
+        return False
 
     def _read_ratio(self, key: str) -> tuple[int, int] | None:
         return parse_ratio(self.read_region(key))
+
+    def _formation_ratio_from_image(
+        self,
+        image: Any,
+        tools: bool = False,
+    ) -> tuple[int, int] | None:
+        wave = formation_wave_diagnostics(image)
+        bounds = wave.get("content_bounds")
+        if bounds:
+            _, top, _, bottom = bounds
+            row_bottom = min(bottom, top + 0.075)
+            region = [0.48, top, 0.88, row_bottom] if tools else [0.0, top, 0.48, row_bottom]
+            ratio = parse_ratio(ocr_text(crop_rel(image, region), psm=6))
+            if ratio:
+                return ratio
+        key = "formation_tools" if tools else "formation_units"
+        return self._read_ratio_from_image(image, key)
 
     def _is_plain_formation(self, image: Any) -> bool:
         return is_formation_screen(image) and not find_picker_cards(image)
@@ -453,24 +569,46 @@ class BlueStacksEngine:
     def _prepare_single_center_wave(self) -> tuple[bool, str]:
         # The game opens with an empty first wave and the centre/front selected.
         # Do not touch the clear-wave or flank controls.
-        ratio = self._read_ratio("formation_units")
+        opening = self._image()
+        ratio = self._formation_ratio_from_image(opening)
         if ratio and ratio[0] == ratio[1] and ratio[1] > 0:
-            tools = self._read_ratio("formation_tools")
+            tools = self._formation_ratio_from_image(opening, tools=True)
             return (bool(tools and tools[0] == 0), "tools_not_empty")
 
-        formation = self._image()
+        formation = opening
         max_actions = int((self.config.get("vision") or {}).get("picker_max_actions") or 4)
-        slot_keys = ("unit_slot", "unit_slot_second")[:max_actions]
-        for slot_key in slot_keys:
-            units = self._read_ratio_from_image(formation, "formation_units")
+        for _ in range(max_actions):
+            units = self._formation_ratio_from_image(formation)
             if units and units[0] == units[1]:
                 break
-            self.tap_rel(slot_key)
+            wave = formation_wave_diagnostics(formation)
+            if wave["collapsed"] and wave["expand_point"] is not None:
+                self._tap_norm_exact(*wave["expand_point"])
+                formation = self._wait_for(
+                    lambda image: formation_wave_diagnostics(image)["expanded"],
+                    timeout=4,
+                )
+                if formation is None:
+                    return False, "wave_expand_failed"
+                wave = formation_wave_diagnostics(formation)
+            if not wave["expanded"]:
+                save_shot(formation, "formation-wave-state-unknown.png")
+                return False, "wave_not_expanded"
+            slots = find_formation_unit_slots(formation)
+            if not slots:
+                save_shot(formation, "formation-unit-slot-not-found.png")
+                return False, "unit_slot_not_found"
+            header = wave["first_header"]
+            sx, sy = slots[0]
+            if header and header[0] <= sx <= header[2] and header[1] <= sy <= header[3]:
+                return False, "unit_slot_overlaps_wave_header"
+            self._tap_norm_exact(*slots[0])
             picker = self._wait_for(
                 lambda image: self._read_ratio_from_image(image, "picker_units") is not None,
                 timeout=5,
             )
             if picker is None:
+                save_shot(self._image(), "unit-picker-not-found.png")
                 return False, "unit_picker_not_found"
             picker_ratio = self._read_ratio_from_image(picker, "picker_units")
             if not picker_ratio or picker_ratio[1] <= 0:
@@ -485,8 +623,8 @@ class BlueStacksEngine:
             confirmed, reason, formation = self.diagnose_unit_picker_confirm(click=True)
             if not confirmed or formation is None:
                 return False, reason
-        final_units = self._read_ratio_from_image(formation, "formation_units")
-        final_tools = self._read_ratio_from_image(formation, "formation_tools")
+        final_units = self._formation_ratio_from_image(formation)
+        final_tools = self._formation_ratio_from_image(formation, tools=True)
         if not final_units or final_units[1] <= 0:
             save_shot(formation, "formation-verification-failed.png")
             return False, "center_capacity_not_read"
@@ -575,7 +713,10 @@ class BlueStacksEngine:
             if self._open_formation(point, kind):
                 opened = True
                 break
-            time.sleep(0.8)
+            if self._last_open_error == "no_commanders":
+                logger.warning("Военачальники закончились; пакет атак остановлен")
+                return "no_commanders"
+            time.sleep(self._vision_delay("state_settle_seconds", 0.20))
         if not opened:
             logger.warning("Не открылся экран формирования атаки")
             return "formation_not_found"
@@ -652,6 +793,7 @@ class BlueStacksEngine:
                 self.store.live.last_error = reason
                 self.store.save()
                 return reason
+            logger.info("dry-run: финальная отправка отменена крестиком намеренно")
             self.tap_rel("travel_cancel")
             time.sleep(0.5)
             self.tap_rel("formation_close")

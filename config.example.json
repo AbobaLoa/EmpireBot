@@ -49,7 +49,11 @@
     "map_coordinate_scale": [0.044, 0.044],
     "picker_timeout_seconds": 15,
     "picker_max_actions": 4,
-    "minimum_flank_fill": 0.7
+    "minimum_flank_fill": 0.7,
+    "poll_interval_seconds": 0.15,
+    "click_settle_seconds": 0.12,
+    "state_settle_seconds": 0.2,
+    "generic_modal_retries": 2
   },
   "telegram": {
     "enabled": true,

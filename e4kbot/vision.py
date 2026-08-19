@@ -124,10 +124,11 @@ def is_formation_screen(image: Image.Image) -> bool:
     bgr = _reference_bgr(image)
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     brown = cv2.inRange(hsv[0:940], (3, 45, 20), (30, 255, 180))
-    yellow = cv2.inRange(hsv[880:1040], (15, 90, 120), (45, 255, 255))
+    yellow = cv2.inRange(hsv[980:1210], (15, 80, 105), (45, 255, 255))
+    full_width_band_rows = int(np.count_nonzero(np.mean(yellow > 0, axis=1) > 0.75))
     return (
         float(np.count_nonzero(brown)) / brown.size > 0.18
-        and float(np.count_nonzero(yellow)) / yellow.size > 0.10
+        and full_width_band_rows >= 25
     )
 
 
@@ -179,6 +180,149 @@ def popup_action(image: Image.Image) -> tuple[float, float] | None:
         _, x, y = max(buttons)
         return x / REFERENCE_SIZE[0], y / REFERENCE_SIZE[1]
     return None
+
+
+def no_commanders_diagnostics(
+    image: Image.Image,
+    recognized_text: str | None = None,
+) -> dict[str, Any]:
+    """Find only the top-right red X of a no-commanders modal."""
+    bgr = _reference_bgr(image)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    text = (recognized_text or ocr_text(image, psm=6)).lower().replace("ё", "е")
+    has_commander = any(token in text for token in ("военачаль", "командир"))
+    has_unavailable = any(
+        token in text for token in ("законч", "нет свобод", "недоступ", "занят")
+    )
+    diagnostic: dict[str, Any] = {
+        "point": None,
+        "popup_bounds": None,
+        "red_ratio": 0.0,
+        "text": text,
+        "valid": False,
+    }
+    if not (has_commander and has_unavailable):
+        return diagnostic
+    beige = cv2.inRange(hsv, (8, 15, 105), (40, 180, 255))
+    count, _, stats, _ = cv2.connectedComponentsWithStats(beige)
+    panels: list[tuple[int, int, int, int, int]] = []
+    for index in range(1, count):
+        x, y, width, height, area = (int(value) for value in stats[index])
+        if area > 12000 and width > 0.35 * 900 and height > 0.10 * 1600:
+            panels.append((area, x, y, width, height))
+    if not panels:
+        return diagnostic
+    _, px, py, pw, ph = max(panels)
+    diagnostic["popup_bounds"] = (px / 900, py / 1600, (px + pw) / 900, (py + ph) / 1600)
+    red = cv2.bitwise_or(
+        cv2.inRange(hsv, (0, 120, 70), (12, 255, 255)),
+        cv2.inRange(hsv, (168, 120, 70), (180, 255, 255)),
+    )
+    count, _, stats, centers = cv2.connectedComponentsWithStats(red)
+    candidates: list[tuple[int, float, float, int, int, int, int]] = []
+    for index in range(1, count):
+        x, y, width, height, area = stats[index]
+        cx, cy = centers[index]
+        if (
+            area >= 350
+            and 0.55 < width / max(1, height) < 1.7
+            and px + pw / 2 < cx < px + pw
+            and py <= cy < py + ph / 2
+        ):
+            candidates.append((int(area), float(cx), float(cy), int(x), int(y), int(width), int(height)))
+    if not candidates:
+        return diagnostic
+    _, cx, cy, x, y, width, height = max(candidates)
+    patch = red[y : y + height, x : x + width]
+    diagnostic["red_ratio"] = float(np.count_nonzero(patch)) / patch.size
+    diagnostic["point"] = (cx / 900, cy / 1600)
+    diagnostic["valid"] = diagnostic["red_ratio"] >= 0.20
+    return diagnostic
+
+
+def generic_modal_diagnostics(image: Image.Image) -> dict[str, Any]:
+    """Return one safe modal action, preferring red X over green confirmation."""
+    diagnostic: dict[str, Any] = {
+        "point": None,
+        "action": None,
+        "modal_bounds": None,
+        "valid": False,
+        "excluded": False,
+    }
+    text = ocr_text(image, psm=6).lower().replace("ё", "е")
+    currency_terms = (
+        "купить",
+        "покупк",
+        "предложен",
+        "магазин",
+        "руб",
+        "монет",
+        "зол",
+        "оплат",
+    )
+    if (
+        is_formation_screen(image)
+        or is_travel_dialog(image)
+        or find_picker_cards(image)
+        or find_target_attack_button(image) is not None
+        or movement_confirm_diagnostics(image)["valid"]
+        or any(term in text for term in currency_terms)
+    ):
+        diagnostic["excluded"] = True
+        return diagnostic
+    bgr = _reference_bgr(image)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    beige = cv2.inRange(hsv, (8, 12, 95), (42, 190, 255))
+    count, _, stats, _ = cv2.connectedComponentsWithStats(beige)
+    panels: list[tuple[int, int, int, int, int]] = []
+    for index in range(1, count):
+        x, y, width, height, area = (int(value) for value in stats[index])
+        if (
+            area > 18000
+            and 0.30 * 900 < width < 0.92 * 900
+            and 0.10 * 1600 < height < 0.82 * 1600
+            and 0.04 * 900 < x
+            and x + width < 0.96 * 900
+        ):
+            panels.append((area, x, y, width, height))
+    if not panels:
+        return diagnostic
+    _, px, py, pw, ph = max(panels)
+    diagnostic["modal_bounds"] = (px / 900, py / 1600, (px + pw) / 900, (py + ph) / 1600)
+
+    def components(mask: np.ndarray, color: str) -> list[tuple[int, float, float]]:
+        count, _, stats, centers = cv2.connectedComponentsWithStats(mask)
+        found: list[tuple[int, float, float]] = []
+        for index in range(1, count):
+            x, y, width, height, area = stats[index]
+            cx, cy = centers[index]
+            inside = px < cx < px + pw and py < cy < py + ph
+            if not inside or area < 450:
+                continue
+            if color == "red":
+                valid_position = cx > px + pw / 2 and cy < py + ph / 2
+                valid_shape = 0.55 < width / max(1, height) < 1.8
+            else:
+                valid_position = cx > px + pw / 2 and cy > py + ph / 2
+                valid_shape = width > 1.4 * max(1, height)
+            if valid_position and valid_shape:
+                found.append((int(area), float(cx), float(cy)))
+        return found
+
+    red = cv2.bitwise_or(
+        cv2.inRange(hsv, (0, 120, 75), (12, 255, 255)),
+        cv2.inRange(hsv, (168, 120, 75), (180, 255, 255)),
+    )
+    green = cv2.inRange(hsv, (35, 90, 55), (95, 255, 255))
+    red_actions = components(red, "red")
+    green_actions = components(green, "green")
+    if red_actions:
+        _, x, y = max(red_actions)
+        diagnostic.update(point=(x / 900, y / 1600), action="close", valid=True)
+    elif green_actions:
+        _, x, y = max(green_actions)
+        diagnostic.update(point=(x / 900, y / 1600), action="confirm", valid=True)
+    return diagnostic
 
 
 def find_robber_candidates(
@@ -314,6 +458,77 @@ def find_picker_cards(
             }
         )
     return cards
+
+
+def formation_wave_diagnostics(image: Image.Image) -> dict[str, Any]:
+    """Locate wave headers and distinguish expanded from collapsed content."""
+    bgr = _reference_bgr(image)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    yellow = cv2.inRange(hsv, (15, 80, 105), (45, 255, 255))
+    count, _, stats, _ = cv2.connectedComponentsWithStats(yellow)
+    bands: list[tuple[int, int, int, int, int]] = []
+    for index in range(1, count):
+        x, y, width, height, area = (int(value) for value in stats[index])
+        if width > 0.72 * 900 and 35 < height < 180 and area > 18000:
+            bands.append((y, x, width, height, area))
+    bands.sort()
+    diagnostic: dict[str, Any] = {
+        "expanded": False,
+        "collapsed": False,
+        "first_header": None,
+        "content_bounds": None,
+        "expand_point": None,
+    }
+    if not bands:
+        return diagnostic
+    y, x, width, height, _ = bands[0]
+    diagnostic["first_header"] = (x / 900, y / 1600, (x + width) / 900, (y + height) / 1600)
+    next_y = bands[1][0] if len(bands) > 1 else min(1500, y + 360)
+    gap = next_y - (y + height)
+    diagnostic["expanded"] = gap >= 140
+    diagnostic["collapsed"] = gap < 140
+    if diagnostic["expanded"]:
+        diagnostic["content_bounds"] = (
+            x / 900,
+            (y + height) / 1600,
+            (x + width) / 900,
+            next_y / 1600,
+        )
+    else:
+        diagnostic["expand_point"] = ((x + width - 35) / 900, (y + height / 2) / 1600)
+    return diagnostic
+
+
+def find_formation_unit_slots(image: Image.Image) -> list[tuple[float, float]]:
+    """Find plus slots only inside validated expanded-wave content."""
+    wave = formation_wave_diagnostics(image)
+    if not wave["expanded"] or wave["content_bounds"] is None:
+        return []
+    left, top, right, bottom = wave["content_bounds"]
+    bgr = _reference_bgr(image)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    dark = cv2.inRange(hsv, (0, 0, 0), (35, 255, 105))
+    y1, y2 = round(top * 1600), round(bottom * 1600)
+    x1, x2 = round(left * 900), min(450, round(right * 900))
+    roi = dark[y1:y2, x1:x2]
+    count, _, stats, _ = cv2.connectedComponentsWithStats(roi)
+    points: list[tuple[int, int]] = []
+    for index in range(1, count):
+        x, y, width, height, area = (int(value) for value in stats[index])
+        if area < 260 or not (0.55 < width / max(1, height) < 1.8):
+            continue
+        patch = roi[y : y + height, x : x + width]
+        mid_y, mid_x = height // 2, width // 2
+        row = patch[max(0, mid_y - 4) : min(height, mid_y + 5), :]
+        column = patch[:, max(0, mid_x - 4) : min(width, mid_x + 5)]
+        if np.mean(row > 0) < 0.45 or np.mean(column > 0) < 0.45:
+            continue
+        points.append((x + width // 2 + x1, y + height // 2 + y1))
+    selected: list[tuple[int, int]] = []
+    for point in sorted(points, key=lambda item: (item[1], item[0])):
+        if all((point[0] - px) ** 2 + (point[1] - py) ** 2 > 45**2 for px, py in selected):
+            selected.append(point)
+    return [(x / 900, y / 1600) for x, y in selected[:4]]
 
 
 def find_target_attack_button(

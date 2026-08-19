@@ -17,9 +17,13 @@ from e4kbot.vision import (
     choose_shortest_candidate,
     find_robber_candidates,
     find_picker_confirm_button,
+    find_formation_unit_slots,
+    formation_wave_diagnostics,
+    generic_modal_diagnostics,
     flank_fill_allowed,
     is_burning_candidate,
     movement_confirm_diagnostics,
+    no_commanders_diagnostics,
     ocr_text,
     parse_coordinate_pair,
     parse_ratio,
@@ -149,6 +153,62 @@ class VisionTests(unittest.TestCase):
         self.assertTrue(valid)
         self.assertEqual(reason, "diagnostic_only")
         engine.adb.tap.assert_not_called()
+
+    def test_no_commanders_close_is_top_right_red_only(self) -> None:
+        image = Image.new("RGB", (900, 1600), (45, 30, 20))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((180, 300, 720, 1050), fill=(225, 195, 145))
+        draw.rectangle((620, 320, 700, 400), fill=(210, 25, 20))
+        draw.rectangle((210, 900, 330, 1000), fill=(210, 25, 20))
+        diagnostic = no_commanders_diagnostics(
+            image, "Нет свободных военачальников"
+        )
+        self.assertTrue(diagnostic["valid"])
+        self.assertGreater(diagnostic["point"][0], 0.5)
+        self.assertLess(diagnostic["point"][1], 0.5)
+
+    def test_generic_modal_prefers_red_close_over_green(self) -> None:
+        image = Image.new("RGB", (900, 1600), (40, 25, 20))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((170, 250, 730, 1100), fill=(225, 195, 145))
+        draw.rectangle((630, 275, 705, 350), fill=(210, 25, 20))
+        draw.rectangle((520, 920, 700, 1000), fill=(55, 165, 15))
+        diagnostic = generic_modal_diagnostics(image)
+        self.assertTrue(diagnostic["valid"])
+        self.assertEqual(diagnostic["action"], "close")
+
+    def test_generic_modal_excludes_attack_formation(self) -> None:
+        image = Image.new("RGB", (900, 1600), (105, 65, 35))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((0, 980, 900, 1210), fill=(230, 175, 25))
+        diagnostic = generic_modal_diagnostics(image)
+        self.assertTrue(diagnostic["excluded"])
+        self.assertFalse(diagnostic["valid"])
+
+    def test_transition_polling_is_bounded(self) -> None:
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.config = {"vision": {"poll_interval_seconds": 0.01}}
+        engine._image = Mock(return_value=Image.new("RGB", (10, 10)))
+        self.assertIsNone(engine._wait_for(lambda _: False, timeout=0.04))
+        self.assertLessEqual(engine._image.call_count, 6)
+
+    def test_unit_slot_target_never_overlaps_wave_header(self) -> None:
+        image = Image.new("RGB", (900, 1600), (105, 65, 35))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((0, 1000, 899, 1080), fill=(230, 175, 25))
+        draw.rectangle((0, 1081, 899, 1320), fill=(220, 205, 180))
+        draw.rectangle((0, 1321, 899, 1400), fill=(230, 175, 25))
+        draw.line((35, 1170, 95, 1170), fill=(45, 30, 20), width=18)
+        draw.line((65, 1140, 65, 1200), fill=(45, 30, 20), width=18)
+        wave = formation_wave_diagnostics(image)
+        slots = find_formation_unit_slots(image)
+        self.assertTrue(wave["expanded"])
+        self.assertTrue(slots)
+        header = wave["first_header"]
+        self.assertFalse(
+            header[0] <= slots[0][0] <= header[2]
+            and header[1] <= slots[0][1] <= header[3]
+        )
 
 
 class StateTests(unittest.TestCase):

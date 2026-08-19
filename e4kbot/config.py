@@ -89,6 +89,10 @@ DEFAULTS: dict[str, Any] = {
         "picker_timeout_seconds": 15,
         "picker_max_actions": 4,
         "minimum_flank_fill": 0.70,
+        "poll_interval_seconds": 0.15,
+        "click_settle_seconds": 0.12,
+        "state_settle_seconds": 0.20,
+        "generic_modal_retries": 2,
     },
     "telegram": {
         "enabled": False,
