@@ -1,0 +1,10 @@
+pygge>=1.0.0
+empire_core>=0.1.0
+loguru>=0.7.0
+requests>=2.31.0
+Pillow>=10.0.0
+flask>=3.0.0
+mss>=9.0.0
+pywin32>=306
+pytesseract>=0.3.10
+opencv-python-headless>=4.8.0

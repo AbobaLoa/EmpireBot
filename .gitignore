@@ -1,0 +1,10 @@
+config.json
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.idea/
+logs/
+data/*.json
+shots/
+*.log

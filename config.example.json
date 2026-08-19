@@ -1,0 +1,58 @@
+{
+  "engine": "bluestacks",
+  "dry_run": true,
+  "attack_style": "on_screen",
+  "current_target_kind": "baron",
+  "live_api_allowed": false,
+  "accept_risk": false,
+  "server": "ru1",
+  "platform": "mobile",
+  "require_bluestacks": true,
+  "require_game_running": false,
+  "legacy_bot_path": "C:\\Users\\Dima\\Desktop\\EFK-Sabotage-Bot",
+  "max_concurrent_attacks": 30,
+  "max_commander_number": 30,
+  "attack_delay_seconds": [4, 10],
+  "cycle_pause_seconds": [12, 25],
+  "active_hours": [8, 24],
+  "modes": {
+    "barons": true,
+    "nomads": true,
+    "shogun": true,
+    "prefer_events": true
+  },
+  "baron_attacks": {
+    "kingdom": 0,
+    "npc_type": 2,
+    "min_level": 1,
+    "max_level": -1,
+    "left_capacity": 100,
+    "center_capacity": 150,
+    "right_capacity": 100,
+    "horses_type": -1,
+    "use_feathers": true
+  },
+  "bluestacks": {
+    "adb_host": "127.0.0.1",
+    "adb_ports": [5555, 5556, 5565],
+    "adb_path": "",
+    "window_title_hints": ["BlueStacks", "HD-Player", "Empire"],
+    "package": "air.com.goodgamestudios.empirefourkingdoms",
+    "layout": "default"
+  },
+  "telegram": {
+    "enabled": true,
+    "bot_token": "PUT_E4KMOBILE_BOT_TOKEN_HERE",
+    "chat_id": "-100...",
+    "miniapp_host": "127.0.0.1",
+    "miniapp_port": 8766,
+    "public_webapp_url": ""
+  },
+  "accounts": [
+    {
+      "username": "login",
+      "password": "password",
+      "enabled": true
+    }
+  ]
+}

@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>E4K Attacks</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root {
+      --bg: #12141c;
+      --card: #1c2130;
+      --gold: #e4c27a;
+      --muted: #9aa3b5;
+      --ok: #7dce9a;
+      --warn: #e08b4f;
+      --bad: #e25b5b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", sans-serif;
+      background: radial-gradient(circle at top, #2a2233, var(--bg) 55%);
+      color: #f3f4f8;
+      min-height: 100vh;
+      padding: 16px;
+    }
+    h1 { font-size: 20px; margin: 0 0 12px; color: var(--gold); }
+    .card {
+      background: var(--card);
+      border: 1px solid #3a4158;
+      border-radius: 16px;
+      padding: 14px;
+      margin-bottom: 12px;
+    }
+    .coords { font-size: 22px; font-weight: 700; }
+    .muted { color: var(--muted); font-size: 13px; }
+    .shot {
+      width: 100%;
+      border-radius: 12px;
+      margin-top: 10px;
+      background: #0b0d14;
+      min-height: 140px;
+      object-fit: cover;
+    }
+    .row { display: flex; justify-content: space-between; gap: 8px; margin-top: 8px; }
+    .pill {
+      background: #101522;
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-size: 12px;
+    }
+    .march {
+      border-top: 1px solid #31384c;
+      padding-top: 8px;
+      margin-top: 8px;
+      font-size: 13px;
+    }
+    .ok { color: var(--ok); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+  </style>
+</head>
+<body>
+  <h1>Empire Four Kingdoms</h1>
+  <div class="card">
+    <div class="muted" id="status">загрузка…</div>
+    <div class="coords" id="coords">—</div>
+    <div class="row">
+      <div class="pill">КД атаки: <span id="cd">—</span></div>
+      <div class="pill">В пути: <span id="inflight">0</span>/30</div>
+    </div>
+    <img class="shot" id="shot" alt="Скрин замка" />
+  </div>
+  <div class="card">
+    <div class="muted">Военачальники в походе</div>
+    <div id="marches"></div>
+  </div>
+  <script>
+    const tg = window.Telegram && window.Telegram.WebApp;
+    if (tg) {
+      tg.ready();
+      tg.expand();
+    }
+    function fmt(sec) {
+      sec = Math.max(0, Number(sec) || 0);
+      const m = Math.floor(sec / 60);
+      const s = sec % 60;
+      if (m >= 60) {
+        const h = Math.floor(m / 60);
+        return h + " ч " + (m % 60) + " мин";
+      }
+      return m ? m + " мин " + s + " с" : s + " с";
+    }
+    async function tick() {
+      const res = await fetch("/api/state");
+      const data = await res.json();
+      const status = [];
+      status.push(data.running ? "бот работает" : "бот остановлен");
+      if (data.dry_run) status.push("DRY-RUN");
+      status.push(data.account || "аккаунт не выбран");
+      status.push(data.mode || "idle");
+      if (data.stopped_reason) status.push(data.stopped_reason);
+      document.getElementById("status").textContent = status.join(" · ");
+      document.getElementById("coords").textContent = data.last_coords || "—";
+      document.getElementById("cd").textContent = fmt(data.next_attack_cd_sec);
+      document.getElementById("inflight").textContent = data.in_flight || 0;
+      const shot = document.getElementById("shot");
+      if (data.last_screenshot) {
+        shot.src = "/shots/" + data.last_screenshot.split(/[\\/]/).pop() + "?t=" + Date.now();
+        shot.style.display = "block";
+      } else {
+        shot.style.display = "none";
+      }
+      const box = document.getElementById("marches");
+      const rows = data.marches || [];
+      if (!rows.length) {
+        box.innerHTML = '<div class="muted">Свободных маршей нет</div>';
+        return;
+      }
+      box.innerHTML = rows.map(function (m) {
+        return (
+          '<div class="march">' +
+          "<b>№" + m.commander_no + "</b> · " + m.kind +
+          " · K" + m.kingdom + " (" + m.x + ", " + m.y + ")<br>" +
+          '<span class="ok">до цели ' + fmt(m.arrive_left_sec) + "</span> · " +
+          '<span class="warn">возврат ' + fmt(m.return_left_sec) + "</span>" +
+          "</div>"
+        );
+      }).join("");
+    }
+    tick();
+    setInterval(tick, 1000);
+  </script>
+</body>
+</html>
