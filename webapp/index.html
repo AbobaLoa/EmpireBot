@@ -58,6 +58,29 @@
     .ok { color: var(--ok); }
     .warn { color: var(--warn); }
     .bad { color: var(--bad); }
+    button {
+      width: 100%;
+      border: 0;
+      border-radius: 12px;
+      padding: 14px;
+      font-size: 16px;
+      font-weight: 700;
+      color: #fff;
+      cursor: pointer;
+    }
+    .on { background: #2f6b45; }
+    .off { background: #8a3030; }
+    label { display: block; margin-top: 8px; font-size: 13px; color: var(--muted); }
+    input, select {
+      width: 100%;
+      margin-top: 4px;
+      padding: 8px;
+      border-radius: 8px;
+      border: 1px solid #3a4158;
+      background: #101522;
+      color: #f3f4f8;
+    }
+    .save { background: #3d4a2f; margin-top: 12px; }
   </style>
 </head>
 <body>
@@ -70,6 +93,32 @@
       <div class="pill">В пути: <span id="inflight">0</span>/30</div>
     </div>
     <img class="shot" id="shot" alt="Скрин замка" />
+  </div>
+  <div class="card">
+    <button id="toggle" class="off" type="button">ВЫКЛ</button>
+    <div class="muted" id="hotkeyHint" style="margin-top:8px">Клавиша N сразу отпускает мышь</div>
+    <label>Цель
+      <select id="kind">
+        <option value="baron">Разбойники</option>
+        <option value="nomad">Кочевники</option>
+        <option value="shogun">Сёгун</option>
+      </select>
+    </label>
+    <label>Горячая клавиша
+      <input id="hotkey" maxlength="3" placeholder="N" />
+    </label>
+    <label>Макс. атак в пути
+      <input id="maxConcurrent" type="number" min="1" max="30" />
+    </label>
+    <label>Пауза между атаками, сек
+      <div class="row">
+        <input id="delayMin" type="number" min="1" max="60" />
+        <input id="delayMax" type="number" min="1" max="60" />
+      </div>
+    </label>
+    <label><input id="dryRun" type="checkbox" style="width:auto" /> DRY-RUN</label>
+    <label><input id="feathers" type="checkbox" style="width:auto" /> Перья</label>
+    <button class="save" id="save" type="button">Сохранить настройки</button>
   </div>
   <div class="card">
     <div class="muted">Военачальники в походе</div>
@@ -91,11 +140,51 @@
       }
       return m ? m + " мин " + s + " с" : s + " с";
     }
+    async function loadSettings() {
+      const res = await fetch("/api/settings");
+      const s = await res.json();
+      document.getElementById("kind").value = s.current_target_kind || "baron";
+      document.getElementById("hotkey").value = s.hotkey || "N";
+      document.getElementById("maxConcurrent").value = s.max_concurrent_attacks || 30;
+      document.getElementById("delayMin").value = s.attack_delay_min || 4;
+      document.getElementById("delayMax").value = s.attack_delay_max || 10;
+      document.getElementById("dryRun").checked = !!s.dry_run;
+      document.getElementById("feathers").checked = s.use_feathers !== false;
+    }
+    document.getElementById("toggle").onclick = async function () {
+      await fetch("/api/control", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ toggle: true }),
+      });
+      tick();
+    };
+    document.getElementById("save").onclick = async function () {
+      await fetch("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          current_target_kind: document.getElementById("kind").value,
+          hotkey: document.getElementById("hotkey").value,
+          max_concurrent_attacks: Number(document.getElementById("maxConcurrent").value),
+          attack_delay_min: Number(document.getElementById("delayMin").value),
+          attack_delay_max: Number(document.getElementById("delayMax").value),
+          dry_run: document.getElementById("dryRun").checked,
+          use_feathers: document.getElementById("feathers").checked,
+        }),
+      });
+    };
     async function tick() {
       const res = await fetch("/api/state");
       const data = await res.json();
+      const on = data.enabled !== false && !data.paused;
+      const btn = document.getElementById("toggle");
+      btn.textContent = on ? "ВКЛ — ищет цели" : "ВЫКЛ — мышь свободна";
+      btn.className = on ? "on" : "off";
+      document.getElementById("hotkeyHint").textContent =
+        "Клавиша " + (data.hotkey || "N") + " сразу отпускает мышь";
       const status = [];
-      status.push(data.running ? "бот работает" : "бот остановлен");
+      status.push(data.running ? (on ? "бот работает" : "на паузе") : "бот остановлен");
       if (data.dry_run) status.push("DRY-RUN");
       status.push(data.account || "аккаунт не выбран");
       status.push(data.mode || "idle");
@@ -128,6 +217,7 @@
         );
       }).join("");
     }
+    loadSettings();
     tick();
     setInterval(tick, 1000);
   </script>

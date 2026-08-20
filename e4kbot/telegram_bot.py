@@ -1,10 +1,72 @@
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 from typing import Any
 
 import requests
 from loguru import logger
+
+BARON_THREAD_NAMES = ("барон разбойников", "бароны разбойников", "разбойников")
+
+
+def parse_loot_amounts(text: str) -> tuple[int, int]:
+    """Return (gold, rubies) parsed from an attack-report caption or OCR text."""
+    if not text:
+        return 0, 0
+    gold = _first_amount(
+        text,
+        (
+            r"(?:💰|золото|золот(?:а|о|ом)?|gold)\s*[:=]?\s*([0-9][0-9\s.,]*)\s*([kкmмbб]?)",
+            r"([0-9][0-9\s.,]*)\s*([kкmмbб]?)\s*(?:💰|золото|gold)",
+        ),
+    )
+    rubies = _first_amount(
+        text,
+        (
+            r"(?:💎|рубин(?:ы|ов)?|ruby|rubies)\s*[:=]?\s*([0-9][0-9\s.,]*)\s*([kкmмbб]?)",
+            r"([0-9][0-9\s.,]*)\s*([kкmмbб]?)\s*(?:💎|рубин(?:ы|ов)?|ruby|rubies)",
+        ),
+    )
+    return gold, rubies
+
+
+def _first_amount(text: str, patterns: tuple[str, ...]) -> int:
+    blob = text.replace("\u00a0", " ")
+    for pattern in patterns:
+        match = re.search(pattern, blob, flags=re.IGNORECASE)
+        if match:
+            return _parse_amount(match.group(1), match.group(2) if match.lastindex and match.lastindex >= 2 else "")
+    return 0
+
+
+def _parse_amount(raw: str, suffix: str = "") -> int:
+    compact = re.sub(r"[^\d.,]", "", str(raw or ""))
+    if not compact:
+        return 0
+    if compact.count(",") == 1 and compact.count(".") == 0:
+        compact = compact.replace(",", ".")
+    else:
+        compact = compact.replace(",", "")
+    try:
+        value = float(compact)
+    except ValueError:
+        digits = re.sub(r"\D", "", compact)
+        value = float(digits) if digits else 0.0
+    mark = (suffix or "").lower().replace("к", "k").replace("м", "m").replace("б", "b")
+    if mark == "k":
+        value *= 1_000
+    elif mark == "m":
+        value *= 1_000_000
+    elif mark == "b":
+        value *= 1_000_000_000
+    return int(value)
+
+
+def _thread_name_matches(name: str) -> bool:
+    lowered = (name or "").strip().lower().replace("ё", "е")
+    return any(token in lowered for token in BARON_THREAD_NAMES)
 
 
 class TelegramReporter:
@@ -13,11 +75,29 @@ class TelegramReporter:
         self.token = str(cfg.get("bot_token") or "").strip()
         self.chat_id = str(cfg.get("chat_id") or cfg.get("chat_baron") or "")
         self.public_webapp_url = str(cfg.get("public_webapp_url") or "").strip()
+        self.message_thread_id = self._coerce_thread(
+            cfg.get("message_thread_id", cfg.get("thread_baron", cfg.get("thread_id")))
+        )
         self._base = f"https://api.telegram.org/bot{self.token}"
+
+    @staticmethod
+    def _coerce_thread(raw: Any) -> int | None:
+        if raw in (None, "", 0, "0"):
+            return None
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
 
     @property
     def ready(self) -> bool:
         return self.enabled and bool(self.token) and bool(self.chat_id)
+
+    def _thread_payload(self) -> dict[str, int]:
+        if self.message_thread_id:
+            return {"message_thread_id": int(self.message_thread_id)}
+        return {}
 
     def _post(self, method: str, data: dict | None = None, files: dict | None = None) -> dict[str, Any]:
         if not self.token:
@@ -41,26 +121,46 @@ class TelegramReporter:
         payload = self._post("getMe")
         return payload.get("result") or {}
 
+    def resolve_baron_thread(self) -> int | None:
+        """Keep a configured topic id, otherwise learn it from recent forum messages."""
+        if self.message_thread_id:
+            return self.message_thread_id
+        if not self.token:
+            return None
+        payload = self._post("getUpdates", {"timeout": 0, "allowed_updates": json.dumps(["message"])})
+        for update in reversed(payload.get("result") or []):
+            message = update.get("message") or update.get("channel_post") or {}
+            chat = message.get("chat") or {}
+            if str(chat.get("id") or "") != str(self.chat_id):
+                continue
+            thread_id = message.get("message_thread_id")
+            topic = (message.get("reply_to_message") or {}).get("forum_topic_created") or {}
+            name = str(topic.get("name") or message.get("forum_topic_created", {}).get("name") or "")
+            if thread_id and _thread_name_matches(name):
+                self.message_thread_id = int(thread_id)
+                logger.info("Telegram topic «{}» → thread {}", name, self.message_thread_id)
+                return self.message_thread_id
+        return self.message_thread_id
+
     def send_text(self, text: str) -> bool:
         if not self.ready:
             return False
-        extra: dict[str, Any] = {"chat_id": self.chat_id, "text": text[:4096]}
+        extra: dict[str, Any] = {
+            "chat_id": self.chat_id,
+            "text": text[:4096],
+            **self._thread_payload(),
+        }
         if self.public_webapp_url:
-            extra["reply_markup"] = _webapp_markup(self.public_webapp_url)
-        import json
-
-        if "reply_markup" in extra:
-            extra["reply_markup"] = json.dumps(extra["reply_markup"])
+            extra["reply_markup"] = json.dumps(_webapp_markup(self.public_webapp_url))
         return bool(self._post("sendMessage", extra).get("ok"))
 
     def send_photo(self, image_path: Path, caption: str) -> bool:
         if not self.ready or not image_path.exists():
             return False
-        import json
-
         data: dict[str, Any] = {
             "chat_id": self.chat_id,
             "caption": caption[:1024],
+            **self._thread_payload(),
         }
         if self.public_webapp_url:
             data["reply_markup"] = json.dumps(_webapp_markup(self.public_webapp_url))
@@ -72,8 +172,6 @@ class TelegramReporter:
     def set_menu_button(self) -> None:
         if not self.token or not self.public_webapp_url:
             return
-        import json
-
         self._post(
             "setChatMenuButton",
             {
@@ -100,6 +198,8 @@ class TelegramReporter:
         screenshot: Path | None = None,
         extra: str = "",
         dry_run: bool = False,
+        gold: int = 0,
+        rubies: int = 0,
     ) -> None:
         prefix = "🧪 DRY-RUN" if dry_run else "✅ Атака отправлена"
         kind_ru = {
@@ -109,6 +209,9 @@ class TelegramReporter:
         }.get(kind, kind)
         mins, sec = divmod(max(0, int(one_way_sec)), 60)
         ret_m, ret_s = divmod(max(0, int(return_sec)), 60)
+        parsed_gold, parsed_rubies = parse_loot_amounts(extra)
+        gold = int(gold or parsed_gold)
+        rubies = int(rubies or parsed_rubies)
         text = (
             f"{prefix}\n"
             f"🎮 {account}\n"
@@ -117,6 +220,10 @@ class TelegramReporter:
             f"⏱ До цели: {mins} мин {sec} сек\n"
             f"↩️ Возврат через: {ret_m} мин {ret_s} сек"
         )
+        if gold:
+            text += f"\n💰 Золото: {gold}"
+        if rubies:
+            text += f"\n💎 Рубины: {rubies}"
         if extra:
             text += f"\n{extra}"
         if screenshot and screenshot.exists():
@@ -129,6 +236,21 @@ class TelegramReporter:
 
     def report_status(self, text: str) -> None:
         self.send_text(text)
+
+    def report_shutdown_summary(
+        self,
+        attacks: int,
+        gold: int,
+        rubies: int,
+        reason: str = "BlueStacks не найден 5 раз подряд",
+    ) -> None:
+        self.send_text(
+            "⛔ Бот остановлен\n"
+            f"{reason}\n"
+            f"⚔️ Атак отправлено: {int(attacks)}\n"
+            f"💰 Золота: {int(gold)}\n"
+            f"💎 Рубинов: {int(rubies)}"
+        )
 
 
 def _webapp_markup(url: str) -> dict[str, Any]:

@@ -11,10 +11,20 @@ from PIL import Image
 from e4kbot.paths import ROOT
 
 REFERENCE_SIZE = (900, 1600)
+# Right-edge special-offers rail (shop/crown/bag, ruby chest, timed chest).
+OFFER_RAIL_X = 0.82
+SPECIAL_OFFERS_CLOSE_FALLBACK = (0.93, 0.04)
 ROBBER_TEMPLATE = ROOT / "assets" / "robber_castle.png"
 PICKER_MAX_TEMPLATE = ROOT / "assets" / "picker_max.png"
 TARGET_ATTACK_TEMPLATE = ROOT / "assets" / "target_attack.png"
 PICKER_CONFIRM_TEMPLATE = ROOT / "assets" / "picker_confirm.png"
+NO_COMMANDERS_TEMPLATE = ROOT / "assets" / "no_commanders.png"
+SPECIAL_OFFERS_MARKERS = (
+    "спецпредлож",
+    "спецпредл",
+    "specialoffer",
+    "special offer",
+)
 
 
 def crop_rel(image: Image.Image, region: list[float]) -> Image.Image:
@@ -31,6 +41,24 @@ def crop_rel(image: Image.Image, region: list[float]) -> Image.Image:
 
 
 def ocr_text(image: Image.Image, psm: int = 7) -> str:
+    return _ocr_raw(image, psm, "0123456789:/")
+
+
+def ocr_text_ui(image: Image.Image, psm: int = 6) -> str:
+    return _ocr_raw(image, psm, None)
+
+
+def _tessdata_dir() -> Path | None:
+    local = ROOT / "tessdata"
+    if (local / "eng.traineddata").exists():
+        return local
+    system = Path(r"C:\Program Files\Tesseract-OCR\tessdata")
+    if (system / "eng.traineddata").exists():
+        return system
+    return None
+
+
+def _ocr_raw(image: Image.Image, psm: int, whitelist: str | None) -> str:
     try:
         import pytesseract
 
@@ -40,12 +68,192 @@ def ocr_text(image: Image.Image, psm: int = 7) -> str:
         gray = cv2.cvtColor(np.asarray(image.convert("RGB")), cv2.COLOR_RGB2GRAY)
         gray = cv2.resize(gray, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
         gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-        return pytesseract.image_to_string(
-            gray,
-            config=f"--psm {psm} -c tessedit_char_whitelist=0123456789:/",
-        ).strip()
+        tessdata = _tessdata_dir()
+        config = f"--psm {psm}"
+        if whitelist:
+            config += f" -c tessedit_char_whitelist={whitelist}"
+        elif tessdata is not None and (tessdata / "rus.traineddata").exists():
+            config += f' --tessdata-dir "{tessdata.as_posix()}" -l rus+eng'
+        else:
+            config += " -l rus+eng"
+        return pytesseract.image_to_string(gray, config=config).strip()
     except Exception:
         return ""
+
+
+def parse_percent(text: str) -> int | None:
+    match = re.search(r"\+?\s*(\d{1,3})\s*%", text.replace(" ", ""))
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def is_offer_rail_point(nx: float, ny: float | None = None) -> bool:
+    """True for the vertical special-offers rail, not the bottom action bar."""
+    if nx < OFFER_RAIL_X:
+        return False
+    if ny is not None and ny >= 0.90:
+        return False
+    return True
+
+
+def _normalize_ui_text(text: str) -> str:
+    return text.lower().replace("ё", "е").replace("-", "").replace(" ", "")
+
+
+def is_special_offers_screen(
+    image: Image.Image,
+    recognized_text: str | None = None,
+) -> bool:
+    """True only when the «спецпредложения» title is present — never formation/map chrome."""
+    if recognized_text is None:
+        title = crop_rel(image, [0.05, 0.0, 0.95, 0.28])
+        recognized_text = ocr_text_ui(title, psm=6)
+    text = recognized_text.lower().replace("ё", "е")
+    compact = _normalize_ui_text(recognized_text)
+    if any(
+        marker in text or _normalize_ui_text(marker) in compact
+        for marker in SPECIAL_OFFERS_MARKERS
+    ):
+        return True
+    return False
+
+
+def _looks_like_special_offers_overlay(image: Image.Image) -> bool:
+    """Legacy layout hint; must not be used alone — formation has the same title-bar X."""
+    bgr = _reference_bgr(image)
+    hsv = cv2.cvtColor(bgr[180:1180, 70:800], cv2.COLOR_BGR2HSV)
+    green = cv2.inRange(hsv, (30, 45, 35), (95, 255, 255))
+    if float(np.count_nonzero(green)) / max(1, green.size) > 0.16:
+        return False
+    red = find_red_cross_force(
+        image,
+        allow_right_chrome=True,
+        title_bar_only=True,
+    )
+    if red is None:
+        return False
+    return red[0] >= 0.88 and red[1] <= 0.16
+
+
+def special_offers_close_point(image: Image.Image) -> tuple[float, float]:
+    """Close X of the special-offers overlay only — never buy / chest / rail / ruby HUD."""
+    red = find_red_cross_force(
+        image,
+        allow_right_chrome=True,
+        title_bar_only=True,
+    )
+    if red is not None and red[0] >= 0.88 and red[1] <= 0.18:
+        return red
+    return SPECIAL_OFFERS_CLOSE_FALLBACK
+
+
+def find_template_point(
+    image: Image.Image,
+    template_path: Path,
+    threshold: float = 0.62,
+) -> tuple[float, float, float] | None:
+    if not template_path.exists():
+        return None
+    bgr = _reference_bgr(image)
+    template = cv2.imread(str(template_path))
+    if template is None or template.size == 0:
+        return None
+    if template.shape[0] >= bgr.shape[0] or template.shape[1] >= bgr.shape[1]:
+        scale = min(
+            (bgr.shape[1] * 0.92) / template.shape[1],
+            (bgr.shape[0] * 0.92) / template.shape[0],
+            1.0,
+        )
+        template = cv2.resize(
+            template,
+            (
+                max(8, int(template.shape[1] * scale)),
+                max(8, int(template.shape[0] * scale)),
+            ),
+            interpolation=cv2.INTER_AREA,
+        )
+    result = cv2.matchTemplate(bgr, template, cv2.TM_CCOEFF_NORMED)
+    _, score, _, location = cv2.minMaxLoc(result)
+    if score < threshold:
+        return None
+    x = location[0] + template.shape[1] / 2
+    y = location[1] + template.shape[0] / 2
+    return x / REFERENCE_SIZE[0], y / REFERENCE_SIZE[1], float(score)
+
+
+def _find_scaled_navigation_template(
+    image: Image.Image,
+    template_path: Path,
+    threshold: float,
+) -> tuple[float, float, float, float] | None:
+    """Match a crop-derived menu template at the current game UI scale."""
+    if not template_path.exists():
+        return None
+    bgr = cv2.cvtColor(np.asarray(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+    template = cv2.imread(str(template_path))
+    if template is None or template.size == 0:
+        return None
+    expected = max(0.45, image.width / 506.0)
+    scales = sorted(
+        {
+            round(expected * factor, 3)
+            for factor in (0.82, 0.90, 0.96, 1.0, 1.04, 1.10, 1.18)
+        }
+        | {1.0}
+    )
+    best: tuple[float, float, float, float] | None = None
+    for scale in scales:
+        width = max(8, round(template.shape[1] * scale))
+        height = max(8, round(template.shape[0] * scale))
+        if width >= image.width or height >= image.height:
+            continue
+        interpolation = cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA
+        resized = cv2.resize(template, (width, height), interpolation=interpolation)
+        scores = cv2.matchTemplate(bgr, resized, cv2.TM_CCOEFF_NORMED)
+        _, score, _, location = cv2.minMaxLoc(scores)
+        candidate = (
+            (location[0] + width / 2) / image.width,
+            (location[1] + height / 2) / image.height,
+            float(score),
+            float(scale),
+        )
+        if best is None or candidate[2] > best[2]:
+            best = candidate
+    return best if best is not None and best[2] >= threshold else None
+
+
+def _validated_navigation_panel(
+    image: Image.Image,
+    point: tuple[float, float],
+    scale: float,
+) -> tuple[float, float, float, float] | None:
+    """Require the wide beige navigation strip around a matched menu control."""
+    cx, cy = point[0] * image.width, point[1] * image.height
+    panel_width = min(float(image.width), 506.0 * scale)
+    panel_height = min(float(image.height), 146.0 * scale)
+    left = max(0, round(cx - 0.94 * panel_width))
+    right = min(image.width, round(cx + 0.06 * panel_width))
+    top = max(0, round(cy - 0.58 * panel_height))
+    bottom = min(image.height, round(cy + 0.42 * panel_height))
+    if right - left < 0.68 * image.width or bottom - top < 35:
+        return None
+    patch = cv2.cvtColor(
+        np.asarray(image.convert("RGB"))[top:bottom, left:right],
+        cv2.COLOR_RGB2HSV,
+    )
+    if patch.size == 0:
+        return None
+    beige = cv2.inRange(patch, (5, 10, 105), (38, 205, 255))
+    beige_ratio = float(np.count_nonzero(beige)) / beige.size
+    if beige_ratio < 0.42:
+        return None
+    return (
+        left / image.width,
+        top / image.height,
+        right / image.width,
+        bottom / image.height,
+    )
 
 
 def parse_ratio(text: str) -> tuple[int, int] | None:
@@ -121,15 +329,17 @@ def is_map_screen(image: Image.Image) -> bool:
 
 
 def is_formation_screen(image: Image.Image) -> bool:
+    """Attack-planning screen: parchment plus a wave header (often above y=0.61)."""
+    wave = formation_wave_diagnostics(image)
     bgr = _reference_bgr(image)
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     brown = cv2.inRange(hsv[0:940], (3, 45, 20), (30, 255, 180))
+    brown_ratio = float(np.count_nonzero(brown)) / brown.size
+    if wave.get("first_header") and brown_ratio > 0.12:
+        return True
     yellow = cv2.inRange(hsv[980:1210], (15, 80, 105), (45, 255, 255))
     full_width_band_rows = int(np.count_nonzero(np.mean(yellow > 0, axis=1) > 0.75))
-    return (
-        float(np.count_nonzero(brown)) / brown.size > 0.18
-        and full_width_band_rows >= 25
-    )
+    return brown_ratio > 0.18 and full_width_band_rows >= 25
 
 
 def is_travel_dialog(image: Image.Image) -> bool:
@@ -143,9 +353,44 @@ def is_travel_dialog(image: Image.Image) -> bool:
     )
 
 
-def popup_action(image: Image.Image) -> tuple[float, float] | None:
-    """Return a safe close/continue point for a blocking modal."""
-    if is_formation_screen(image) or is_travel_dialog(image):
+def find_formation_attack_button(image: Image.Image) -> tuple[float, float] | None:
+    """Gold «Нападение» on the planning footer. Never the title-bar close."""
+    bgr = _reference_bgr(image)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    top = int(0.90 * REFERENCE_SIZE[1])
+    left = int(0.52 * REFERENCE_SIZE[0])
+    band = hsv[top : REFERENCE_SIZE[1], left : int(0.98 * REFERENCE_SIZE[0])]
+    gold = cv2.inRange(band, (14, 70, 90), (48, 255, 255))
+    count, _, stats, centers = cv2.connectedComponentsWithStats(gold)
+    best: tuple[int, float, float] | None = None
+    for index in range(1, count):
+        _x, _y, width, height, area = stats[index]
+        if area < 400:
+            continue
+        ratio = width / max(1, height)
+        if not (1.4 < ratio < 8.0):
+            continue
+        cx, cy = centers[index]
+        nx = (float(cx) + left) / REFERENCE_SIZE[0]
+        ny = (float(cy) + top) / REFERENCE_SIZE[1]
+        if ny < 0.90 or nx < 0.55 or nx > 0.98:
+            continue
+        candidate = (int(area), nx, ny)
+        if best is None or candidate[0] > best[0]:
+            best = candidate
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
+def popup_action(
+    image: Image.Image,
+    recognized_text: str | None = None,
+) -> tuple[float, float] | None:
+    """Return a red-X close point only. Never buy/green and never map chrome/ruby HUD."""
+    if is_special_offers_screen(image, recognized_text):
+        return special_offers_close_point(image)
+    if is_map_screen(image) or is_formation_screen(image) or is_travel_dialog(image):
         return None
     bgr = _reference_bgr(image)
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
@@ -160,96 +405,244 @@ def popup_action(image: Image.Image) -> tuple[float, float] | None:
         if area < 500 or not (0.55 < width / max(1, height) < 1.6):
             continue
         cx, cy = centers[index]
+        nx = cx / REFERENCE_SIZE[0]
+        ny = cy / REFERENCE_SIZE[1]
+        if is_offer_rail_point(nx, ny):
+            continue
         if cx > 0.70 * REFERENCE_SIZE[0] and cy < 0.38 * REFERENCE_SIZE[1]:
             close_candidates.append((area, cx, cy))
     if close_candidates:
         _, x, y = max(close_candidates)
         return x / REFERENCE_SIZE[0], y / REFERENCE_SIZE[1]
+    return None
 
-    green = cv2.inRange(hsv, (35, 80, 70), (95, 255, 255))
-    count, _, stats, centers = cv2.connectedComponentsWithStats(green)
-    buttons: list[tuple[int, float, float]] = []
+
+def find_red_cross_force(
+    image: Image.Image,
+    *,
+    allow_right_chrome: bool = False,
+    title_bar_only: bool = False,
+) -> tuple[float, float] | None:
+    """Aggressively find a red close/X control; never the green confirm."""
+    bgr = _reference_bgr(image)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    red = cv2.bitwise_or(
+        cv2.inRange(hsv, (0, 110, 70), (14, 255, 255)),
+        cv2.inRange(hsv, (165, 110, 70), (180, 255, 255)),
+    )
+    count, _, stats, centers = cv2.connectedComponentsWithStats(red)
+    ranked: list[tuple[float, float, float]] = []
     for index in range(1, count):
         x, y, width, height, area = stats[index]
-        if area < 1500 or width < 2.2 * height:
-            continue
         cx, cy = centers[index]
-        if 0.25 * REFERENCE_SIZE[0] < cx < 0.75 * REFERENCE_SIZE[0] and cy > 0.35 * REFERENCE_SIZE[1]:
-            buttons.append((area, cx, cy))
-    if buttons:
-        _, x, y = max(buttons)
-        return x / REFERENCE_SIZE[0], y / REFERENCE_SIZE[1]
-    return None
+        if area < 280:
+            continue
+        ratio = width / max(1, height)
+        square = 0.45 < ratio < 1.9
+        if not square:
+            continue
+        if title_bar_only and cy > 0.22 * REFERENCE_SIZE[1]:
+            continue
+        if not allow_right_chrome and cx >= OFFER_RAIL_X * REFERENCE_SIZE[0]:
+            continue
+        # Resource-bar / plus-ruby HUD, not a modal close X.
+        if cy < 0.10 * REFERENCE_SIZE[1] and cx < 0.88 * REFERENCE_SIZE[0]:
+            continue
+        # Prefer parchment-top-right ribbon, then large lower-left decline seal.
+        top_right = cx > 0.55 * REFERENCE_SIZE[0] and cy < 0.48 * REFERENCE_SIZE[1]
+        lower_left_seal = (
+            not title_bar_only
+            and cx < 0.50 * REFERENCE_SIZE[0]
+            and cy > 0.52 * REFERENCE_SIZE[1]
+            and area >= 1200
+        )
+        if not (top_right or lower_left_seal):
+            continue
+        score = float(area)
+        if top_right:
+            score += 8000
+        if title_bar_only:
+            score += max(0.0, (0.22 * REFERENCE_SIZE[1] - cy) * 20)
+        ranked.append((score, float(cx), float(cy)))
+    if not ranked:
+        return None
+    _, x, y = max(ranked)
+    return x / REFERENCE_SIZE[0], y / REFERENCE_SIZE[1]
+
+
+def is_green_hire_point(nx: float, ny: float) -> bool:
+    """True for the bottom-right green hire/check seal — never click it."""
+    return nx > 0.52 and ny > 0.55
+
+
+def _no_commanders_text_hit(text: str) -> bool:
+    blob = (text or "").lower().replace("ё", "е")
+    if "начать нападен" in blob:
+        return False
+    if "военачаль" not in blob and "командир" not in blob:
+        return False
+    return any(
+        token in blob
+        for token in ("нет свобод", "нанять резерв", "резервного", "законч")
+    )
+
+
+def _no_commanders_unique_template_score(image: Image.Image) -> float:
+    """Match the 125-ruby price strip — the part that is not shared with travel confirm."""
+    if not NO_COMMANDERS_TEMPLATE.exists():
+        return 0.0
+    template = cv2.imread(str(NO_COMMANDERS_TEMPLATE))
+    if template is None or template.size == 0:
+        return 0.0
+    th, tw = template.shape[:2]
+    price = template[int(th * 0.48) : int(th * 0.72), int(tw * 0.30) : int(tw * 0.70)]
+    if price.size == 0:
+        return 0.0
+    bgr = cv2.cvtColor(np.asarray(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+    ih, iw = bgr.shape[:2]
+    ph, pw = price.shape[:2]
+    best = 0.0
+    if ph <= ih and pw <= iw:
+        best = max(
+            best,
+            float(cv2.minMaxLoc(cv2.matchTemplate(bgr, price, cv2.TM_CCOEFF_NORMED))[1]),
+        )
+    for scale in (0.7, 0.9, 1.15, 1.4, 1.7, 2.0, 2.4):
+        width = max(16, int(pw * scale))
+        height = max(12, int(ph * scale))
+        if width >= iw or height >= ih:
+            continue
+        resized = cv2.resize(price, (width, height), interpolation=cv2.INTER_AREA)
+        score = float(cv2.minMaxLoc(cv2.matchTemplate(bgr, resized, cv2.TM_CCOEFF_NORMED))[1])
+        if score > best:
+            best = score
+    return best
+
+
+def _no_commanders_red_closes(image: Image.Image) -> list[tuple[float, float, float]]:
+    """Native-resolution red X candidates: score, nx, ny. Never the green hire seal."""
+    rgb = np.asarray(image.convert("RGB"))
+    height, width = rgb.shape[:2]
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    red = cv2.bitwise_or(
+        cv2.inRange(hsv, (0, 80, 60), (14, 255, 255)),
+        cv2.inRange(hsv, (165, 80, 60), (180, 255, 255)),
+    )
+    min_area = max(80, int(width * height * 0.0004))
+    count, _, stats, centers = cv2.connectedComponentsWithStats(red)
+    ranked: list[tuple[float, float, float]] = []
+    for index in range(1, count):
+        _x, _y, bw, bh, area = stats[index]
+        cx, cy = centers[index]
+        nx, ny = float(cx / width), float(cy / height)
+        if area < min_area:
+            continue
+        ratio = bw / max(1, bh)
+        if not (0.45 < ratio < 2.4):
+            continue
+        if is_green_hire_point(nx, ny):
+            continue
+        if ny < 0.10 and nx < 0.88:
+            continue
+        top_right = nx > 0.55 and ny < 0.48
+        lower_left = nx < 0.50 and ny > 0.52
+        if not (top_right or lower_left):
+            continue
+        score = float(area)
+        if top_right:
+            score += 8000
+        ranked.append((score, nx, ny))
+    ranked.sort(reverse=True)
+    return ranked
+
+
+def _looks_like_hire_parchment(image: Image.Image) -> bool:
+    """Beige panel plus a red close. Shared chrome with travel — never sufficient alone."""
+    rgb = np.asarray(image.convert("RGB"))
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    beige = cv2.inRange(hsv, (8, 12, 90), (42, 190, 255))
+    beige_ratio = float(np.count_nonzero(beige)) / max(1, beige.size)
+    if beige_ratio < 0.10:
+        return False
+    return bool(_no_commanders_red_closes(image))
 
 
 def no_commanders_diagnostics(
     image: Image.Image,
     recognized_text: str | None = None,
 ) -> dict[str, Any]:
-    """Find only the top-right red X of a no-commanders modal."""
-    bgr = _reference_bgr(image)
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    text = (recognized_text or ocr_text(image, psm=6)).lower().replace("ё", "е")
-    has_commander = any(token in text for token in ("военачаль", "командир"))
-    has_unavailable = any(
-        token in text for token in ("законч", "нет свобод", "недоступ", "занят")
-    )
+    """Strict hire-reserve parchment only. Uncertain screens must not match."""
     diagnostic: dict[str, Any] = {
         "point": None,
         "popup_bounds": None,
         "red_ratio": 0.0,
-        "text": text,
+        "text": "",
         "valid": False,
+        "template_score": 0.0,
     }
-    if not (has_commander and has_unavailable):
+    if is_special_offers_screen(image, recognized_text):
         return diagnostic
-    beige = cv2.inRange(hsv, (8, 15, 105), (40, 180, 255))
-    count, _, stats, _ = cv2.connectedComponentsWithStats(beige)
-    panels: list[tuple[int, int, int, int, int]] = []
-    for index in range(1, count):
-        x, y, width, height, area = (int(value) for value in stats[index])
-        if area > 12000 and width > 0.35 * 900 and height > 0.10 * 1600:
-            panels.append((area, x, y, width, height))
-    if not panels:
+    if recognized_text is None and (
+        is_formation_screen(image)
+        or is_travel_dialog(image)
+        or movement_confirm_diagnostics(image)["valid"]
+        or find_target_attack_button(image) is not None
+    ):
         return diagnostic
-    _, px, py, pw, ph = max(panels)
-    diagnostic["popup_bounds"] = (px / 900, py / 1600, (px + pw) / 900, (py + ph) / 1600)
-    red = cv2.bitwise_or(
-        cv2.inRange(hsv, (0, 120, 70), (12, 255, 255)),
-        cv2.inRange(hsv, (168, 120, 70), (180, 255, 255)),
-    )
-    count, _, stats, centers = cv2.connectedComponentsWithStats(red)
-    candidates: list[tuple[int, float, float, int, int, int, int]] = []
-    for index in range(1, count):
-        x, y, width, height, area = stats[index]
-        cx, cy = centers[index]
-        if (
-            area >= 350
-            and 0.55 < width / max(1, height) < 1.7
-            and px + pw / 2 < cx < px + pw
-            and py <= cy < py + ph / 2
-        ):
-            candidates.append((int(area), float(cx), float(cy), int(x), int(y), int(width), int(height)))
-    if not candidates:
+    template_score = 0.0 if recognized_text is not None else _no_commanders_unique_template_score(image)
+    diagnostic["template_score"] = template_score
+    strong_template = template_score >= 0.62
+    if recognized_text is not None:
+        text = recognized_text.lower().replace("ё", "е")
+    elif strong_template:
+        text = ""
+    else:
+        text = ocr_text_ui(image, psm=6).lower().replace("ё", "е")
+    diagnostic["text"] = text
+    if "начать нападен" in text.replace("ё", "е"):
         return diagnostic
-    _, cx, cy, x, y, width, height = max(candidates)
-    patch = red[y : y + height, x : x + width]
-    diagnostic["red_ratio"] = float(np.count_nonzero(patch)) / patch.size
-    diagnostic["point"] = (cx / 900, cy / 1600)
-    diagnostic["valid"] = diagnostic["red_ratio"] >= 0.20
+    text_hit = _no_commanders_text_hit(text)
+    if not (text_hit or strong_template):
+        return diagnostic
+    if not _looks_like_hire_parchment(image):
+        return diagnostic
+    closes = _no_commanders_red_closes(image)
+    point = (closes[0][1], closes[0][2]) if closes else None
+    if point is None or is_green_hire_point(*point):
+        return diagnostic
+    diagnostic["point"] = point
+    diagnostic["valid"] = True
+    diagnostic["red_ratio"] = 1.0
     return diagnostic
 
 
-def generic_modal_diagnostics(image: Image.Image) -> dict[str, Any]:
-    """Return one safe modal action, preferring red X over green confirmation."""
+def generic_modal_diagnostics(
+    image: Image.Image,
+    recognized_text: str | None = None,
+) -> dict[str, Any]:
+    """Return a red-X close only. Never buy/green; close спецпредложения with X."""
     diagnostic: dict[str, Any] = {
         "point": None,
         "action": None,
         "modal_bounds": None,
         "valid": False,
         "excluded": False,
+        "special_offers": False,
     }
-    text = ocr_text(image, psm=6).lower().replace("ё", "е")
+    text = (
+        recognized_text
+        if recognized_text is not None
+        else ocr_text_ui(crop_rel(image, [0.05, 0.0, 0.95, 0.28]), psm=6)
+    ).lower().replace("ё", "е")
+    if is_special_offers_screen(image, text):
+        point = special_offers_close_point(image)
+        diagnostic.update(
+            point=point,
+            action="close",
+            valid=True,
+            special_offers=True,
+        )
+        return diagnostic
     currency_terms = (
         "купить",
         "покупк",
@@ -290,7 +683,7 @@ def generic_modal_diagnostics(image: Image.Image) -> dict[str, Any]:
     _, px, py, pw, ph = max(panels)
     diagnostic["modal_bounds"] = (px / 900, py / 1600, (px + pw) / 900, (py + ph) / 1600)
 
-    def components(mask: np.ndarray, color: str) -> list[tuple[int, float, float]]:
+    def components(mask: np.ndarray) -> list[tuple[int, float, float]]:
         count, _, stats, centers = cv2.connectedComponentsWithStats(mask)
         found: list[tuple[int, float, float]] = []
         for index in range(1, count):
@@ -299,12 +692,8 @@ def generic_modal_diagnostics(image: Image.Image) -> dict[str, Any]:
             inside = px < cx < px + pw and py < cy < py + ph
             if not inside or area < 450:
                 continue
-            if color == "red":
-                valid_position = cx > px + pw / 2 and cy < py + ph / 2
-                valid_shape = 0.55 < width / max(1, height) < 1.8
-            else:
-                valid_position = cx > px + pw / 2 and cy > py + ph / 2
-                valid_shape = width > 1.4 * max(1, height)
+            valid_position = cx > px + pw / 2 and cy < py + ph / 2
+            valid_shape = 0.55 < width / max(1, height) < 1.8
             if valid_position and valid_shape:
                 found.append((int(area), float(cx), float(cy)))
         return found
@@ -313,15 +702,13 @@ def generic_modal_diagnostics(image: Image.Image) -> dict[str, Any]:
         cv2.inRange(hsv, (0, 120, 75), (12, 255, 255)),
         cv2.inRange(hsv, (168, 120, 75), (180, 255, 255)),
     )
-    green = cv2.inRange(hsv, (35, 90, 55), (95, 255, 255))
-    red_actions = components(red, "red")
-    green_actions = components(green, "green")
+    red_actions = components(red)
     if red_actions:
         _, x, y = max(red_actions)
-        diagnostic.update(point=(x / 900, y / 1600), action="close", valid=True)
-    elif green_actions:
-        _, x, y = max(green_actions)
-        diagnostic.update(point=(x / 900, y / 1600), action="confirm", valid=True)
+        nx, ny = x / 900, y / 1600
+        if is_offer_rail_point(nx, ny):
+            return diagnostic
+        diagnostic.update(point=(nx, ny), action="close", valid=True)
     return diagnostic
 
 
@@ -336,22 +723,26 @@ def find_robber_candidates(
     template = cv2.imread(str(template_path))
     if template is None:
         return []
-    edges = cv2.Canny(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), 60, 140)
-    template_edges = cv2.Canny(cv2.cvtColor(template, cv2.COLOR_BGR2GRAY), 60, 140)
-    scores = cv2.matchTemplate(edges, template_edges, cv2.TM_CCOEFF_NORMED)
-    ys, xs = np.where(scores >= float(threshold))
-    half_w, half_h = template.shape[1] // 2, template.shape[0] // 2
-    ranked = sorted(
-        (
-            (float(scores[y, x]), x + half_w, y + half_h)
-            for y, x in zip(ys, xs)
-            if 0.18 * REFERENCE_SIZE[1] < y + half_h < 0.88 * REFERENCE_SIZE[1]
-            and 0.07 * REFERENCE_SIZE[0] < x + half_w < 0.93 * REFERENCE_SIZE[0]
-        ),
-        reverse=True,
-    )
+    ranked: list[tuple[float, int, int]] = []
+    for scale in (0.55, 0.62, 0.70, 1.0):
+        width = max(16, int(template.shape[1] * scale))
+        height = max(16, int(template.shape[0] * scale))
+        if width >= bgr.shape[1] or height >= bgr.shape[0]:
+            continue
+        resized = cv2.resize(template, (width, height), interpolation=cv2.INTER_AREA)
+        scores = cv2.matchTemplate(bgr, resized, cv2.TM_CCOEFF_NORMED)
+        ys, xs = np.where(scores >= float(threshold))
+        half_w, half_h = width // 2, height // 2
+        for y, x in zip(ys, xs):
+            cx, cy = x + half_w, y + half_h
+            if (
+                0.18 * REFERENCE_SIZE[1] < cy < 0.88 * REFERENCE_SIZE[1]
+                and 0.07 * REFERENCE_SIZE[0] < cx < OFFER_RAIL_X * REFERENCE_SIZE[0]
+            ):
+                ranked.append((float(scores[y, x]), int(cx), int(cy)))
+    ranked.sort(reverse=True)
     selected: list[tuple[float, int, int]] = []
-    min_distance = max(template.shape[:2]) * 0.75
+    min_distance = max(template.shape[:2]) * 0.55
     for score, x, y in ranked:
         if all((x - px) ** 2 + (y - py) ** 2 > min_distance**2 for _, px, py in selected):
             selected.append((score, x, y))
@@ -458,6 +849,32 @@ def find_picker_cards(
             }
         )
     return cards
+
+
+def find_picker_max_control(
+    image: Image.Image,
+    template_path: Path = PICKER_MAX_TEMPLATE,
+    threshold: float = 0.65,
+) -> tuple[float, float] | None:
+    """LEFT-side MAX control that fills to capacity. Never the cancel that zeros."""
+    if not template_path.exists():
+        return None
+    bgr = _reference_bgr(image)
+    template = cv2.imread(str(template_path))
+    if template is None:
+        return None
+    edges = cv2.Canny(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), 60, 140)
+    template_edges = cv2.Canny(cv2.cvtColor(template, cv2.COLOR_BGR2GRAY), 60, 140)
+    scores = cv2.matchTemplate(edges, template_edges, cv2.TM_CCOEFF_NORMED)
+    _, score, _, location = cv2.minMaxLoc(scores)
+    if score < threshold:
+        return None
+    x = location[0] + template.shape[1] / 2
+    y = location[1] + template.shape[0] / 2
+    nx, ny = x / REFERENCE_SIZE[0], y / REFERENCE_SIZE[1]
+    if not (0.22 < nx < 0.50 and 0.42 < ny < 0.70):
+        return None
+    return nx, ny
 
 
 def formation_wave_diagnostics(image: Image.Image) -> dict[str, Any]:
@@ -661,6 +1078,39 @@ def choose_shortest_candidate(
 ) -> tuple[float, float] | None:
     valid = [(point, seconds) for point, seconds in measured if seconds > 0]
     return min(valid, key=lambda item: item[1])[0] if valid else None
+
+
+def _movement_tile_score(image: Image.Image, nx: float, ny: float) -> float:
+    crop = crop_rel(
+        image,
+        [
+            max(0.0, nx - 0.09),
+            max(0.0, ny - 0.07),
+            min(1.0, nx + 0.09),
+            min(1.0, ny + 0.07),
+        ],
+    )
+    arr = np.asarray(crop)
+    if arr.size == 0:
+        return 0.0
+    red = arr[:, :, 0].astype(np.float32)
+    green = arr[:, :, 1].astype(np.float32)
+    blue = arr[:, :, 2].astype(np.float32)
+    goldish = ((red > 170) & (green > 130) & (blue < 120)).mean()
+    selected_green = ((green > red + 15) & (green > 140) & (blue < 140)).mean()
+    bright = float(arr.mean()) / 255.0
+    return float(goldish * 2.2 + selected_green * 1.6 + bright)
+
+
+def is_feather_selected(
+    image: Image.Image,
+    feather: tuple[float, float] = (0.80, 0.34),
+    gold: tuple[float, float] = (0.20, 0.34),
+) -> bool:
+    """True when the right-hand feather tile looks selected vs the gold tile."""
+    feather_score = _movement_tile_score(image, feather[0], feather[1])
+    gold_score = _movement_tile_score(image, gold[0], gold[1])
+    return feather_score > gold_score + 0.035
 
 
 def choose_movement(feather_count: int | None) -> str:

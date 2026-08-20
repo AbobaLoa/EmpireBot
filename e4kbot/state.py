@@ -48,16 +48,24 @@ class LiveState:
     mode: str = "idle"
     last_error: str = ""
     next_attack_at: float = 0.0
+    next_send_at: float = 0.0
     last_attack_at: float = 0.0
     last_coords: str = "—"
     last_screenshot: str = ""
     stopped_reason: str = ""
     last_confirmed_one_way_sec: int = 0
+    paused: bool = False
     cooldowns: dict[str, float] = field(default_factory=dict)
+    return_speed_pct: int = 0
     marches: list[March] = field(default_factory=list)
     history: list[dict[str, Any]] = field(default_factory=list)
+    session_attacks: int = 0
+    session_gold: int = 0
+    session_rubies: int = 0
 
     def to_dict(self) -> dict[str, Any]:
+        from e4kbot.control import CONTROL
+
         now = time.time()
         in_flight = [m for m in self.marches if m.return_at > now]
         next_cd = max(0, int(self.next_attack_at - now))
@@ -69,8 +77,12 @@ class LiveState:
             for key, until in self.cooldowns.items()
             if until > now
         }
+        paused = not CONTROL.is_enabled()
         return {
             "running": self.running,
+            "paused": paused,
+            "enabled": not paused,
+            "hotkey": CONTROL.hotkey,
             "dry_run": self.dry_run,
             "engine": self.engine,
             "account": self.account,
@@ -80,13 +92,19 @@ class LiveState:
             "last_coords": self.last_coords,
             "last_screenshot": self.last_screenshot,
             "last_confirmed_one_way_sec": self.last_confirmed_one_way_sec,
+            "return_speed_pct": self.return_speed_pct,
             "target_cooldowns": cooldowns,
-            "next_attack_cd_sec": next_cd,
+            "next_attack_cd_sec": max(
+                next_cd, max(0, int(self.next_send_at - now))
+            ),
             "in_flight": len(in_flight),
             "max_concurrent": MAX_CONCURRENT_ATTACKS,
             "max_commander": MAX_COMMANDER_NUMBER,
             "marches": [m.to_dict() for m in in_flight],
             "history": self.history[-20:],
+            "session_attacks": int(self.session_attacks),
+            "session_gold": int(self.session_gold),
+            "session_rubies": int(self.session_rubies),
             "server_time": int(now),
         }
 
@@ -172,8 +190,10 @@ class StateStore:
             cooldown_until=now + one_way + 3 * 60 * 60,
             screenshot=screenshot,
             movement=movement,
+            timer_source="outbound_x2",
         )
         self.live.marches.append(march)
+        self.live.session_attacks += 1
         self.live.last_confirmed_one_way_sec = one_way
         target_key = self.target_key(kind, kingdom, x, y)
         self.live.cooldowns[target_key] = march.cooldown_until
@@ -207,6 +227,22 @@ class StateStore:
         now: float | None = None,
     ) -> bool:
         return self.target_cooldown_until(kind, kingdom, x, y) <= (now or time.time())
+
+    def record_loot(self, gold: int = 0, rubies: int = 0) -> None:
+        self.live.session_gold += max(0, int(gold or 0))
+        self.live.session_rubies += max(0, int(rubies or 0))
+
+    def session_summary(self) -> dict[str, int]:
+        return {
+            "attacks": int(self.live.session_attacks),
+            "gold": int(self.live.session_gold),
+            "rubies": int(self.live.session_rubies),
+        }
+
+    def reset_session_stats(self) -> None:
+        self.live.session_attacks = 0
+        self.live.session_gold = 0
+        self.live.session_rubies = 0
 
     def update_return_timer(
         self,

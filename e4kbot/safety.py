@@ -7,6 +7,9 @@ from typing import Any
 
 from loguru import logger
 
+from e4kbot.control import CONTROL
+
+
 MAX_COMMANDER_NUMBER = 30
 MAX_CONCURRENT_ATTACKS = 30
 
@@ -26,16 +29,61 @@ def human_sleep(span: list | tuple | float | int, reason: str = "") -> float:
     delay = max(0.0, triangular_delay(span))
     if reason:
         logger.debug(f"пауза {delay:.1f}с ({reason})")
-    time.sleep(delay)
+    CONTROL.sleep(delay)
     return delay
 
 
 def attack_gap_sleep(config: dict[str, Any]) -> float:
-    return human_sleep(config.get("attack_delay_seconds") or [4, 10], "кд между атаками")
+    return human_sleep(config.get("attack_delay_seconds") or [8, 10], "кд между атаками")
 
 
 def cycle_pause_sleep(config: dict[str, Any]) -> float:
-    return human_sleep(config.get("cycle_pause_seconds") or [12, 25], "пауза цикла")
+    span = config.get("cycle_pause_seconds") or [0, 0]
+    if isinstance(span, (list, tuple)) and max(float(span[0]), float(span[1])) <= 0:
+        return 0.0
+    return human_sleep(span, "пауза цикла")
+
+
+def send_cadence_span(config: dict[str, Any] | None = None) -> tuple[float, float]:
+    span = (config or {}).get("attack_delay_seconds") or [8, 10]
+    if isinstance(span, (list, tuple)) and len(span) >= 2:
+        lo, hi = float(span[0]), float(span[1])
+        return (hi, lo) if lo > hi else (lo, hi)
+    value = float(span)
+    return value, value
+
+
+def roll_send_gap(config: dict[str, Any] | None = None) -> float:
+    lo, hi = send_cadence_span(config)
+    if lo == hi:
+        return lo
+    return random.uniform(lo, hi)
+
+
+def send_gap_remaining(last_send_at: float | None, now: float, gap: float) -> float:
+    """Seconds to wait so send happens at last_send_at+gap. Late formation waits 0."""
+    if not last_send_at or last_send_at <= 0 or gap <= 0:
+        return 0.0
+    return max(0.0, float(last_send_at) + float(gap) - float(now))
+
+
+def wait_for_send_slot(store: Any, config: dict[str, Any] | None = None) -> float:
+    """Block only the leftover send-to-send window, right before the final confirm."""
+    remaining = max(0.0, float(getattr(store.live, "next_send_at", 0) or 0) - time.time())
+    if remaining <= 0:
+        return 0.0
+    logger.info("Жду слот отправки {:.1f}с (каденс 8–10с от прошлой атаки)", remaining)
+    CONTROL.sleep(remaining)
+    return remaining
+
+
+def mark_successful_send(store: Any, config: dict[str, Any] | None = None, now: float | None = None) -> float:
+    sent = time.time() if now is None else float(now)
+    gap = roll_send_gap(config)
+    store.live.last_attack_at = sent
+    store.live.next_send_at = sent + gap
+    logger.info("Следующая отправка не раньше чем через {:.1f}с", gap)
+    return gap
 
 
 def tap_jitter(px: int = 6) -> tuple[int, int]:
@@ -61,7 +109,7 @@ def wait_active_hours(config: dict[str, Any]) -> None:
     hours = config.get("active_hours") or [8, 24]
     logger.info(f"Вне активных часов ({hours[0]}–{hours[1]}), ждём")
     while not is_within_active_hours(config):
-        time.sleep(30)
+        CONTROL.sleep(30)
 
 
 def commander_number_ok(number: int | None, config: dict[str, Any]) -> tuple[bool, str]:

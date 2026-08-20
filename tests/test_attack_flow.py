@@ -8,26 +8,26 @@ from unittest.mock import Mock, patch
 
 from PIL import Image, ImageDraw
 
-from e4kbot.client import BlueStacksEngine, parse_march_seconds
+from e4kbot.client import BlueStacksEngine, HuntTarget, parse_march_seconds
 from e4kbot.state import StateStore
 from e4kbot.vision import (
+    OFFER_RAIL_X,
     ROBBER_TEMPLATE,
     choose_nearest_main_castle,
     choose_movement,
     choose_shortest_candidate,
     find_robber_candidates,
     find_picker_confirm_button,
-    find_formation_unit_slots,
-    formation_wave_diagnostics,
-    generic_modal_diagnostics,
     flank_fill_allowed,
     is_burning_candidate,
+    is_offer_rail_point,
+    is_special_offers_screen,
     movement_confirm_diagnostics,
-    no_commanders_diagnostics,
     ocr_text,
     parse_coordinate_pair,
     parse_ratio,
     popup_action,
+    special_offers_close_point,
 )
 
 
@@ -81,13 +81,14 @@ class VisionTests(unittest.TestCase):
         self.assertEqual(len(found), 2)
 
     def test_detects_safe_modal_close(self) -> None:
-        image = Image.new("RGB", (900, 1600), (90, 130, 55))
+        image = Image.new("RGB", (900, 1600), (40, 35, 50))
         draw = ImageDraw.Draw(image)
-        draw.rectangle((720, 100, 800, 180), fill=(205, 35, 20))
+        draw.rectangle((640, 90, 720, 170), fill=(205, 35, 20))
         action = popup_action(image)
         self.assertIsNotNone(action)
         assert action is not None
         self.assertGreater(action[0], 0.7)
+        self.assertLess(action[0], 0.82)
 
     def test_reads_authoritative_travel_duration_fixture(self) -> None:
         fixture = ROBBER_TEMPLATE.parent / "travel_duration_fixture.png"
@@ -124,6 +125,166 @@ class VisionTests(unittest.TestCase):
         self.assertEqual(reason, "diagnostic_only")
         engine.adb.tap.assert_not_called()
 
+    def test_filled_picker_confirm_does_not_abort_after_overlay_closes(self) -> None:
+        picker = Image.new("RGB", (900, 1600), (55, 35, 25))
+        formation = Image.new("RGB", (900, 1600), (80, 50, 30))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.adb = Mock()
+        engine._image = Mock(return_value=picker)
+        engine._tap_norm_exact = Mock()
+        engine._wait_for = Mock(return_value=formation)
+        engine._read_ratio_from_image = Mock(
+            side_effect=lambda image, key: (0, 10) if image is formation else (10, 10)
+        )
+        diagnostic = {
+            "point": (0.73, 0.79),
+            "popup_bounds": (0.08, 0.18, 0.92, 0.90),
+            "template_score": 0.99,
+            "green_ratio": 0.2,
+            "check_ratio": 0.05,
+            "valid": True,
+        }
+        with patch("e4kbot.client.picker_confirm_diagnostics", return_value=diagnostic):
+            with patch("e4kbot.client.save_shot"):
+                with patch("e4kbot.client.is_map_screen", return_value=False):
+                    valid, reason, after = engine.diagnose_unit_picker_confirm(
+                        click=True,
+                        observed_fill=(10, 10),
+                    )
+        self.assertTrue(valid)
+        self.assertEqual(reason, "confirmed")
+        self.assertIs(after, formation)
+        self.assertNotEqual(reason, "unit_picker_fill_not_retained")
+        engine._tap_norm_exact.assert_called_once_with(0.73, 0.79)
+
+    def test_observed_ten_of_ten_does_not_abort_on_zero_ocr_after_check(self) -> None:
+        picker = Image.new("RGB", (900, 1600), (55, 35, 25))
+        leftover = Image.new("RGB", (900, 1600), (80, 50, 30))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.adb = Mock()
+        engine._image = Mock(side_effect=[picker, leftover])
+        engine._tap_norm_exact = Mock()
+        engine._wait_for = Mock(return_value=None)
+        engine._read_ratio_from_image = Mock(return_value=(0, 10))
+        diagnostic = {
+            "point": (0.73, 0.79),
+            "popup_bounds": (0.08, 0.18, 0.92, 0.90),
+            "template_score": 0.99,
+            "green_ratio": 0.2,
+            "check_ratio": 0.05,
+            "valid": True,
+        }
+        with patch("e4kbot.client.picker_confirm_diagnostics", return_value=diagnostic):
+            with patch("e4kbot.client.save_shot"):
+                with patch("e4kbot.client.is_map_screen", return_value=False):
+                    with patch("e4kbot.client.find_picker_confirm_button", return_value=(0.73, 0.79)):
+                        with patch("e4kbot.client.find_picker_cards", return_value=[{"x": 1}]):
+                            valid, reason, after = engine.diagnose_unit_picker_confirm(
+                                click=True,
+                                observed_fill=(10, 10),
+                            )
+        self.assertTrue(valid)
+        self.assertEqual(reason, "confirmed")
+        self.assertIs(after, leftover)
+        engine._tap_norm_exact.assert_called_once_with(0.73, 0.79)
+
+    def test_empty_picker_confirm_still_aborts(self) -> None:
+        picker = Image.new("RGB", (900, 1600), (55, 35, 25))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.adb = Mock()
+        engine._image = Mock(return_value=picker)
+        engine._tap_norm_exact = Mock()
+        engine._wait_for = Mock()
+        engine._read_ratio_from_image = Mock(return_value=(0, 10))
+        diagnostic = {
+            "point": (0.73, 0.79),
+            "popup_bounds": (0.08, 0.18, 0.92, 0.90),
+            "template_score": 0.99,
+            "green_ratio": 0.2,
+            "check_ratio": 0.05,
+            "valid": True,
+        }
+        with patch("e4kbot.client.picker_confirm_diagnostics", return_value=diagnostic):
+            with patch("e4kbot.client.save_shot"):
+                valid, reason, after = engine.diagnose_unit_picker_confirm(click=True)
+        self.assertFalse(valid)
+        self.assertEqual(reason, "unit_picker_fill_not_retained")
+        self.assertIsNone(after)
+        engine._tap_norm_exact.assert_not_called()
+        engine._wait_for.assert_not_called()
+
+    def test_prepare_wave_continues_when_overlay_hides_ten_of_ten(self) -> None:
+        dummy = Image.new("RGB", (900, 1600), (80, 50, 30))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.config = {"vision": {"picker_max_actions": 1, "minimum_flank_fill": 0.70}}
+        engine.telegram = Mock()
+        engine.store = Mock()
+        engine.store.live = Mock()
+        engine._last_picker_fill = None
+        engine._image = Mock(return_value=dummy)
+        engine.tap_rel = Mock()
+        engine._wait_for = Mock(return_value=dummy)
+        engine._picker_overlay_open = Mock(return_value=False)
+        engine._select_best_picker_card = Mock(return_value=True)
+        engine._is_plain_formation = Mock(return_value=False)
+        engine._read_ratio_from_image = Mock(
+            side_effect=lambda _image, key: {
+                "picker_units": (10, 10),
+                "formation_units": (0, 10),
+                "formation_tools": None,
+            }.get(key)
+        )
+        engine.diagnose_unit_picker_confirm = Mock(return_value=(True, "confirmed", dummy))
+        engine._tap_norm = Mock()
+        with patch("e4kbot.client.find_picker_max_control", return_value=None):
+            with patch("e4kbot.client.CONTROL") as control:
+                control.sleep = Mock()
+                ok, reason = engine._prepare_single_center_wave()
+        self.assertTrue(ok)
+        self.assertEqual(reason, "")
+        taps = [call.args[0] for call in engine.tap_rel.call_args_list]
+        self.assertIn("unit_slot", taps)
+        self.assertIn("picker_max", taps)
+        kwargs = engine.diagnose_unit_picker_confirm.call_args.kwargs
+        self.assertEqual(kwargs.get("observed_fill"), (10, 10))
+        self.assertTrue(kwargs.get("click"))
+
+    def test_second_attack_clicks_confirm_after_max(self) -> None:
+        dummy = Image.new("RGB", (900, 1600), (80, 50, 30))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.config = {"vision": {"picker_max_actions": 1, "minimum_flank_fill": 0.70}}
+        engine.telegram = Mock()
+        engine.store = Mock()
+        engine.store.live = Mock()
+        engine._last_picker_fill = (10, 10)
+        engine._image = Mock(return_value=dummy)
+        engine.tap_rel = Mock()
+        engine._wait_for = Mock(return_value=dummy)
+        engine._is_plain_formation = Mock(return_value=True)
+        engine._select_best_picker_card = Mock(return_value=True)
+
+        def dump_max() -> bool:
+            engine._last_picker_fill = (10, 10)
+            return True
+
+        engine._dump_picker_max = Mock(side_effect=dump_max)
+        engine._read_ratio_from_image = Mock(
+            side_effect=lambda _image, key: {
+                "picker_units": (10, 10),
+                "formation_units": (0, 10),
+                "formation_tools": None,
+            }.get(key)
+        )
+        engine.diagnose_unit_picker_confirm = Mock(return_value=(True, "confirmed", dummy))
+        ok, reason = engine._prepare_single_center_wave()
+        self.assertTrue(ok)
+        self.assertEqual(reason, "")
+        engine._dump_picker_max.assert_called_once()
+        engine.diagnose_unit_picker_confirm.assert_called_once()
+        kwargs = engine.diagnose_unit_picker_confirm.call_args.kwargs
+        self.assertTrue(kwargs.get("click"))
+        self.assertEqual(kwargs.get("observed_fill"), (10, 10))
+
     def test_picker_confirm_rejects_red_cancel(self) -> None:
         image = Image.new("RGB", (900, 1600), (55, 35, 25))
         draw = ImageDraw.Draw(image)
@@ -154,61 +315,440 @@ class VisionTests(unittest.TestCase):
         self.assertEqual(reason, "diagnostic_only")
         engine.adb.tap.assert_not_called()
 
-    def test_no_commanders_close_is_top_right_red_only(self) -> None:
-        image = Image.new("RGB", (900, 1600), (45, 30, 20))
-        draw = ImageDraw.Draw(image)
-        draw.rectangle((180, 300, 720, 1050), fill=(225, 195, 145))
-        draw.rectangle((620, 320, 700, 400), fill=(210, 25, 20))
-        draw.rectangle((210, 900, 330, 1000), fill=(210, 25, 20))
-        diagnostic = no_commanders_diagnostics(
-            image, "Нет свободных военачальников"
-        )
-        self.assertTrue(diagnostic["valid"])
-        self.assertGreater(diagnostic["point"][0], 0.5)
-        self.assertLess(diagnostic["point"][1], 0.5)
-
-    def test_generic_modal_prefers_red_close_over_green(self) -> None:
-        image = Image.new("RGB", (900, 1600), (40, 25, 20))
-        draw = ImageDraw.Draw(image)
-        draw.rectangle((170, 250, 730, 1100), fill=(225, 195, 145))
-        draw.rectangle((630, 275, 705, 350), fill=(210, 25, 20))
-        draw.rectangle((520, 920, 700, 1000), fill=(55, 165, 15))
-        diagnostic = generic_modal_diagnostics(image)
-        self.assertTrue(diagnostic["valid"])
-        self.assertEqual(diagnostic["action"], "close")
-
-    def test_generic_modal_excludes_attack_formation(self) -> None:
-        image = Image.new("RGB", (900, 1600), (105, 65, 35))
-        draw = ImageDraw.Draw(image)
-        draw.rectangle((0, 980, 900, 1210), fill=(230, 175, 25))
-        diagnostic = generic_modal_diagnostics(image)
-        self.assertTrue(diagnostic["excluded"])
-        self.assertFalse(diagnostic["valid"])
-
-    def test_transition_polling_is_bounded(self) -> None:
+    def test_selects_visible_robber_without_ocr_coordinates(self) -> None:
         engine = BlueStacksEngine.__new__(BlueStacksEngine)
-        engine.config = {"vision": {"poll_interval_seconds": 0.01}}
-        engine._image = Mock(return_value=Image.new("RGB", (10, 10)))
-        self.assertIsNone(engine._wait_for(lambda _: False, timeout=0.04))
-        self.assertLessEqual(engine._image.call_count, 6)
-
-    def test_unit_slot_target_never_overlaps_wave_header(self) -> None:
-        image = Image.new("RGB", (900, 1600), (105, 65, 35))
-        draw = ImageDraw.Draw(image)
-        draw.rectangle((0, 1000, 899, 1080), fill=(230, 175, 25))
-        draw.rectangle((0, 1081, 899, 1320), fill=(220, 205, 180))
-        draw.rectangle((0, 1321, 899, 1400), fill=(230, 175, 25))
-        draw.line((35, 1170, 95, 1170), fill=(45, 30, 20), width=18)
-        draw.line((65, 1140, 65, 1200), fill=(45, 30, 20), width=18)
-        wave = formation_wave_diagnostics(image)
-        slots = find_formation_unit_slots(image)
-        self.assertTrue(wave["expanded"])
-        self.assertTrue(slots)
-        header = wave["first_header"]
-        self.assertFalse(
-            header[0] <= slots[0][0] <= header[2]
-            and header[1] <= slots[0][1] <= header[3]
+        engine._blocked_screen_targets = []
+        engine._selected_target_coords = None
+        image = Image.new("RGB", (900, 1600), (104, 151, 57))
+        chosen = engine._choose_visible_target_without_ocr(
+            image,
+            "baron",
+            [(0.42, 0.51, 0.9), (0.70, 0.80, 0.8)],
         )
+        self.assertEqual(chosen, (0.42, 0.51))
+        self.assertIsNotNone(engine._selected_target_coords)
+
+    def test_rejects_implausible_map_viewport(self) -> None:
+        self.assertFalse(
+            BlueStacksEngine._coords_plausible((607, 738), (614, 144))
+        )
+        self.assertTrue(
+            BlueStacksEngine._coords_plausible((607, 738), (607, 735))
+        )
+
+    def test_offer_rail_zone_starts_at_eighty_two_percent(self) -> None:
+        self.assertFalse(is_offer_rail_point(0.81, 0.04))
+        self.assertTrue(is_offer_rail_point(0.82, 0.04))
+        self.assertTrue(is_offer_rail_point(0.94, 0.034))
+        self.assertTrue(is_offer_rail_point(0.90, 0.14))
+        self.assertFalse(is_offer_rail_point(0.85, 0.96))
+        self.assertEqual(OFFER_RAIL_X, 0.82)
+
+    def test_popup_action_never_returns_offer_rail_point(self) -> None:
+        image = Image.new("RGB", (900, 1600), (40, 35, 50))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((760, 90, 840, 170), fill=(205, 35, 20))
+        action = popup_action(image)
+        if action is not None:
+            self.assertLess(action[0], OFFER_RAIL_X)
+
+    def test_blocks_tap_on_offer_rail_during_map(self) -> None:
+        green = Image.new("RGB", (900, 1600), (104, 151, 57))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.adb = Mock()
+        engine._image = Mock(return_value=green)
+        engine._size = Mock(return_value=(900, 1600))
+        engine._tap_norm(0.94, 0.034)
+        engine.adb.tap.assert_not_called()
+
+    def test_allows_special_offers_close_on_rail_when_overlay_open(self) -> None:
+        image = Image.new("RGB", (900, 1600), (40, 35, 50))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((80, 220, 820, 1400), fill=(235, 220, 190))
+        draw.rectangle((820, 40, 880, 100), fill=(205, 35, 20))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.adb = Mock()
+        engine._image = Mock(return_value=image)
+        engine._size = Mock(return_value=(900, 1600))
+        engine._plan_or_picker_open = Mock(return_value=False)
+        with patch("e4kbot.client.is_special_offers_screen", return_value=True):
+            with patch(
+                "e4kbot.client.special_offers_close_point",
+                return_value=(0.93, 0.04),
+            ):
+                with patch("e4kbot.client.time.sleep"):
+                    engine._tap_norm_exact(0.93, 0.04)
+        engine.adb.tap.assert_called_once()
+
+    def test_special_offers_overlay_clicks_only_red_x(self) -> None:
+        dummy = Image.new("RGB", (900, 1600), (40, 35, 50))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.adb = Mock()
+        engine._size = Mock(return_value=(900, 1600))
+        engine._image = Mock(return_value=dummy)
+        engine._plan_or_picker_open = Mock(return_value=False)
+        with patch("e4kbot.client.is_special_offers_screen", return_value=True):
+            with patch(
+                "e4kbot.client.special_offers_close_point",
+                return_value=(0.93, 0.04),
+            ):
+                with patch("e4kbot.client.CONTROL") as control:
+                    control.sleep = Mock()
+                    with patch("e4kbot.client.time.sleep"):
+                        closed = engine._dismiss_special_offers_if_open(dummy)
+                        engine._tap_norm(0.90, 0.20)
+                        engine._tap_norm(0.88, 0.35)
+        self.assertTrue(closed)
+        self.assertEqual(engine.adb.tap.call_count, 1)
+        self.assertEqual(engine.adb.tap.call_args.args[0], 837)
+        self.assertEqual(engine.adb.tap.call_args.args[1], 64)
+
+    def test_search_button_is_never_tapped(self) -> None:
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.layout = {"buttons": {"search": [0.90, 0.14]}}
+        engine._plan_or_picker_open = Mock(return_value=False)
+        engine._tap_norm = Mock()
+        engine.tap_rel("search")
+        engine._tap_norm.assert_not_called()
+
+    def test_napadenie_footer_is_not_offer_rail(self) -> None:
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.adb = Mock()
+        engine._size = Mock(return_value=(900, 1600))
+        engine._image = Mock(return_value=Image.new("RGB", (900, 1600), (80, 50, 30)))
+        with patch("e4kbot.client.time.sleep"):
+            engine._tap_norm(0.85, 0.96)
+        engine.adb.tap.assert_called()
+
+    def test_tap_rel_close_redirects_from_offer_rail(self) -> None:
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.layout = {"buttons": {"close": [0.94, 0.034]}}
+        engine._plan_or_picker_open = Mock(return_value=False)
+        engine._tap_norm = Mock()
+        engine._dismiss_special_offers_if_open = Mock()
+        engine.tap_rel("close")
+        engine._tap_norm.assert_not_called()
+        engine._dismiss_special_offers_if_open.assert_called_once()
+
+    def test_dismiss_popups_skips_blind_close_on_rail(self) -> None:
+        green = Image.new("RGB", (900, 1600), (104, 151, 57))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.layout = {"dismiss": [], "buttons": {"close": [0.94, 0.034]}}
+        engine._dismiss_blocking_overlay = Mock(return_value=False)
+        engine._tap_norm = Mock()
+        engine.dismiss_popups()
+        engine._dismiss_blocking_overlay.assert_called_once()
+        engine._tap_norm.assert_not_called()
+
+
+class HuntTests(unittest.TestCase):
+    def test_hunt_quota_defaults_to_ten_commanders(self) -> None:
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.config = {}
+        self.assertEqual(engine._hunt_quota(), 10)
+        engine.config = {"max_commanders": 10}
+        self.assertEqual(engine._hunt_quota(), 10)
+        engine.config = {"army_slots": 7}
+        self.assertEqual(engine._hunt_quota(), 7)
+
+    def test_jump_to_coords_does_not_tap_search(self) -> None:
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.tap_rel = Mock()
+        engine.adb = Mock()
+        engine._jump_to_coords((607, 738))
+        engine.tap_rel.assert_not_called()
+        engine.adb.text.assert_not_called()
+
+    def test_focus_hunt_skips_missing_target_without_search(self) -> None:
+        green = Image.new("RGB", (900, 1600), (104, 151, 57))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine._await_world_map = Mock(return_value=green)
+        engine._dismiss_special_offers_if_open = Mock(return_value=False)
+        engine._match_visible_target = Mock(return_value=None)
+        engine._jump_to_coords = Mock()
+        point = engine._focus_hunt_target(
+            "baron", HuntTarget((0.42, 0.51), (609, 739))
+        )
+        self.assertIsNone(point)
+        engine._jump_to_coords.assert_not_called()
+
+    def test_recenter_does_not_jump_via_search(self) -> None:
+        green = Image.new("RGB", (900, 1600), (104, 151, 57))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine._read_map_coords = Mock(return_value=((607, 738), (620, 750)))
+        engine._jump_to_coords = Mock()
+        engine._pan_map = Mock()
+        engine._image = Mock(return_value=green)
+        with patch("e4kbot.client.find_main_castle_marker", return_value=None):
+            result = engine._recenter_on_main_castle(green)
+        engine._jump_to_coords.assert_not_called()
+        engine._pan_map.assert_not_called()
+        self.assertIs(result, green)
+
+    def test_hunt_swipes_when_no_visible_target(self) -> None:
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.config = {"vision": {"map_scan_rings": 1, "map_scan_span": [0.3, 0.24]}}
+        engine.store = Mock()
+        engine.store.live = Mock()
+        green = Image.new("RGB", (900, 1600), (104, 151, 57))
+        engine._image = Mock(return_value=green)
+        engine._recenter_on_main_castle = Mock(return_value=green)
+        engine._select_visible_target = Mock(
+            side_effect=[None, None, (0.42, 0.51)]
+        )
+        engine._pan_map = Mock()
+        with patch("e4kbot.client.is_map_screen", return_value=True):
+            with patch("e4kbot.client.CONTROL") as control:
+                control.sleep = Mock()
+                point = engine._hunt_robbers("baron")
+        self.assertEqual(point, (0.42, 0.51))
+        self.assertGreaterEqual(engine._pan_map.call_count, 1)
+        engine.store.save.assert_called()
+
+    def test_hunt_collects_quota_then_stops(self) -> None:
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.config = {"max_commanders": 2, "vision": {"map_scan_rings": 1}}
+        engine.store = Mock()
+        engine.store.live = Mock()
+        green = Image.new("RGB", (900, 1600), (104, 151, 57))
+        engine._image = Mock(return_value=green)
+        engine._recenter_on_main_castle = Mock(return_value=green)
+        engine._pan_map = Mock()
+        engine._list_eligible_targets = Mock(
+            return_value=[
+                HuntTarget((0.40, 0.50), (601, 700)),
+                HuntTarget((0.55, 0.52), (603, 701)),
+                HuntTarget((0.70, 0.60), (605, 702)),
+            ]
+        )
+        with patch("e4kbot.client.is_map_screen", return_value=True):
+            batch = engine._collect_hunt_batch("baron")
+        self.assertEqual(len(batch), 2)
+        self.assertEqual(batch[0].coords, (601, 700))
+        self.assertEqual(batch[1].coords, (603, 701))
+        engine._pan_map.assert_not_called()
+
+    def test_on_screen_attack_hunts_before_giving_up(self) -> None:
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.config = {"vision": {"popup_retries": 0}}
+        engine._blocked_screen_targets = []
+        engine._hunt_queue = []
+        green = Image.new("RGB", (900, 1600), (104, 151, 57))
+        engine._image = Mock(return_value=green)
+        engine._plan_or_picker_open = Mock(return_value=False)
+        engine._collect_hunt_batch = Mock(return_value=[])
+        result = engine.on_screen_attack("baron")
+        self.assertEqual(result, "no_targets")
+        engine._collect_hunt_batch.assert_called_once_with("baron")
+
+    def test_on_screen_attack_goes_napadenie_feather_then_send(self) -> None:
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.config = {"vision": {"popup_retries": 0}, "baron_attacks": {"kingdom": 0}}
+        engine._blocked_screen_targets = []
+        engine._hunt_queue = []
+        engine._selected_target_coords = (607, 743)
+        engine.store = Mock()
+        engine.store.live = Mock()
+        travel = Image.new("RGB", (900, 1600), (55, 35, 25))
+        engine._collect_hunt_batch = Mock(
+            return_value=[HuntTarget((0.42, 0.51), (607, 743))]
+        )
+        engine._focus_hunt_target = Mock(return_value=(0.42, 0.51))
+        engine._open_formation = Mock(return_value=True)
+        engine._prepare_single_center_wave = Mock(return_value=(True, ""))
+        engine._plan_or_picker_open = Mock(return_value=False)
+        engine.tap_rel = Mock()
+        engine._wait_for = Mock(return_value=travel)
+        engine._movement_option = Mock(return_value=("feather", 3))
+        engine._image = Mock(return_value=travel)
+        engine._read_march_time = Mock(return_value=188)
+        engine._finish_attack = Mock(return_value="baron")
+        with patch("e4kbot.client.time.sleep"):
+            result = engine.on_screen_attack("baron")
+        self.assertEqual(result, "baron")
+        engine._tap_formation_attack = getattr(
+            engine, "_tap_formation_attack", None
+        )
+        taps = [call.args[0] for call in engine.tap_rel.call_args_list]
+        self.assertIn("formation_attack", taps)
+        engine._movement_option.assert_called_once()
+        engine._finish_attack.assert_called_once()
+        self.assertEqual(engine._finish_attack.call_args.args[3], "feather")
+
+    def test_second_attack_uses_stored_list_without_rescan(self) -> None:
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.config = {"vision": {"popup_retries": 0}, "baron_attacks": {"kingdom": 0}}
+        engine._blocked_screen_targets = []
+        engine._hunt_queue = []
+        engine._selected_target_coords = (607, 743)
+        engine.store = Mock()
+        engine.store.live = Mock()
+        travel = Image.new("RGB", (900, 1600), (55, 35, 25))
+        engine._collect_hunt_batch = Mock(
+            return_value=[
+                HuntTarget((0.42, 0.51), (607, 743)),
+                HuntTarget((0.58, 0.55), (609, 740)),
+            ]
+        )
+        engine._focus_hunt_target = Mock(side_effect=[(0.42, 0.51), (0.58, 0.55)])
+        engine._open_formation = Mock(return_value=True)
+        engine._prepare_single_center_wave = Mock(return_value=(True, ""))
+        engine._plan_or_picker_open = Mock(return_value=False)
+        engine.tap_rel = Mock()
+        engine._wait_for = Mock(return_value=travel)
+        engine._movement_option = Mock(return_value=("feather", 3))
+        engine._image = Mock(return_value=travel)
+        engine._read_march_time = Mock(return_value=188)
+        engine._finish_attack = Mock(return_value="baron")
+        with patch("e4kbot.client.time.sleep"):
+            first = engine.on_screen_attack("baron")
+            second = engine.on_screen_attack("baron")
+        self.assertEqual(first, "baron")
+        self.assertEqual(second, "baron")
+        engine._collect_hunt_batch.assert_called_once_with("baron")
+        self.assertEqual(engine._focus_hunt_target.call_count, 2)
+        self.assertEqual(engine._finish_attack.call_count, 2)
+        self.assertEqual(engine._prepare_single_center_wave.call_count, 2)
+
+    def test_formation_open_never_taps_red_x(self) -> None:
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.layout = {
+            "buttons": {
+                "formation_close": [0.94, 0.034],
+                "close": [0.94, 0.034],
+                "map": [0.12, 0.94],
+                "formation_attack": [0.80, 0.96],
+            }
+        }
+        engine._plan_or_picker_open = Mock(return_value=True)
+        engine._tap_norm = Mock()
+        engine.tap_rel("formation_close")
+        engine.tap_rel("close")
+        engine.tap_rel("map")
+        engine._tap_norm.assert_not_called()
+        engine.tap_rel("formation_attack")
+        engine._tap_norm.assert_called_once()
+
+    def test_failed_prepare_does_not_close_plan(self) -> None:
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.store = Mock()
+        engine.store.live = Mock()
+        engine.tap_rel = Mock()
+        engine._prepare_single_center_wave = Mock(
+            return_value=(False, "unit_picker_fill_not_retained")
+        )
+        result = engine._execute_formation_attack("baron", (0.42, 0.51))
+        self.assertEqual(result, "unsafe_formation")
+        engine.tap_rel.assert_not_called()
+
+    def test_open_plan_skips_hunt_and_reuses_first_attack_path(self) -> None:
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.config = {}
+        engine._hunt_queue = [HuntTarget((0.42, 0.51), (607, 743))]
+        engine._blocked_screen_targets = []
+        engine._image = Mock(return_value=Image.new("RGB", (900, 1600), (80, 50, 30)))
+        engine._plan_or_picker_open = Mock(return_value=True)
+        engine._collect_hunt_batch = Mock()
+        engine._execute_formation_attack = Mock(return_value="baron")
+        result = engine.on_screen_attack("baron")
+        self.assertEqual(result, "baron")
+        engine._collect_hunt_batch.assert_not_called()
+        engine._execute_formation_attack.assert_called_once()
+
+    def test_second_prepare_still_clicks_confirm_like_first(self) -> None:
+        dummy = Image.new("RGB", (900, 1600), (80, 50, 30))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.config = {"vision": {"picker_max_actions": 1, "minimum_flank_fill": 0.70}}
+        engine.telegram = Mock()
+        engine.store = Mock()
+        engine.store.live = Mock()
+        engine._image = Mock(return_value=dummy)
+        engine.tap_rel = Mock()
+        engine._wait_for = Mock(return_value=dummy)
+        engine._picker_overlay_open = Mock(return_value=False)
+        engine._dump_picker_max = Mock(
+            side_effect=lambda: setattr(engine, "_last_picker_fill", (10, 10)) or True
+        )
+        engine._read_ratio_from_image = Mock(
+            side_effect=lambda _image, key: {
+                "picker_units": (10, 10),
+                "formation_units": (0, 10),
+                "formation_tools": None,
+            }.get(key)
+        )
+        engine.diagnose_unit_picker_confirm = Mock(return_value=(True, "confirmed", dummy))
+        first = engine._prepare_single_center_wave()
+        second = engine._prepare_single_center_wave()
+        self.assertEqual(first, (True, ""))
+        self.assertEqual(second, (True, ""))
+        self.assertEqual(engine.diagnose_unit_picker_confirm.call_count, 2)
+        self.assertEqual(engine._dump_picker_max.call_count, 2)
+        for call in engine.diagnose_unit_picker_confirm.call_args_list:
+            self.assertTrue(call.kwargs.get("click"))
+            self.assertEqual(call.kwargs.get("observed_fill"), (10, 10))
+
+    def test_fourth_prepare_wave_always_max_and_confirm(self) -> None:
+        dummy = Image.new("RGB", (900, 1600), (80, 50, 30))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.config = {"vision": {"picker_max_actions": 1, "minimum_flank_fill": 0.70}}
+        engine.telegram = Mock()
+        engine.store = Mock()
+        engine.store.live = Mock()
+        engine._image = Mock(return_value=dummy)
+        engine.tap_rel = Mock()
+        engine._wait_for = Mock(return_value=dummy)
+        engine._picker_overlay_open = Mock(return_value=False)
+        engine._dump_picker_max = Mock(
+            side_effect=lambda: setattr(engine, "_last_picker_fill", (10, 10)) or True
+        )
+        engine._read_ratio_from_image = Mock(
+            side_effect=lambda _image, key: {
+                "picker_units": (10, 10),
+                "formation_units": (0, 10),
+                "formation_tools": None,
+            }.get(key)
+        )
+        engine.diagnose_unit_picker_confirm = Mock(return_value=(True, "confirmed", dummy))
+        for wave in range(4):
+            ok, reason = engine._prepare_single_center_wave()
+            self.assertEqual((ok, reason), (True, ""), msg=f"wave {wave + 1}")
+        self.assertEqual(engine._dump_picker_max.call_count, 4)
+        self.assertEqual(engine.diagnose_unit_picker_confirm.call_count, 4)
+        for call in engine.diagnose_unit_picker_confirm.call_args_list:
+            self.assertTrue(call.kwargs.get("click"))
+
+    def test_open_picker_when_overlay_already_visible(self) -> None:
+        dummy = Image.new("RGB", (900, 1600), (80, 50, 30))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine._image = Mock(return_value=dummy)
+        engine.tap_rel = Mock()
+        engine._wait_for = Mock()
+        engine._picker_overlay_open = Mock(return_value=True)
+        picker, reason = engine._open_unit_picker("unit_slot")
+        self.assertIs(picker, dummy)
+        self.assertEqual(reason, "")
+        engine.tap_rel.assert_not_called()
+        engine._wait_for.assert_not_called()
+
+    def test_select_best_picker_card_does_not_skip_on_stale_full_ocr(self) -> None:
+        dummy = Image.new("RGB", (900, 1600), (80, 50, 30))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.config = {"vision": {"picker_timeout_seconds": 1}}
+        engine._last_picker_fill = None
+        engine._image = Mock(return_value=dummy)
+        engine._tap_norm = Mock()
+        engine._is_plain_formation = Mock(return_value=False)
+        engine._read_ratio_from_image = Mock(
+            side_effect=[
+                (10, 10),
+                (10, 10),
+                (10, 10),
+                (10, 10),
+            ]
+        )
+        with patch("e4kbot.client.find_picker_cards", return_value=[]):
+            self.assertFalse(engine._select_best_picker_card())
+        engine._tap_norm.assert_not_called()
 
 
 class StateTests(unittest.TestCase):

@@ -11,7 +11,8 @@ from e4kbot.paths import add_legacy_bot_path
 from e4kbot.safety import (
     commander_number_ok,
     concurrent_ok,
-    triangular_delay,
+    mark_successful_send,
+    wait_for_send_slot,
 )
 from e4kbot.state import StateStore
 from e4kbot.telegram_bot import TelegramReporter
@@ -275,6 +276,7 @@ class ProtocolEngine:
                     dry_run=True,
                 )
             else:
+                wait_for_send_slot(self.store, self.config)
                 status, detail = _send_attack_with_status(
                     self.socket,
                     kid,
@@ -320,10 +322,8 @@ class ProtocolEngine:
                     dry_run=False,
                 )
             sent += 1
-            delay = triangular_delay(self.config.get("attack_delay_seconds") or [4, 10])
-            self.store.live.next_attack_at = time.time() + delay
+            mark_successful_send(self.store, self.config)
             self.store.save()
-            time.sleep(delay)
         return f"{kind}:{sent}"
 
     def _closest_npc(

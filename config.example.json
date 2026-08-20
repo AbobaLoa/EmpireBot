@@ -12,8 +12,8 @@
   "legacy_bot_path": "C:\\Users\\Dima\\Desktop\\EFK-Sabotage-Bot",
   "max_concurrent_attacks": 30,
   "max_commander_number": 30,
-  "attack_delay_seconds": [4, 10],
-  "cycle_pause_seconds": [12, 25],
+  "attack_delay_seconds": [8, 10],
+  "cycle_pause_seconds": [0, 0],
   "active_hours": [8, 24],
   "modes": {
     "barons": true,
@@ -37,9 +37,10 @@
     "adb_host": "127.0.0.1",
     "adb_ports": [5555, 5556, 5565],
     "adb_path": "",
-    "window_title_hints": ["BlueStacks", "HD-Player", "Empire"],
+    "window_title_hints": ["BlueStacks", "HD-Player"],
     "package": "air.com.goodgamestudios.empirefourkingdoms",
-    "layout": "default"
+    "layout": "default",
+    "input": "mouse"
   },
   "vision": {
     "robber_threshold": 0.65,
@@ -49,20 +50,23 @@
     "map_coordinate_scale": [0.044, 0.044],
     "picker_timeout_seconds": 15,
     "picker_max_actions": 4,
-    "minimum_flank_fill": 0.7,
-    "poll_interval_seconds": 0.15,
-    "click_settle_seconds": 0.12,
-    "state_settle_seconds": 0.2,
-    "generic_modal_retries": 2
+    "minimum_flank_fill": 0.7
   },
-  "telegram": {
-    "enabled": true,
-    "bot_token": "PUT_E4KMOBILE_BOT_TOKEN_HERE",
-    "chat_id": "-100...",
-    "miniapp_host": "127.0.0.1",
-    "miniapp_port": 8766,
-    "public_webapp_url": ""
+  "control": {
+    "hotkey": "N",
+    "always_on_top": true,
+    "start_paused": true
   },
+    "telegram": {
+        "enabled": true,
+        "bot_token": "PUT_E4KMOBILE_BOT_TOKEN_HERE",
+        "chat_id": "-100...",
+        "message_thread_id": 5,
+        "thread_baron": 5,
+        "miniapp_host": "127.0.0.1",
+        "miniapp_port": 8766,
+        "public_webapp_url": ""
+    },
   "accounts": [
     {
       "username": "login",

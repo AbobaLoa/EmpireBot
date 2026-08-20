@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import threading
 from pathlib import Path
@@ -12,11 +13,49 @@ if str(ROOT) not in sys.path:
 from loguru import logger
 
 from e4kbot.config import load_config
+from e4kbot.control import CONTROL
 from e4kbot.engine import AttackBot
 from e4kbot.miniapp import run_miniapp
-from e4kbot.paths import LOG_DIR, ensure_dirs
+from e4kbot.paths import DATA_DIR, LOG_DIR, ensure_dirs
 from e4kbot.state import StateStore
 from e4kbot.telegram_bot import TelegramReporter
+
+
+def _run_bot_thread(bot: AttackBot) -> None:
+    try:
+        bot.start()
+    except Exception:
+        logger.exception("Поток бота упал")
+
+
+def _pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def acquire_singleton() -> bool:
+    """Refuse a second run.py so two bots cannot click the same planning screen."""
+    ensure_dirs()
+    lock_path = DATA_DIR / "bot.lock"
+    pid = os.getpid()
+    if lock_path.exists():
+        try:
+            old_pid = int(lock_path.read_text(encoding="utf-8").strip())
+        except ValueError:
+            old_pid = 0
+        if old_pid and old_pid != pid and _pid_running(old_pid):
+            logger.error(
+                "EmpireBot уже запущен (pid {}). Второй процесс не стартую.",
+                old_pid,
+            )
+            return False
+    lock_path.write_text(str(pid), encoding="utf-8")
+    return True
 
 
 def setup_logging() -> None:
@@ -32,10 +71,20 @@ def setup_logging() -> None:
     )
 
 
-def cmd_run() -> None:
+def cmd_run(max_cycles: int = 0, no_panel: bool = False) -> None:
+    if not acquire_singleton():
+        return
     config = load_config()
+    if max_cycles:
+        config["max_cycles"] = int(max_cycles)
+    CONTROL.configure(config, startup=True)
+    CONTROL.restart_hotkey()
     store = StateStore()
     telegram = TelegramReporter(config.get("telegram") or {})
+    if telegram.token:
+        telegram.resolve_baron_thread()
+        if telegram.message_thread_id:
+            logger.info("Telegram topic thread_id={}", telegram.message_thread_id)
     me = telegram.verify() if telegram.token else {}
     if me:
         logger.info(f"Telegram: @{me.get('username')}")
@@ -48,17 +97,31 @@ def cmd_run() -> None:
             store,
             str(tg_cfg.get("miniapp_host") or "127.0.0.1"),
             int(tg_cfg.get("miniapp_port") or 8766),
+            config,
         ),
         daemon=True,
     )
     miniapp_thread.start()
 
     bot = AttackBot(config, store, telegram)
+    bot_thread = threading.Thread(target=_run_bot_thread, args=(bot,), name="e4k-bot", daemon=True)
+    bot_thread.start()
+    logger.info(
+        "Панель: кнопка вкл/выкл. Горячая клавиша {} выключает бота сразу и отпускает мышь.",
+        CONTROL.hotkey,
+    )
     try:
-        bot.start()
+        if no_panel:
+            bot_thread.join()
+        else:
+            from e4kbot.panel import run_panel
+
+            run_panel(config, store)
     except KeyboardInterrupt:
-        bot.stop = True
         logger.info("Остановлено вручную")
+    finally:
+        bot.stop = True
+        CONTROL.shutdown()
 
 
 def cmd_calibrate() -> None:
@@ -99,13 +162,24 @@ def main() -> None:
         default="run",
         choices=["run", "calibrate", "check"],
     )
+    parser.add_argument(
+        "--max-cycles",
+        type=int,
+        default=0,
+        help="Stop after N completed attack/attempt cycles (0 = unlimited)",
+    )
+    parser.add_argument(
+        "--no-panel",
+        action="store_true",
+        help="Run without the desktop control window",
+    )
     args = parser.parse_args()
     if args.command == "calibrate":
         cmd_calibrate()
     elif args.command == "check":
         cmd_check()
     else:
-        cmd_run()
+        cmd_run(max_cycles=args.max_cycles, no_panel=args.no_panel)
 
 
 if __name__ == "__main__":

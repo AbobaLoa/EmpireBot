@@ -4,35 +4,42 @@ import json
 import random
 import re
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from loguru import logger
 from PIL import ImageDraw
 
 from e4kbot.bluestacks import AdbClient, capture_game_image, save_shot
+from e4kbot.control import CONTROL
 from e4kbot.paths import LAYOUTS_DIR, ROOT
-from e4kbot.safety import commander_number_ok, concurrent_ok, tap_jitter, triangular_delay
+from e4kbot.safety import (
+    commander_number_ok,
+    concurrent_ok,
+    mark_successful_send,
+    tap_jitter,
+    wait_for_send_slot,
+)
 from e4kbot.state import StateStore
 from e4kbot.telegram_bot import TelegramReporter
 from e4kbot.vision import (
     choose_movement,
-    choose_nearest_main_castle,
     crop_rel,
     find_picker_cards,
     find_picker_confirm_button,
-    find_formation_unit_slots,
-    formation_wave_diagnostics,
+    find_picker_max_control,
     find_main_castle_marker,
     find_robber_candidates,
+    find_formation_attack_button,
     find_target_attack_button,
     flank_fill_allowed,
-    generic_modal_diagnostics,
     is_formation_screen,
     is_burning_candidate,
     is_map_screen,
+    is_offer_rail_point,
+    is_special_offers_screen,
     is_travel_dialog,
     movement_confirm_diagnostics,
-    no_commanders_diagnostics,
     ocr_text,
     parse_count,
     parse_coordinate_pair,
@@ -40,7 +47,21 @@ from e4kbot.vision import (
     picker_confirm_diagnostics,
     popup_action,
     project_map_coordinate,
+    special_offers_close_point,
 )
+
+DEFAULT_HUNT_BATCH = 10
+
+
+@dataclass(frozen=True)
+class HuntTarget:
+    point: tuple[float, float]
+    coords: tuple[int, int] | None = None
+
+    def identity(self) -> tuple[Any, ...]:
+        if self.coords is not None:
+            return ("xy", int(self.coords[0]), int(self.coords[1]))
+        return ("sc", round(self.point[0], 2), round(self.point[1], 2))
 
 
 def load_layout(name: str) -> dict[str, Any]:
@@ -104,12 +125,24 @@ class BlueStacksEngine:
         self.layout = load_layout(str((config.get("bluestacks") or {}).get("layout") or "default"))
         self._next_commander = 1
         self._selected_target_coords: tuple[int, int] | None = None
-        self._last_open_error = ""
-        self._blocked_screen_targets: list[tuple[int, int, float, float]] = []
-        self._selection_viewport: tuple[int, int] | None = None
+        self._blocked_screen_targets: list[tuple[float, float]] = []
+        self._last_picker_fill: tuple[int, int] | None = None
+        self._hunt_queue: list[HuntTarget] = []
+        self._picker_stall_count = 0
 
-    def _vision_delay(self, key: str, default: float) -> float:
-        return float((self.config.get("vision") or {}).get(key) or default)
+    _PICKER_STALL_REASONS = frozenset(
+        {
+            "unit_picker_selection_no_progress",
+            "unit_picker_not_found",
+            "unit_picker_fill_not_retained",
+            "unit_picker_confirm_not_confident",
+            "unit_picker_confirm_transition_failed",
+        }
+    )
+
+    def _vision_seconds(self, key: str, default: float) -> float:
+        vision = (getattr(self, "config", None) or {}).get("vision") or {}
+        return float(vision.get(key) or default)
 
     def _size(self) -> tuple[int, int]:
         image = capture_game_image(self.config, self.adb)
@@ -117,24 +150,179 @@ class BlueStacksEngine:
             raise RuntimeError("Нет скрина BlueStacks — открой игру")
         return image.size
 
+    def _plan_or_picker_open(self, image: Any | None = None) -> bool:
+        """True while attack planning / unit picker is on screen."""
+        try:
+            shot = image if image is not None else self._image()
+        except Exception:
+            return True
+        if is_formation_screen(shot):
+            return True
+        if find_picker_cards(shot) or find_picker_confirm_button(shot):
+            return True
+        return False
+
     def tap_rel(self, key: str) -> None:
+        banned = {
+            "formation_close",
+            "close",
+            "picker_cancel",
+            "attack_cancel",
+            "map",
+        }
+        if key in banned and self._plan_or_picker_open():
+            logger.warning("Не жму крестик/закрытие {} — открыт план атаки", key)
+            return
+        if key == "search":
+            logger.warning("Не жму search — кнопка на рейке спецпредложений/магазина")
+            return
         point = self.layout["buttons"][key]
-        self._tap_norm(float(point[0]), float(point[1]))
+        nx, ny = float(point[0]), float(point[1])
+        if key in {"formation_close", "close"} and is_offer_rail_point(nx, ny):
+            logger.warning(
+                "Не жму {} ({:.3f}, {:.3f}) — это правый rail, не крестик плана",
+                key,
+                nx,
+                ny,
+            )
+            self._dismiss_special_offers_if_open()
+            return
+        self._tap_norm(nx, ny)
+
+    def _rail_guard_allows(self, nx: float, ny: float) -> bool:
+        """Block the special-offers rail unless this is that overlay's red X or the footer."""
+        if ny >= 0.90:
+            return True
+        if not is_offer_rail_point(nx, ny):
+            return True
+        try:
+            image = self._image()
+        except Exception:
+            logger.warning("Блокирую тап на rail ({:.3f}, {:.3f}) — нет скрина", nx, ny)
+            return False
+        if self._plan_or_picker_open(image):
+            logger.warning(
+                "Блокирую тап на rail ({:.3f}, {:.3f}) — открыт план, не магазин",
+                nx,
+                ny,
+            )
+            return False
+        if not is_special_offers_screen(image):
+            logger.warning(
+                "Блокирую тап на правом rail ({:.3f}, {:.3f}) — магазин/сундуки/оплату не открываю",
+                nx,
+                ny,
+            )
+            return False
+        close_x, close_y = special_offers_close_point(image)
+        if abs(nx - close_x) > 0.06 or abs(ny - close_y) > 0.10:
+            logger.warning(
+                "На спецпредложениях жму только красный крестик, не ({:.3f}, {:.3f})",
+                nx,
+                ny,
+            )
+            return False
+        return True
+
+    def _dismiss_special_offers_if_open(self, image: Any | None = None) -> bool:
+        """If «спецпредложения» is open, close with the red X only — never buy/chest/%."""
+        try:
+            shot = image if image is not None else self._image()
+        except Exception:
+            return False
+        if self._plan_or_picker_open(shot):
+            return False
+        if not is_special_offers_screen(shot):
+            return False
+        close_x, close_y = special_offers_close_point(shot)
+        logger.info(
+            "Закрываю спецпредложения только красным крестиком ({:.3f}, {:.3f})",
+            close_x,
+            close_y,
+        )
+        self._tap_norm_exact(close_x, close_y)
+        CONTROL.sleep(0.35)
+        return True
+
+    def _dismiss_blocking_overlay(self) -> bool:
+        """Close a recognized blocker. Never tap offer-rail shop/chest buttons."""
+        if self._dismiss_special_offers_if_open():
+            return True
+        try:
+            image = self._image()
+        except Exception:
+            return False
+        if self._plan_or_picker_open(image):
+            return False
+        action = popup_action(image)
+        if action:
+            self._tap_norm(*action)
+            return True
+        return False
 
     def _tap_norm(self, nx: float, ny: float) -> None:
+        if not self._rail_guard_allows(nx, ny):
+            return
         size = self._size()
         x, y = _abs_point(size, [nx, ny])
         jx, jy = tap_jitter(5)
-        self.adb.tap(x + jx, y + jy)
-        time.sleep(self._vision_delay("click_settle_seconds", 0.12))
+        self.adb.tap(x + jx, y + jy, source_size=size)
+        time.sleep(random.uniform(0.25, 0.7))
 
     def _tap_norm_exact(self, nx: float, ny: float) -> None:
+        if not self._rail_guard_allows(nx, ny):
+            return
         size = self._size()
         x, y = _abs_point(size, [nx, ny])
-        self.adb.tap(x, y)
-        time.sleep(self._vision_delay("click_settle_seconds", 0.12))
+        self.adb.tap(x, y, source_size=size)
+        time.sleep(0.5)
 
-    def diagnose_unit_picker_confirm(self, click: bool = False) -> tuple[bool, str, Any | None]:
+    @staticmethod
+    def _positive_unit_fill(ratio: tuple[int, int] | None) -> bool:
+        return bool(ratio and ratio[0] > 0 and ratio[1] > 0)
+
+    def _picker_overlay_open(self, image: Any) -> bool:
+        """True when the unit picker overlay is visible (OCR or vision)."""
+        if self._read_ratio_from_image(image, "picker_units") is not None:
+            return True
+        if find_picker_confirm_button(image) is not None:
+            return True
+        return bool(find_picker_cards(image))
+
+    def _open_unit_picker(self, slot_key: str) -> tuple[Any | None, str]:
+        """Tap the flank cell unless the picker is already open."""
+        image = self._image()
+        if self._picker_overlay_open(image):
+            logger.info("Пикер уже открыт — жму MAX и галочку без повторного закрытия")
+            return image, ""
+        self.tap_rel(slot_key)
+        picker = self._wait_for(
+            self._picker_overlay_open,
+            timeout=self._vision_seconds("picker_open_timeout_seconds", 8),
+            label="открытие пикера",
+        )
+        if picker is None:
+            return None, "unit_picker_not_found"
+        return picker, ""
+
+    def _picker_confirm_point(self, image: Any) -> tuple[float, float] | None:
+        point = find_picker_confirm_button(image)
+        if point is not None:
+            return point
+        if not self._picker_overlay_open(image):
+            return None
+        layout_point = (getattr(self, "layout", None) or {}).get("buttons", {}).get(
+            "unit_picker_confirm"
+        )
+        if layout_point:
+            return float(layout_point[0]), float(layout_point[1])
+        return None
+
+    def diagnose_unit_picker_confirm(
+        self,
+        click: bool = False,
+        observed_fill: tuple[int, int] | None = None,
+    ) -> tuple[bool, str, Any | None]:
         """Detect/annotate picker confirmation; detection-only unless click=True."""
         image = self._image()
         diagnostic = picker_confirm_diagnostics(image)
@@ -160,21 +348,70 @@ class BlueStacksEngine:
             draw.line((x, y - 35, x, y + 35), fill=color, width=3)
         save_shot(annotated, "unit-picker-confirm-before.png")
         logger.info("Unit picker confirm diagnostic: {}", diagnostic)
+        if (not diagnostic["valid"] or point is None) and self._positive_unit_fill(
+            observed_fill
+        ):
+            fallback = self._picker_confirm_point(image)
+            if fallback is not None:
+                point = fallback
+                diagnostic = {**diagnostic, "point": point, "valid": True}
+                logger.warning(
+                    "OCR/шаблон галочки слабый — жму по разметке ({:.3f}, {:.3f})",
+                    point[0],
+                    point[1],
+                )
         if not diagnostic["valid"] or point is None:
             return False, "unit_picker_confirm_not_confident", None
         if not click:
             return True, "diagnostic_only", image
-        self._tap_norm_exact(*point)
-        after = self._wait_for(self._is_plain_formation, timeout=3.5)
-        if after is None or is_map_screen(self._image()):
-            save_shot(self._image(), "unit-picker-confirm-transition-failed.png")
-            return False, "unit_picker_confirm_transition_failed", None
-        units = self._formation_ratio_from_image(after, tools=False)
-        if not units or units[0] <= 0:
-            save_shot(after, "unit-picker-confirm-fill-not-retained.png")
+        picker_units = self._read_ratio_from_image(image, "picker_units")
+        filled = self._positive_unit_fill(observed_fill) or self._positive_unit_fill(
+            picker_units
+        )
+        # Empty confirm is the only abort: picker still 0/N. A later frame after
+        # the overlay closes is not a fill failure — that is the success path.
+        if not filled:
+            save_shot(image, "unit-picker-confirm-fill-not-retained.png")
             return False, "unit_picker_fill_not_retained", None
-        save_shot(after, "unit-picker-confirm-after.png")
-        return True, "confirmed", after
+        logger.info(
+            "Пикер: жму галочку ({:.3f}, {:.3f}) после заполнения {}",
+            point[0],
+            point[1],
+            observed_fill or picker_units,
+        )
+        self._tap_norm_exact(*point)
+        after = self._wait_for(
+            self._is_plain_formation,
+            timeout=self._vision_seconds("picker_confirm_timeout_seconds", 8),
+            label="закрытие пикера",
+        )
+        latest = after if after is not None else self._image()
+        if is_map_screen(latest):
+            save_shot(latest, "unit-picker-confirm-transition-failed.png")
+            return False, "unit_picker_confirm_transition_failed", None
+        if after is not None:
+            save_shot(after, "unit-picker-confirm-after.png")
+            return True, "confirmed", after
+        picker_gone = find_picker_confirm_button(latest) is None and not find_picker_cards(
+            latest
+        )
+        if picker_gone:
+            save_shot(latest, "unit-picker-confirm-after.png")
+            return True, "confirmed", latest
+        leftover = self._read_ratio_from_image(latest, "picker_units")
+        if leftover is not None and leftover[0] <= 0:
+            if self._positive_unit_fill(observed_fill):
+                logger.info(
+                    "После галочки OCR дал 0/N при уже заполненном {}/{} — план не закрываю, иду в Нападение",
+                    observed_fill[0],
+                    observed_fill[1],
+                )
+                save_shot(latest, "unit-picker-confirm-after.png")
+                return True, "confirmed", latest
+            save_shot(latest, "unit-picker-confirm-fill-not-retained.png")
+            return False, "unit_picker_fill_not_retained", None
+        save_shot(latest, "unit-picker-confirm-transition-failed.png")
+        return False, "unit_picker_confirm_transition_failed", None
 
     def diagnose_movement_confirm(self, click: bool = False) -> tuple[bool, str, Any | None]:
         """Validate the distinct final movement confirmation before sending."""
@@ -215,58 +452,6 @@ class BlueStacksEngine:
         save_shot(after, "movement-confirm-after.png")
         return True, "confirmed", after
 
-    def _handle_no_commanders(self, image: Any) -> bool:
-        diagnostic = no_commanders_diagnostics(image)
-        if not diagnostic["valid"] or diagnostic["point"] is None:
-            return False
-        annotated = image.copy()
-        draw = ImageDraw.Draw(annotated)
-        x, y = _abs_point(image.size, diagnostic["point"])
-        draw.ellipse((x - 25, y - 25, x + 25, y + 25), outline=(255, 0, 0), width=6)
-        save_shot(annotated, "no-commanders-close.png")
-        self._tap_norm_exact(*diagnostic["point"])
-        closed = self._wait_for(
-            lambda fresh: not no_commanders_diagnostics(fresh)["valid"],
-            timeout=4,
-        )
-        if closed is None:
-            save_shot(self._image(), "no-commanders-close-failed.png")
-            return False
-        message = "Военачальники закончились"
-        returns = [march.return_at for march in self.store.in_flight() if march.return_at > time.time()]
-        self.store.live.stopped_reason = message
-        if returns:
-            self.store.live.next_attack_at = min(returns)
-        self.store.save()
-        self.telegram.report_status(message)
-        self._last_open_error = "no_commanders"
-        return True
-
-    def _recover_unexpected_modal(self, image: Any) -> bool:
-        diagnostic = generic_modal_diagnostics(image)
-        if not diagnostic["valid"] or diagnostic["point"] is None:
-            return False
-        annotated = image.copy()
-        draw = ImageDraw.Draw(annotated)
-        left, top, right, bottom = diagnostic["modal_bounds"]
-        draw.rectangle(
-            (left * image.width, top * image.height, right * image.width, bottom * image.height),
-            outline=(255, 210, 0),
-            width=4,
-        )
-        x, y = _abs_point(image.size, diagnostic["point"])
-        draw.ellipse((x - 24, y - 24, x + 24, y + 24), outline=(255, 0, 0), width=5)
-        save_shot(annotated, "unexpected-modal-action.png")
-        self._tap_norm_exact(*diagnostic["point"])
-        disappeared = self._wait_for(
-            lambda fresh: not generic_modal_diagnostics(fresh)["valid"],
-            timeout=4,
-        )
-        if disappeared is None:
-            save_shot(self._image(), "unexpected-modal-recovery-failed.png")
-            return False
-        return True
-
     def _swipe_norm(
         self,
         start: tuple[float, float],
@@ -278,15 +463,330 @@ class BlueStacksEngine:
             round(start[1] * height),
             round(finish[0] * width),
             round(finish[1] * height),
+            source_size=(width, height),
         )
-        time.sleep(0.6)
+        CONTROL.sleep(0.6)
+
+    def _pan_map(self, view_dx: float, view_dy: float) -> None:
+        """Move the kingdom-map view. Positive dx looks east; the drag is inverted."""
+        start = (0.50, 0.52)
+        finish = (
+            min(0.78, max(0.18, 0.50 - float(view_dx))),
+            min(0.82, max(0.20, 0.52 - float(view_dy))),
+        )
+        self._swipe_norm(start, finish)
+
+    def _read_map_coords(self, image: Any) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
+        main_region = self.layout.get("regions", {}).get("main_castle_coords")
+        x_region = self.layout.get("regions", {}).get("viewport_x")
+        y_region = self.layout.get("regions", {}).get("viewport_y")
+        main = (
+            parse_coordinate_pair(ocr_text(crop_rel(image, main_region), psm=6))
+            if main_region
+            else None
+        )
+        viewport_x = (
+            parse_count(ocr_text(crop_rel(image, x_region), psm=6)) if x_region else None
+        )
+        viewport_y = (
+            parse_count(ocr_text(crop_rel(image, y_region), psm=6)) if y_region else None
+        )
+        viewport = (
+            (viewport_x, viewport_y)
+            if viewport_x is not None and viewport_y is not None
+            else None
+        )
+        return main, viewport
+
+    @staticmethod
+    def _coords_plausible(
+        main: tuple[int, int] | None,
+        viewport: tuple[int, int] | None,
+        radius: int = 80,
+    ) -> bool:
+        if main is None or viewport is None:
+            return False
+        return abs(main[0] - viewport[0]) <= radius and abs(main[1] - viewport[1]) <= radius
+
+    def _map_scan_offsets(self) -> list[tuple[float, float]]:
+        vision = self.config.get("vision") or {}
+        span = vision.get("map_scan_span") or [0.30, 0.24]
+        sx = float(span[0])
+        sy = float(span[1] if len(span) > 1 else span[0])
+        rings = max(1, int(vision.get("map_scan_rings") or 2))
+        offsets: list[tuple[float, float]] = []
+        for ring in range(1, rings + 1):
+            rx, ry = sx * ring, sy * ring
+            offsets.extend(
+                [
+                    (rx, 0.0),
+                    (0.0, ry),
+                    (-rx, 0.0),
+                    (0.0, -ry),
+                    (rx, ry),
+                    (-rx, ry),
+                    (-rx, -ry),
+                    (rx, -ry),
+                ]
+            )
+        return offsets
+
+    def _is_blocked_screen_target(self, point: tuple[float, float]) -> bool:
+        for bx, by in self._blocked_screen_targets:
+            if (point[0] - bx) ** 2 + (point[1] - by) ** 2 < 0.012**2:
+                return True
+        return False
+
+    def _jump_to_coords(self, coords: tuple[int, int]) -> None:
+        logger.warning(
+            "Переход через поиск {}:{} отключён — кнопка search на рейке спецпредложений",
+            coords[0],
+            coords[1],
+        )
+
+    def _recenter_on_main_castle(self, image: Any) -> Any:
+        """Keep the hunt anchored on the account's MAIN castle, not the last target."""
+        main, viewport = self._read_map_coords(image)
+        marker = find_main_castle_marker(image)
+        if marker and 0.32 < marker[0] < 0.68 and 0.38 < marker[1] < 0.72:
+            return image
+        if main and viewport and self._coords_plausible(main, viewport):
+            if abs(main[0] - viewport[0]) + abs(main[1] - viewport[1]) <= 4:
+                return image
+        if marker:
+            logger.info("Центрирую главный замок на карте")
+            self._pan_map(marker[0] - 0.50, marker[1] - 0.54)
+            CONTROL.sleep(0.2)
+            return self._image()
+        if main:
+            logger.info(
+                "Не жму поиск к замку {}:{} — search на рейке спецпредложений",
+                main[0],
+                main[1],
+            )
+        return image
+
+    def _hunt_quota(self) -> int:
+        """How many unique robber targets to collect before attacking."""
+        cfg = self.config or {}
+        for key in ("max_commanders", "commanders", "army_slots", "max_waves"):
+            value = cfg.get(key)
+            if value not in (None, "", 0):
+                return max(1, min(30, int(value)))
+        return DEFAULT_HUNT_BATCH
+
+    def _await_world_map(self, timeout: float = 6.0) -> Any | None:
+        """Wait for the kingdom map without ESC/formation_close after a successful plan."""
+        image = self._image()
+        if is_map_screen(image):
+            return image
+        logger.info("Жду карту без закрытия плана крестиком")
+        return self._wait_for(is_map_screen, timeout=timeout)
+
+    def _list_eligible_targets(self, image: Any, kind: str) -> list[HuntTarget]:
+        threshold = float((self.config.get("vision") or {}).get("robber_threshold") or 0.65)
+        candidates = find_robber_candidates(image, threshold)
+        if not candidates:
+            return []
+        main, viewport = self._read_map_coords(image)
+        if main is None or viewport is None or not self._coords_plausible(main, viewport):
+            logger.warning(
+                "Не прочитаны координаты главного замка или карты — беру видимые цели по карте"
+            )
+            eligible: list[tuple[float, float, float]] = []
+            for candidate in candidates:
+                point = (candidate[0], candidate[1])
+                if is_burning_candidate(image, point):
+                    continue
+                if is_offer_rail_point(point[0], point[1]):
+                    continue
+                if self._is_blocked_screen_target(point):
+                    continue
+                eligible.append(candidate)
+            if not eligible:
+                return []
+            marker = find_main_castle_marker(image)
+            anchor = marker or (0.50, 0.54)
+            eligible.sort(
+                key=lambda item: (item[0] - anchor[0]) ** 2 + (item[1] - anchor[1]) ** 2
+            )
+            return [HuntTarget((item[0], item[1]), None) for item in eligible]
+        vision = self.config.get("vision") or {}
+        anchor_raw = vision.get("map_anchor") or [0.50, 0.54]
+        scale_raw = vision.get("map_coordinate_scale") or [0.044, 0.044]
+        kingdom = int((self.config.get("baron_attacks") or {}).get("kingdom", 0))
+        found: list[HuntTarget] = []
+        burning = 0
+        cooling = 0
+        blocked = 0
+        for candidate in candidates:
+            point = (candidate[0], candidate[1])
+            if is_burning_candidate(image, point):
+                burning += 1
+                continue
+            if is_offer_rail_point(point[0], point[1]):
+                continue
+            if self._is_blocked_screen_target(point):
+                blocked += 1
+                continue
+            coords = project_map_coordinate(
+                point,
+                viewport,
+                (float(anchor_raw[0]), float(anchor_raw[1])),
+                (float(scale_raw[0]), float(scale_raw[1])),
+            )
+            stable = (round(coords[0]), round(coords[1]))
+            if not self.store.target_available(kind, kingdom, stable[0], stable[1]):
+                cooling += 1
+                continue
+            found.append(HuntTarget(point, stable))
+        main_marker = find_main_castle_marker(image)
+        if main_marker:
+            found.sort(
+                key=lambda item: (item.point[0] - main_marker[0]) ** 2
+                + (item.point[1] - main_marker[1]) ** 2
+            )
+        else:
+            found.sort(
+                key=lambda item: (
+                    (item.coords[0] - main[0]) ** 2 + (item.coords[1] - main[1]) ** 2
+                    if item.coords is not None
+                    else 10**9
+                )
+            )
+        if not found:
+            logger.info(
+                "Нет доступной цели на экране: найдено {}, горят {}, "
+                "на перезарядке {}, заблокировано {}",
+                len(candidates),
+                burning,
+                cooling,
+                blocked,
+            )
+        return found
+
+    def _collect_hunt_batch(self, kind: str) -> list[HuntTarget]:
+        """Scan around the MAIN castle until N unique robbers are stored, then stop."""
+        quota = self._hunt_quota()
+        logger.info(
+            "Охота: сначала набираю до {} целей разбойников (лимит военачальников), потом атаки",
+            quota,
+        )
+        self.store.live.mode = "search"
+        self.store.save()
+        found: list[HuntTarget] = []
+        seen: set[tuple[Any, ...]] = set()
+
+        def ingest(image: Any) -> bool:
+            if not is_map_screen(image):
+                logger.info("Скан карты остановлен — экран больше не карта")
+                return True
+            for target in self._list_eligible_targets(image, kind):
+                ident = target.identity()
+                if ident in seen:
+                    continue
+                seen.add(ident)
+                found.append(target)
+                logger.info(
+                    "В пачку охоты: {} ({}/{})",
+                    target.coords or target.point,
+                    len(found),
+                    quota,
+                )
+                if len(found) >= quota:
+                    return True
+            return False
+
+        image = self._recenter_on_main_castle(self._image())
+        if ingest(image):
+            logger.info("Пачка охоты готова: {} целей, полный скан больше не нужен", len(found))
+            return found
+        for dx, dy in self._map_scan_offsets():
+            logger.info("Скан карты: сдвиг ({:+.2f}, {:+.2f})", dx, dy)
+            self._pan_map(dx, dy)
+            CONTROL.sleep(0.25)
+            image = self._image()
+            stop = ingest(image)
+            self._pan_map(-dx, -dy)
+            CONTROL.sleep(0.15)
+            if stop:
+                break
+        logger.info("Пачка охоты готова: {} целей", len(found))
+        return found
+
+    def _match_visible_target(
+        self,
+        image: Any,
+        kind: str,
+        target: HuntTarget,
+    ) -> tuple[float, float] | None:
+        for item in self._list_eligible_targets(image, kind):
+            if is_burning_candidate(image, item.point):
+                continue
+            if target.coords and item.coords:
+                if (
+                    abs(item.coords[0] - target.coords[0]) <= 2
+                    and abs(item.coords[1] - target.coords[1]) <= 2
+                ):
+                    return item.point
+            dist2 = (item.point[0] - target.point[0]) ** 2 + (
+                item.point[1] - target.point[1]
+            ) ** 2
+            if dist2 < 0.04**2:
+                return item.point
+        return None
+
+    def _focus_hunt_target(self, kind: str, target: HuntTarget) -> tuple[float, float] | None:
+        """Open the next stored robber without a full map rescan."""
+        image = self._await_world_map()
+        if image is None:
+            return None
+        if self._dismiss_special_offers_if_open(image):
+            image = self._await_world_map(timeout=4) or self._image()
+        visible = self._match_visible_target(image, kind, target)
+        if visible:
+            self._selected_target_coords = target.coords
+            return visible
+        logger.info(
+            "Цель {} не на экране — поиск/магазин не жму, пропускаю",
+            target.coords or target.point,
+        )
+        return None
+
+    def _hunt_robbers(self, kind: str) -> tuple[float, float] | None:
+        """Swipe around the MAIN castle until an eligible robber is on screen."""
+        logger.info("Ищу замки разбойников вокруг главного замка")
+        self.store.live.mode = "search"
+        self.store.save()
+        image = self._recenter_on_main_castle(self._image())
+        if not is_map_screen(image):
+            logger.info("Скан карты остановлен — экран больше не карта")
+            return None
+        point = self._select_visible_target(image, kind)
+        if point:
+            return point
+        for dx, dy in self._map_scan_offsets():
+            logger.info("Скан карты: сдвиг ({:+.2f}, {:+.2f})", dx, dy)
+            self._pan_map(dx, dy)
+            CONTROL.sleep(0.25)
+            image = self._image()
+            if not is_map_screen(image):
+                logger.info("Скан карты остановлен — экран больше не карта")
+                return None
+            point = self._select_visible_target(image, kind)
+            if point:
+                return point
+            self._pan_map(-dx, -dy)
+            CONTROL.sleep(0.15)
+        logger.info("Скан карты: вокруг главного замка свободных разбойников нет")
+        return None
 
     def dismiss_popups(self) -> None:
+        if self._dismiss_blocking_overlay():
+            return
         extra = self.layout.get("dismiss") or []
         for point in extra:
             self._tap_norm(float(point[0]), float(point[1]))
-        if "close" in self.layout.get("buttons", {}):
-            self.tap_rel("close")
 
     def read_region(self, key: str) -> str:
         image = capture_game_image(self.config, self.adb)
@@ -303,18 +803,31 @@ class BlueStacksEngine:
             raise RuntimeError("Нет скрина BlueStacks — открой игру")
         return image
 
-    def _wait_for(self, predicate: Any, timeout: float | None = None) -> Any | None:
+    def _wait_for(
+        self,
+        predicate: Any,
+        timeout: float | None = None,
+        *,
+        label: str = "",
+        heartbeat: float = 2.0,
+    ) -> Any | None:
         timeout = float(
             timeout
             or (self.config.get("vision") or {}).get("screen_timeout_seconds")
             or 8
         )
         deadline = time.time() + timeout
+        started = time.time()
+        next_heartbeat = started + max(0.5, float(heartbeat))
         while time.time() < deadline:
+            CONTROL.check()
             image = self._image()
             if predicate(image):
                 return image
-            time.sleep(self._vision_delay("poll_interval_seconds", 0.15))
+            if label and time.time() >= next_heartbeat:
+                logger.info("Пикер: жду {}… ({:.0f}s)", label, time.time() - started)
+                next_heartbeat = time.time() + max(0.5, float(heartbeat))
+            CONTROL.sleep(0.35)
         return None
 
     def ensure_map(self) -> Any | None:
@@ -338,114 +851,90 @@ class BlueStacksEngine:
                 return image
             if is_travel_dialog(image):
                 self.tap_rel("travel_cancel")
-            elif is_formation_screen(image):
-                self.tap_rel("formation_close")
+            elif is_formation_screen(image) or find_picker_cards(image) or find_picker_confirm_button(image):
+                logger.warning(
+                    "ensure_map: план/picker открыт — не жму крестик, карту, ESC и не закрываю"
+                )
+                return image
             else:
-                if no_commanders_diagnostics(image)["valid"]:
-                    self._handle_no_commanders(image)
-                    return None
-                if self._recover_unexpected_modal(image):
-                    pass
+                action = popup_action(image)
+                if action:
+                    self._tap_norm(*action)
                 else:
                     self.tap_rel("map")
             time.sleep(0.9)
         image = self._image()
         return image if is_map_screen(image) else None
 
-    def _select_visible_target(self, image: Any, kind: str) -> tuple[float, float] | None:
-        threshold = float((self.config.get("vision") or {}).get("robber_threshold") or 0.65)
-        candidates = find_robber_candidates(image, threshold)
-        if not candidates:
-            return None
-        main_region = self.layout.get("regions", {}).get("main_castle_coords")
-        x_region = self.layout.get("regions", {}).get("viewport_x")
-        y_region = self.layout.get("regions", {}).get("viewport_y")
-        main = (
-            parse_coordinate_pair(ocr_text(crop_rel(image, main_region), psm=6))
-            if main_region
-            else None
-        )
-        viewport_x = (
-            parse_count(ocr_text(crop_rel(image, x_region), psm=6)) if x_region else None
-        )
-        viewport_y = (
-            parse_count(ocr_text(crop_rel(image, y_region), psm=6)) if y_region else None
-        )
-        if main is None or viewport_x is None or viewport_y is None:
-            logger.warning("Не прочитаны координаты главного замка или карты")
-            return None
-        vision = self.config.get("vision") or {}
-        anchor_raw = vision.get("map_anchor") or [0.50, 0.54]
-        scale_raw = vision.get("map_coordinate_scale") or [0.044, 0.044]
-        kingdom = int((self.config.get("baron_attacks") or {}).get("kingdom", 0))
-        projected: dict[tuple[float, float], tuple[int, int]] = {}
+    def _choose_visible_target_without_ocr(
+        self,
+        image: Any,
+        kind: str,
+        candidates: list[tuple[float, float, float]],
+    ) -> tuple[float, float] | None:
+        del kind
         eligible: list[tuple[float, float, float]] = []
-        cooling = 0
-        burning = 0
         for candidate in candidates:
-            if any(
-                viewport_x == vx
-                and viewport_y == vy
-                and (candidate[0] - nx) ** 2 + (candidate[1] - ny) ** 2 < 0.035**2
-                for vx, vy, nx, ny in self._blocked_screen_targets
-            ):
-                cooling += 1
+            point = (candidate[0], candidate[1])
+            if is_burning_candidate(image, point):
                 continue
-            if is_burning_candidate(image, (candidate[0], candidate[1])):
-                burning += 1
+            if is_offer_rail_point(point[0], point[1]):
                 continue
-            coords = project_map_coordinate(
-                (candidate[0], candidate[1]),
-                (viewport_x, viewport_y),
-                (float(anchor_raw[0]), float(anchor_raw[1])),
-                (float(scale_raw[0]), float(scale_raw[1])),
-            )
-            stable = (round(coords[0]), round(coords[1]))
-            projected[(candidate[0], candidate[1])] = stable
-            if self.store.target_available(kind, kingdom, stable[0], stable[1]):
-                eligible.append(candidate)
-            else:
-                cooling += 1
-        main_marker = find_main_castle_marker(image)
-        if main_marker:
-            chosen_candidate = min(
-                eligible,
-                key=lambda candidate: (candidate[0] - main_marker[0]) ** 2
-                + (candidate[1] - main_marker[1]) ** 2,
-                default=None,
-            )
-            chosen = (
-                (chosen_candidate[0], chosen_candidate[1])
-                if chosen_candidate is not None
-                else None
-            )
-        else:
-            chosen = choose_nearest_main_castle(
-                eligible,
-                main,
-                (viewport_x, viewport_y),
-                (float(anchor_raw[0]), float(anchor_raw[1])),
-                (float(scale_raw[0]), float(scale_raw[1])),
-            )
-        if chosen is None:
-            logger.info(f"Все видимые замки на перезарядке: {cooling}")
+            if self._is_blocked_screen_target(point):
+                continue
+            eligible.append(candidate)
+        if not eligible:
             return None
-        self._selected_target_coords = projected[chosen]
-        self._selection_viewport = (viewport_x, viewport_y)
+        marker = find_main_castle_marker(image)
+        anchor = marker or (0.50, 0.54)
+        chosen_candidate = min(
+            eligible,
+            key=lambda item: (item[0] - anchor[0]) ** 2 + (item[1] - anchor[1]) ** 2,
+        )
+        chosen = (chosen_candidate[0], chosen_candidate[1])
+        self._selected_target_coords = (
+            round(chosen[0] * 1000),
+            round(chosen[1] * 1000),
+        )
         logger.info(
-            f"Найдено замков разбойников: {len(candidates)}, горят: {burning}, "
-            f"на локальной перезарядке: {cooling}; "
-            f"главный замок {main[0]}:{main[1]}, карта {viewport_x}:{viewport_y}; "
-            f"выбрана цель {self._selected_target_coords[0]}:{self._selected_target_coords[1]}"
+            "Выбрана видимая цель без OCR: {}/{} кандидатов, точка {:.2f},{:.2f}",
+            len(eligible),
+            len(candidates),
+            chosen[0],
+            chosen[1],
         )
         return chosen
 
+    def _select_visible_target(self, image: Any, kind: str) -> tuple[float, float] | None:
+        targets = self._list_eligible_targets(image, kind)
+        if not targets:
+            return None
+        chosen = targets[0]
+        if chosen.coords is not None:
+            self._selected_target_coords = chosen.coords
+        else:
+            self._selected_target_coords = (
+                round(chosen.point[0] * 1000),
+                round(chosen.point[1] * 1000),
+            )
+        logger.info(
+            "Выбрана ближайшая к главному замку цель {} из {} видимых",
+            chosen.coords or chosen.point,
+            len(targets),
+        )
+        return chosen.point
+
     def _open_formation(self, point: tuple[float, float], kind: str) -> bool:
-        self._last_open_error = ""
+        already = self._image()
+        if self._plan_or_picker_open(already):
+            logger.info("Планирование уже открыто — не закрываю и не жму карту")
+            return True
         self._tap_norm(*point)
         popup = self._wait_for(lambda image: find_target_attack_button(image) is not None, timeout=5)
         if popup is None:
             blocked = self._image()
+            if self._plan_or_picker_open(blocked):
+                return True
             action = popup_action(blocked)
             if action:
                 logger.info("Цель перекрыта окном; закрываю его перед повтором")
@@ -457,78 +946,35 @@ class BlueStacksEngine:
         target_y = parse_count(ocr_text(crop_rel(popup, y_region), psm=6)) if y_region else None
         if target_x is None or target_y is None:
             return False
-        fresh_popup = self._image()
-        stable_x = parse_count(ocr_text(crop_rel(fresh_popup, x_region), psm=6)) if x_region else None
-        stable_y = parse_count(ocr_text(crop_rel(fresh_popup, y_region), psm=6)) if y_region else None
-        if (stable_x, stable_y) != (target_x, target_y):
-            save_shot(fresh_popup, "target-identity-unstable.png")
-            self._last_open_error = "target_identity_unstable"
-            return False
-        save_shot(fresh_popup, f"target-popup-{target_x}-{target_y}.png")
         self._selected_target_coords = (target_x, target_y)
         kingdom = int((self.config.get("baron_attacks") or {}).get("kingdom", 0))
         if not self.store.target_available(kind, kingdom, target_x, target_y):
             logger.info(f"Цель {target_x}:{target_y} ещё на локальной перезарядке")
-            if self._selection_viewport:
-                self._blocked_screen_targets.append((*self._selection_viewport, *point))
             self.tap_rel("map")
             return False
         attack_point = find_target_attack_button(popup)
         if attack_point is None:
             return False
         self._tap_norm(*attack_point)
-        time.sleep(self._vision_delay("state_settle_seconds", 0.20))
+        time.sleep(1.0)
         self.tap_rel("start_attack_confirm")
-        deadline = time.time() + self._vision_delay("screen_timeout_seconds", 8)
-        generic_actions = 0
-        generic_limit = int(self._vision_delay("generic_modal_retries", 2))
-        while time.time() < deadline:
-            image = self._image()
-            if is_formation_screen(image):
-                return True
-            if no_commanders_diagnostics(image)["valid"]:
-                self._handle_no_commanders(image)
-                return False
-            if generic_actions < generic_limit and self._recover_unexpected_modal(image):
-                generic_actions += 1
-                continue
-            time.sleep(self._vision_delay("poll_interval_seconds", 0.15))
-        self._last_open_error = "formation_not_found"
-        return False
+        return self._wait_for(is_formation_screen, timeout=10) is not None
 
     def _read_ratio(self, key: str) -> tuple[int, int] | None:
         return parse_ratio(self.read_region(key))
-
-    def _formation_ratio_from_image(
-        self,
-        image: Any,
-        tools: bool = False,
-    ) -> tuple[int, int] | None:
-        wave = formation_wave_diagnostics(image)
-        bounds = wave.get("content_bounds")
-        if bounds:
-            _, top, _, bottom = bounds
-            row_bottom = min(bottom, top + 0.075)
-            region = [0.48, top, 0.88, row_bottom] if tools else [0.0, top, 0.48, row_bottom]
-            ratio = parse_ratio(ocr_text(crop_rel(image, region), psm=6))
-            if ratio:
-                return ratio
-        key = "formation_tools" if tools else "formation_units"
-        return self._read_ratio_from_image(image, key)
 
     def _is_plain_formation(self, image: Any) -> bool:
         return is_formation_screen(image) and not find_picker_cards(image)
 
     def _select_best_picker_card(self) -> bool:
         """Select one detected card with strict progress and time bounds."""
-        timeout = float((self.config.get("vision") or {}).get("picker_timeout_seconds") or 15)
+        timeout = self._vision_seconds("picker_timeout_seconds", 15)
         deadline = time.time() + timeout
+        CONTROL.check()
         image = self._image()
         before = self._read_ratio_from_image(image, "picker_units")
         if not before or time.time() >= deadline:
             return False
-        if before[0] >= before[1] > 0:
-            return True
         cards = [
             card
             for card in find_picker_cards(image)
@@ -555,76 +1001,217 @@ class BlueStacksEngine:
         for _ in range(4):
             if after is not None or self._is_plain_formation(after_image):
                 break
-            time.sleep(0.3)
+            CONTROL.sleep(0.3)
             after_image = self._image()
             after = self._read_ratio_from_image(after_image, "picker_units")
         logger.info(f"Выбор юнитов в ячейке: {before} -> {after}")
+        if after and after[0] > 0:
+            self._last_picker_fill = after
         if after is None and self._is_plain_formation(after_image):
-            time.sleep(1.0)
+            if before[1] > 0:
+                self._last_picker_fill = (before[1], before[1])
+            CONTROL.sleep(1.0)
             return True
         if after is None and find_picker_confirm_button(after_image) is not None:
             return True
         return bool(after and (after[0] > before[0] or after[0] >= after[1] > 0))
 
-    def _prepare_single_center_wave(self) -> tuple[bool, str]:
-        # The game opens with an empty first wave and the centre/front selected.
-        # Do not touch the clear-wave or flank controls.
-        opening = self._image()
-        ratio = self._formation_ratio_from_image(opening)
-        if ratio and ratio[0] == ratio[1] and ratio[1] > 0:
-            tools = self._formation_ratio_from_image(opening, tools=True)
-            return (bool(tools and tools[0] == 0), "tools_not_empty")
+    def _assume_picker_capacity(self, image: Any, before: tuple[int, int] | None) -> tuple[int, int]:
+        ratio = self._read_ratio_from_image(image, "picker_units")
+        cap = ratio[1] if ratio and ratio[1] > 0 else 0
+        if cap <= 0 and before and before[1] > 0:
+            cap = before[1]
+        if cap <= 0 and self._last_picker_fill and self._last_picker_fill[1] > 0:
+            cap = self._last_picker_fill[1]
+        if cap <= 0:
+            cap = 10
+        cur = ratio[0] if ratio and ratio[0] > 0 else cap
+        if before and before[0] > cur:
+            cur = before[0]
+        if cur < cap:
+            cur = cap
+        return cur, cap
 
-        formation = opening
-        max_actions = int((self.config.get("vision") or {}).get("picker_max_actions") or 4)
-        for _ in range(max_actions):
-            units = self._formation_ratio_from_image(formation)
-            if units and units[0] == units[1]:
-                break
-            wave = formation_wave_diagnostics(formation)
-            if wave["collapsed"] and wave["expand_point"] is not None:
-                self._tap_norm_exact(*wave["expand_point"])
-                formation = self._wait_for(
-                    lambda image: formation_wave_diagnostics(image)["expanded"],
-                    timeout=4,
+    def _vision_fill_picker_fallback(self) -> bool:
+        """When OCR is silent but the picker overlay is visible, still MAX and proceed."""
+        image = self._image()
+        if not self._picker_overlay_open(image):
+            return False
+        logger.warning("Пикер: OCR застрял — MAX по шаблону/разметке без ожидания 10/10")
+        point = find_picker_max_control(image)
+        if point is not None:
+            self._tap_norm(*point)
+        else:
+            layout = (getattr(self, "layout", None) or {}).get("buttons", {}).get("picker_max")
+            if layout:
+                self._tap_norm_exact(float(layout[0]), float(layout[1]))
+        CONTROL.sleep(0.5)
+        cur, cap = self._assume_picker_capacity(self._image(), self._last_picker_fill)
+        self._last_picker_fill = (cur, cap)
+        logger.info("Пикер: overlay виден — считаю {}/{} и иду к галочке", cur, cap)
+        return True
+
+    def _dump_picker_max(self) -> bool:
+        """LEFT-side MAX that fills to capacity. Never the cancel that zeros."""
+        wait_seconds = self._vision_seconds("picker_max_wait_seconds", 10)
+        image = self._image()
+        before = self._read_ratio_from_image(image, "picker_units")
+        point = find_picker_max_control(image)
+        if point is not None:
+            logger.info("Жму MAX пикера по шаблону ({:.3f}, {:.3f})", point[0], point[1])
+            self._tap_norm(*point)
+        else:
+            logger.info("Жму MAX пикера по разметке picker_max (левый MAX, не ноль)")
+            layout = (getattr(self, "layout", None) or {}).get("buttons", {}).get("picker_max")
+            if layout:
+                self._tap_norm_exact(float(layout[0]), float(layout[1]))
+            else:
+                self.tap_rel("picker_max")
+        deadline = time.time() + wait_seconds
+        started = time.time()
+        next_heartbeat = started + 2.0
+        latest: tuple[int, int] | None = before if self._positive_unit_fill(before) else None
+        while time.time() < deadline:
+            CONTROL.check()
+            shot = self._image()
+            ratio = self._read_ratio_from_image(shot, "picker_units")
+            if ratio and ratio[1] > 0:
+                if self._positive_unit_fill(ratio):
+                    latest = ratio
+                if ratio[0] >= ratio[1]:
+                    progressed = (
+                        before is None
+                        or ratio[0] > before[0]
+                        or ratio[1] != before[1]
+                    )
+                    if progressed or find_picker_confirm_button(shot) is not None:
+                        self._last_picker_fill = ratio
+                        logger.info("Пикер после MAX: {}/{}", ratio[0], ratio[1])
+                        return True
+            if self._picker_confirm_point(shot) is not None:
+                cur, cap = self._assume_picker_capacity(shot, before)
+                self._last_picker_fill = (cur, cap)
+                logger.info(
+                    "Пикер: галочка видна после MAX — считаю {}/{}",
+                    cur,
+                    cap,
                 )
-                if formation is None:
-                    return False, "wave_expand_failed"
-                wave = formation_wave_diagnostics(formation)
-            if not wave["expanded"]:
-                save_shot(formation, "formation-wave-state-unknown.png")
-                return False, "wave_not_expanded"
-            slots = find_formation_unit_slots(formation)
-            if not slots:
-                save_shot(formation, "formation-unit-slot-not-found.png")
-                return False, "unit_slot_not_found"
-            header = wave["first_header"]
-            sx, sy = slots[0]
-            if header and header[0] <= sx <= header[2] and header[1] <= sy <= header[3]:
-                return False, "unit_slot_overlaps_wave_header"
-            self._tap_norm_exact(*slots[0])
-            picker = self._wait_for(
-                lambda image: self._read_ratio_from_image(image, "picker_units") is not None,
-                timeout=5,
-            )
+                return True
+            if time.time() >= next_heartbeat:
+                logger.info("Пикер: жду MAX… ({:.0f}s)", time.time() - started)
+                next_heartbeat = time.time() + 2.0
+            CONTROL.sleep(0.25)
+        if latest:
+            self._last_picker_fill = latest
+        return bool(latest and latest[0] >= latest[1] > 0)
+
+    def _fill_picker_to_capacity(self) -> bool:
+        """Cell already open: MAX, then wait until current==capacity (Юниты 10/10)."""
+        max_attempts = int((self.config.get("vision") or {}).get("picker_max_attempts") or 3)
+        wait_seconds = self._vision_seconds("picker_fill_timeout_seconds", 10)
+        for attempt in range(max(1, max_attempts)):
+            if self._dump_picker_max():
+                return True
+            if attempt + 1 < max_attempts:
+                logger.info("MAX без 10/10 — повтор {}/{}", attempt + 2, max_attempts)
+                CONTROL.sleep(0.35)
+        if self._vision_fill_picker_fallback():
+            return True
+        if not self._select_best_picker_card():
+            return self._vision_fill_picker_fallback()
+        deadline = time.time() + wait_seconds
+        started = time.time()
+        next_heartbeat = started + 2.0
+        while time.time() < deadline:
+            CONTROL.check()
+            shot = self._image()
+            ratio = self._read_ratio_from_image(shot, "picker_units")
+            if ratio and ratio[1] > 0 and ratio[0] >= ratio[1]:
+                self._last_picker_fill = ratio
+                logger.info("Пикер заполнен {}/{}", ratio[0], ratio[1])
+                return True
+            if self._picker_confirm_point(shot) is not None:
+                cur, cap = self._assume_picker_capacity(shot, self._last_picker_fill)
+                self._last_picker_fill = (cur, cap)
+                logger.info("Пикер: жду 10/10, но галочка видна — {}/{}", cur, cap)
+                return True
+            if self._positive_unit_fill(ratio):
+                self._last_picker_fill = ratio
+            if time.time() >= next_heartbeat:
+                logger.info("Пикер: жду 10/10… ({:.0f}s)", time.time() - started)
+                next_heartbeat = time.time() + 2.0
+            CONTROL.sleep(0.25)
+        filled = self._last_picker_fill
+        if filled and filled[1] > 0 and filled[0] >= filled[1]:
+            return True
+        return self._vision_fill_picker_fallback()
+
+    def _prepare_single_center_wave(self) -> tuple[bool, str]:
+        # Every attack, including the 4th+: cell → MAX → 10/10 → green check.
+        # Do not skip confirm because leftover OCR still looks like 10/10.
+        last_reason = ""
+        for sequence_attempt in range(2):
+            if sequence_attempt:
+                logger.warning("Пикер: повтор полной последовательности 2/2")
+                slot = self.layout.get("buttons", {}).get("unit_slot")
+                if slot:
+                    self._tap_norm_exact(float(slot[0]), float(slot[1]))
+                    CONTROL.sleep(0.5)
+            self._last_picker_fill = None
+            ok, reason = self._prepare_single_center_wave_once()
+            if ok:
+                return True, ""
+            last_reason = reason
+            if reason not in self._PICKER_STALL_REASONS:
+                return False, reason
+        return False, last_reason
+
+    def _prepare_single_center_wave_once(self) -> tuple[bool, str]:
+        formation = self._image()
+        max_actions = int((self.config.get("vision") or {}).get("picker_max_actions") or 4)
+        slot_keys = ("unit_slot", "unit_slot_second")[:max_actions]
+        for slot_key in slot_keys:
+            picker, reason = self._open_unit_picker(slot_key)
             if picker is None:
-                save_shot(self._image(), "unit-picker-not-found.png")
-                return False, "unit_picker_not_found"
+                return False, reason
             picker_ratio = self._read_ratio_from_image(picker, "picker_units")
+            if (not picker_ratio or picker_ratio[1] <= 0) and self._picker_overlay_open(picker):
+                picker_ratio = (0, 10)
             if not picker_ratio or picker_ratio[1] <= 0:
                 return False, "center_capacity_not_read"
-            if not self._select_best_picker_card():
+            if not self._fill_picker_to_capacity():
                 save_shot(self._image(), "unit-picker-selection-no-progress.png")
                 return False, "unit_picker_selection_no_progress"
-            current_screen = self._image()
-            if self._is_plain_formation(current_screen):
-                formation = current_screen
-                continue
-            confirmed, reason, formation = self.diagnose_unit_picker_confirm(click=True)
+            if not self._positive_unit_fill(self._last_picker_fill):
+                return False, "unit_picker_fill_not_retained"
+            confirmed, reason, formation = self.diagnose_unit_picker_confirm(
+                click=True,
+                observed_fill=self._last_picker_fill,
+            )
             if not confirmed or formation is None:
                 return False, reason
-        final_units = self._formation_ratio_from_image(formation)
-        final_tools = self._formation_ratio_from_image(formation, tools=True)
+            units = self._read_ratio_from_image(formation, "formation_units")
+            if units and units[0] == units[1] and units[1] > 0:
+                break
+            if (
+                self._last_picker_fill
+                and self._last_picker_fill[0] >= self._last_picker_fill[1] > 0
+            ):
+                break
+        observed = self._last_picker_fill
+        final_units = self._read_ratio_from_image(formation, "formation_units")
+        if self._positive_unit_fill(observed) and (
+            not final_units or final_units[0] <= 0
+        ):
+            logger.info(
+                "Пикер закрылся после заполнения {}/{}; продолжаю к Нападению",
+                observed[0],
+                observed[1],
+            )
+            final_units = observed
+        final_tools = self._read_ratio_from_image(formation, "formation_tools")
+        if final_tools is None and self._positive_unit_fill(observed):
+            final_tools = (0, 0)
         if not final_units or final_units[1] <= 0:
             save_shot(formation, "formation-verification-failed.png")
             return False, "center_capacity_not_read"
@@ -650,6 +1237,23 @@ class BlueStacksEngine:
         )
         return True, ""
 
+    def _escape_stuck_picker(self) -> None:
+        """Force-close picker/formation after repeated stall so hunt can continue."""
+        image = self._image()
+        if find_picker_confirm_button(image) or find_picker_cards(image):
+            cancel = (getattr(self, "layout", None) or {}).get("buttons", {}).get("picker_cancel")
+            if cancel:
+                logger.warning("Пикер: принудительно закрываю overlay")
+                self._tap_norm_exact(float(cancel[0]), float(cancel[1]))
+                CONTROL.sleep(0.6)
+        image = self._image()
+        if self._plan_or_picker_open(image):
+            close = (getattr(self, "layout", None) or {}).get("buttons", {}).get("formation_close")
+            if close and not is_offer_rail_point(float(close[0]), float(close[1])):
+                logger.warning("Пикер: закрываю формирование — иду к следующей цели")
+                self._tap_norm_exact(float(close[0]), float(close[1]))
+                CONTROL.sleep(0.8)
+
     def _read_ratio_from_image(self, image: Any, key: str) -> tuple[int, int] | None:
         region = self.layout.get("regions", {}).get(key)
         return parse_ratio(ocr_text(crop_rel(image, region))) if region else None
@@ -668,69 +1272,134 @@ class BlueStacksEngine:
         return "gold", feathers
 
     def search_and_attack(self, kind: str, target: dict[str, int]) -> str:
-        dry_run = bool(self.config.get("dry_run", True))
-        in_flight = len(self.store.in_flight())
-        ok_conc, msg = concurrent_ok(in_flight, self.config)
-        if not ok_conc:
-            return "wait_return"
-
-        self.dismiss_popups()
-        time.sleep(random.uniform(0.3, 0.8))
-        self.tap_rel("map")
-        time.sleep(random.uniform(0.6, 1.2))
-        self.tap_rel("search")
-        time.sleep(random.uniform(0.4, 0.9))
-        x, y = int(target["x"]), int(target["y"])
-        self.tap_rel("coord_x")
-        self.adb.text(str(x))
-        self.tap_rel("coord_y")
-        self.adb.text(str(y))
-        self.tap_rel("search_go")
-        time.sleep(random.uniform(1.2, 2.0))
-        self.tap_rel("target_center")
-        time.sleep(random.uniform(0.6, 1.1))
-        self.tap_rel("attack")
-        time.sleep(random.uniform(0.8, 1.4))
-        return self._finish_attack(kind, target)
+        logger.warning(
+            "Координатный поиск отключён — search ({:.2f},{:.2f}) открывает спецпредложения",
+            0.90,
+            0.14,
+        )
+        return "search_disabled"
 
     def on_screen_attack(self, kind: str) -> str:
-        opened = False
-        attempts = int((self.config.get("vision") or {}).get("popup_retries") or 4) + 1
-        for _ in range(attempts):
-            image = self.ensure_map()
-            if image is None:
-                time.sleep(0.6)
-                continue
-            point = self._select_visible_target(image, kind)
-            if point is None:
-                action = popup_action(image)
-                if action:
-                    self._tap_norm(*action)
-                    time.sleep(0.8)
-                    continue
+        if getattr(self, "_hunt_queue", None) is None:
+            self._hunt_queue = []
+        if getattr(self, "_blocked_screen_targets", None) is None:
+            self._blocked_screen_targets = []
+        current = self._image()
+        if self._plan_or_picker_open(current):
+            logger.info(
+                "Экран планирования уже открыт — не закрываю, продолжаю набор/Нападение"
+            )
+            return self._execute_formation_attack(kind, (0.50, 0.50))
+        self._dismiss_special_offers_if_open(current)
+        if not self._hunt_queue:
+            self._blocked_screen_targets.clear()
+            self._hunt_queue = self._collect_hunt_batch(kind)
+            if not self._hunt_queue:
                 logger.info("На карте нет доступных замков разбойников")
                 return "no_targets"
-            if self._open_formation(point, kind):
-                opened = True
-                break
-            if self._last_open_error == "no_commanders":
-                logger.warning("Военачальники закончились; пакет атак остановлен")
-                return "no_commanders"
-            time.sleep(self._vision_delay("state_settle_seconds", 0.20))
-        if not opened:
-            logger.warning("Не открылся экран формирования атаки")
-            return "formation_not_found"
+            logger.info(
+                "Охота закончена: {} целей, дальше бью по списку без повторного скана",
+                len(self._hunt_queue),
+            )
+        while self._hunt_queue:
+            current = self._image()
+            if self._plan_or_picker_open(current):
+                logger.info(
+                    "Экран планирования уже открыт — не закрываю, продолжаю набор/Нападение"
+                )
+                return self._execute_formation_attack(kind, (0.50, 0.50))
+            self._dismiss_special_offers_if_open(current)
+            target = self._hunt_queue.pop(0)
+            point = self._focus_hunt_target(kind, target)
+            if point is None:
+                logger.info(
+                    "Цель {} пропала или горит — следующая из пачки без полного скана",
+                    target.coords or target.point,
+                )
+                continue
+            opened = False
+            attempts = min(
+                int((self.config.get("vision") or {}).get("popup_retries") or 4) + 1,
+                3,
+            )
+            for _ in range(max(1, attempts)):
+                if self._open_formation(point, kind):
+                    opened = True
+                    break
+                self._blocked_screen_targets.append(point)
+                blocked = self._image()
+                if self._plan_or_picker_open(blocked):
+                    opened = True
+                    break
+                if self._dismiss_special_offers_if_open(blocked):
+                    time.sleep(0.8)
+                    point = self._focus_hunt_target(kind, target) or point
+                    continue
+                action = popup_action(blocked)
+                if action:
+                    self._tap_norm(*action)
+                time.sleep(0.8)
+                point = self._focus_hunt_target(kind, target) or point
+            if not opened:
+                logger.warning(
+                    "Не открылся экран формирования — беру следующую цель из пачки"
+                )
+                continue
+            return self._execute_formation_attack(kind, point)
+        return "no_targets"
+
+    def _tap_formation_attack(self) -> None:
+        image = self._image()
+        point = find_formation_attack_button(image)
+        if point is not None:
+            logger.info("Нападение: золотая кнопка ({:.3f}, {:.3f})", point[0], point[1])
+            self._tap_norm(*point)
+            return
+        self.tap_rel("formation_attack")
+
+    def _execute_formation_attack(self, kind: str, point: tuple[float, float]) -> str:
+        self._last_picker_fill = None
         ok, reason = self._prepare_single_center_wave()
         if not ok:
             self.store.live.last_error = reason
             self.store.save()
-            self.tap_rel("formation_close")
-            logger.warning(f"Атака отменена: {reason}")
+            if reason in self._PICKER_STALL_REASONS:
+                stall_count = getattr(self, "_picker_stall_count", 0) + 1
+                self._picker_stall_count = stall_count
+                max_stalls = int(
+                    ((getattr(self, "config", None) or {}).get("vision") or {}).get(
+                        "picker_stall_retries"
+                    )
+                    or 2
+                )
+                logger.warning(
+                    "Формирование оставлено открытым для повтора: {} — крестик не жму ({}/{})",
+                    reason,
+                    stall_count,
+                    max_stalls,
+                )
+                if stall_count >= max_stalls:
+                    logger.warning(
+                        "Пикер без прогресса {} раз — закрываю план и беру следующую цель",
+                        stall_count,
+                    )
+                    self._escape_stuck_picker()
+                    self._picker_stall_count = 0
+            else:
+                logger.warning(
+                    "Формирование оставлено открытым для повтора: {} — крестик не жму",
+                    reason,
+                )
             return "unsafe_formation"
-        self.tap_rel("formation_attack")
-        travel = self._wait_for(is_travel_dialog)
+        self._picker_stall_count = 0
+        self._tap_formation_attack()
+        travel = self._wait_for(
+            is_travel_dialog,
+            timeout=self._vision_seconds("travel_dialog_timeout_seconds", 15),
+            label="диалог похода",
+        )
         if travel is None:
-            self.tap_rel("formation_close")
+            logger.warning("Нет диалога похода — план не закрываю крестиком")
             return "travel_dialog_not_found"
         movement, feathers = self._movement_option(travel)
         if movement == "unknown":
@@ -748,8 +1417,16 @@ class BlueStacksEngine:
             logger.warning(f"Перьев нет ({feathers}); выбран разрешённый вариант за золото")
         fake_target = {
             "kingdom": int((self.config.get("baron_attacks") or {}).get("kingdom", 0)),
-            "x": int(self._selected_target_coords[0] if self._selected_target_coords else point[0] * 1000),
-            "y": int(self._selected_target_coords[1] if self._selected_target_coords else point[1] * 1000),
+            "x": int(
+                self._selected_target_coords[0]
+                if self._selected_target_coords
+                else point[0] * 1000
+            ),
+            "y": int(
+                self._selected_target_coords[1]
+                if self._selected_target_coords
+                else point[1] * 1000
+            ),
         }
         return self._finish_attack(kind, fake_target, one_way, movement)
 
@@ -776,7 +1453,7 @@ class BlueStacksEngine:
         if not ok_cmd:
             self.store.live.stopped_reason = cmd_msg
             self.telegram.report_stop(cmd_msg)
-            self.tap_rel("close")
+            self._dismiss_blocking_overlay()
             return "stop"
         self._next_commander = int(commander_no) + 1
         one_way = one_way or parse_march_seconds(self.read_region("march_time"))
@@ -793,15 +1470,14 @@ class BlueStacksEngine:
                 self.store.live.last_error = reason
                 self.store.save()
                 return reason
-            logger.info("dry-run: финальная отправка отменена крестиком намеренно")
             self.tap_rel("travel_cancel")
             time.sleep(0.5)
-            self.tap_rel("formation_close")
             self.telegram.report_status(
                 f"🧪 DRY-RUN отменён перед отправкой: {kind} K{kid} ({x}, {y}), "
                 f"время {one_way} сек"
             )
             return kind
+        wait_for_send_slot(self.store, self.config)
         confirmed, reason, _ = self.diagnose_movement_confirm(click=True)
         if not confirmed:
             self.store.live.last_error = reason
@@ -831,10 +1507,8 @@ class BlueStacksEngine:
             shot_path,
             dry_run=False,
         )
-        delay = triangular_delay(self.config.get("attack_delay_seconds") or [4, 10])
-        self.store.live.next_attack_at = time.time() + delay
+        mark_successful_send(self.store, self.config)
         self.store.save()
-        time.sleep(delay)
         return kind
 
     def run_cycle(self) -> str:
