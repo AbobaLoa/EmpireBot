@@ -171,8 +171,9 @@ class ControlTests(unittest.TestCase):
             self.assertEqual(args[:3], (1, 0, 0))
             self.assertIn("военачальник", kwargs["reason"].lower())
 
-    def test_no_commanders_without_inflight_pauses_until_enable(self) -> None:
+    def test_no_commanders_without_inflight_waits_fallback(self) -> None:
         import tempfile
+        import time
         from pathlib import Path
         from unittest.mock import Mock
 
@@ -187,7 +188,6 @@ class ControlTests(unittest.TestCase):
             bot._armed_for_report = True
             CONTROL.enable()
             bot.handle_no_commanders_result()
-            self.assertFalse(CONTROL.is_enabled())
-            self.assertFalse(bot._armed_for_report)
+            self.assertTrue(CONTROL.is_enabled())
+            self.assertGreater(store.live.next_attack_at, time.time() + 10 * 60)
             bot.telegram.report_shutdown_summary.assert_called_once()
-            CONTROL.enable()

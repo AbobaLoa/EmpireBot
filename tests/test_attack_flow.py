@@ -18,11 +18,14 @@ from e4kbot.vision import (
     choose_shortest_candidate,
     find_robber_candidates,
     find_picker_confirm_button,
+    find_empty_wave_warning_confirm,
     flank_fill_allowed,
     is_burning_candidate,
+    is_green_hire_point,
     is_offer_rail_point,
     is_special_offers_screen,
     movement_confirm_diagnostics,
+    no_commanders_diagnostics,
     ocr_text,
     parse_coordinate_pair,
     parse_ratio,
@@ -112,6 +115,100 @@ class VisionTests(unittest.TestCase):
         assert point is not None
         self.assertGreater(point[0], 0.55)
         self.assertGreater(point[1], 0.70)
+
+    def test_picker_confirm_rejects_empty_wave_warning_check(self) -> None:
+        image = Image.new("RGB", (900, 1600), (55, 35, 25))
+        confirm = Image.open(ROBBER_TEMPLATE.parent / "picker_confirm.png").convert("RGB")
+        image.paste(confirm, (600, 880))
+        self.assertIsNone(find_picker_confirm_button(image, threshold=0.70))
+        warning = find_empty_wave_warning_confirm(image, threshold=0.70)
+        self.assertIsNotNone(warning)
+        assert warning is not None
+        self.assertGreater(warning[0], 0.55)
+        self.assertGreaterEqual(warning[1], 0.48)
+        self.assertLessEqual(warning[1], 0.68)
+
+    def test_no_commanders_ocr_reads_garbled_inscription(self) -> None:
+        from e4kbot.vision import _no_commanders_conclusion, _no_commanders_text_hit
+
+        garbled = (
+            "Bunsanne! Cenuyac y Te6R HeT CBOGOQHbIX BOCHANANbHMKOB. "
+            "XOYeLWb HaHATb PeZepBHOO BOEHAYANbHUKA ANA ITOLO HanadeHna? Uena: 125"
+        )
+        self.assertTrue(_no_commanders_text_hit(garbled))
+        conclusion = _no_commanders_conclusion(garbled)
+        self.assertIn("нет свободных военачальников", conclusion)
+        self.assertIn("нанять резерв", conclusion)
+        self.assertIn("125", conclusion)
+        self.assertIn("красным крестиком", conclusion)
+        self.assertTrue(
+            _no_commanders_text_hit(
+                "Сейчас у тебя нет свободных наместников. Хочешь нанять резервного?"
+            )
+        )
+        namestnik = _no_commanders_conclusion(
+            "Сейчас у тебя нет свободных наместников. Хочешь нанять резервного?"
+        )
+        self.assertIn("наместников", namestnik)
+        self.assertFalse(_no_commanders_text_hit("Начать нападение?"))
+        live_garbled = (
+            "Buumanne! Cenuyac y Te6A HET CBOOOQHbIX BOCHAYAIbHUKOB. "
+            "XOYELUb HaHATb PeSe€pBHOIO BOeEHAYaNIbHUKa OA 3TOFO HanageHuna? LleHa: 125"
+        )
+        self.assertTrue(_no_commanders_text_hit(live_garbled))
+        live_conclusion = _no_commanders_conclusion(live_garbled)
+        self.assertIn("нет свободных военачальников", live_conclusion)
+        self.assertIn("125", live_conclusion)
+        self.assertIn("красным крестиком", live_conclusion)
+
+    def test_no_commanders_asset_closes_red_not_green_hire(self) -> None:
+        image = Image.open(ROBBER_TEMPLATE.parent / "no_commanders.png").convert("RGB")
+        diagnostic = no_commanders_diagnostics(image)
+        self.assertTrue(diagnostic["valid"], diagnostic)
+        self.assertTrue(diagnostic["text"])
+        self.assertIn("рубин", diagnostic["conclusion"])
+        self.assertIn("красным крестиком", diagnostic["conclusion"])
+        assert diagnostic["point"] is not None
+        self.assertFalse(is_green_hire_point(*diagnostic["point"]))
+        self.assertLess(diagnostic["point"][1], 0.55)
+
+    def test_prepare_wave_fails_when_formation_still_empty(self) -> None:
+        dummy = Image.new("RGB", (900, 1600), (80, 50, 30))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.config = {"vision": {"picker_max_actions": 1, "minimum_flank_fill": 0.70}}
+        engine.telegram = Mock()
+        engine.store = Mock()
+        engine.store.live = Mock()
+        engine._image = Mock(return_value=dummy)
+        engine.layout = {"buttons": {"unit_slot": [0.07, 0.70]}}
+        engine._tap_norm_exact = Mock()
+        engine._dismiss_empty_wave_warning = Mock(return_value=False)
+        engine.tap_rel = Mock()
+        engine._wait_for = Mock(return_value=dummy)
+        engine._picker_overlay_open = Mock(return_value=False)
+        engine._dump_picker_max = Mock(
+            side_effect=lambda: setattr(engine, "_last_picker_fill", (10, 10)) or True
+        )
+        engine._read_ratio_from_image = Mock(
+            side_effect=lambda _image, key: {
+                "picker_units": (10, 10),
+                "formation_units": (0, 19),
+                "formation_tools": None,
+            }.get(key)
+        )
+        engine.diagnose_unit_picker_confirm = Mock(return_value=(True, "confirmed", dummy))
+        ok, reason = engine._prepare_single_center_wave()
+        self.assertFalse(ok)
+        self.assertEqual(reason, "formation_units_empty")
+
+    def test_assume_picker_capacity_does_not_invent_full_fill(self) -> None:
+        dummy = Image.new("RGB", (900, 1600), (80, 50, 30))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine._last_picker_fill = None
+        engine._read_ratio_from_image = Mock(return_value=(0, 19))
+        self.assertEqual(engine._assume_picker_capacity(dummy, (0, 19)), (0, 19))
+        engine._read_ratio_from_image = Mock(return_value=(19, 19))
+        self.assertEqual(engine._assume_picker_capacity(dummy, (0, 19)), (19, 19))
 
     def test_picker_diagnostic_mode_never_clicks(self) -> None:
         image = Image.new("RGB", (900, 1600), (55, 35, 25))
@@ -222,6 +319,7 @@ class VisionTests(unittest.TestCase):
         engine.store.live = Mock()
         engine._last_picker_fill = None
         engine._image = Mock(return_value=dummy)
+        engine._dismiss_empty_wave_warning = Mock(return_value=False)
         engine.tap_rel = Mock()
         engine._wait_for = Mock(return_value=dummy)
         engine._picker_overlay_open = Mock(return_value=False)
@@ -230,7 +328,7 @@ class VisionTests(unittest.TestCase):
         engine._read_ratio_from_image = Mock(
             side_effect=lambda _image, key: {
                 "picker_units": (10, 10),
-                "formation_units": (0, 10),
+                "formation_units": None,
                 "formation_tools": None,
             }.get(key)
         )
@@ -262,6 +360,7 @@ class VisionTests(unittest.TestCase):
         engine._wait_for = Mock(return_value=dummy)
         engine._is_plain_formation = Mock(return_value=True)
         engine._select_best_picker_card = Mock(return_value=True)
+        engine._dismiss_empty_wave_warning = Mock(return_value=False)
 
         def dump_max() -> bool:
             engine._last_picker_fill = (10, 10)
@@ -271,7 +370,7 @@ class VisionTests(unittest.TestCase):
         engine._read_ratio_from_image = Mock(
             side_effect=lambda _image, key: {
                 "picker_units": (10, 10),
-                "formation_units": (0, 10),
+                "formation_units": None,
                 "formation_tools": None,
             }.get(key)
         )
@@ -465,6 +564,7 @@ class HuntTests(unittest.TestCase):
         engine._await_world_map = Mock(return_value=green)
         engine._dismiss_special_offers_if_open = Mock(return_value=False)
         engine._match_visible_target = Mock(return_value=None)
+        engine._recenter_on_main_castle = Mock(return_value=green)
         engine._jump_to_coords = Mock()
         point = engine._focus_hunt_target(
             "baron", HuntTarget((0.42, 0.51), (609, 739))
@@ -634,6 +734,7 @@ class HuntTests(unittest.TestCase):
         engine.store = Mock()
         engine.store.live = Mock()
         engine.tap_rel = Mock()
+        engine._dismiss_empty_wave_warning = Mock(return_value=False)
         engine._prepare_single_center_wave = Mock(
             return_value=(False, "unit_picker_fill_not_retained")
         )
@@ -647,6 +748,8 @@ class HuntTests(unittest.TestCase):
         engine._hunt_queue = [HuntTarget((0.42, 0.51), (607, 743))]
         engine._blocked_screen_targets = []
         engine._image = Mock(return_value=Image.new("RGB", (900, 1600), (80, 50, 30)))
+        engine._dismiss_empty_wave_warning = Mock(return_value=False)
+        engine._dismiss_no_commanders = Mock(return_value=False)
         engine._plan_or_picker_open = Mock(return_value=True)
         engine._collect_hunt_batch = Mock()
         engine._execute_formation_attack = Mock(return_value="baron")
@@ -654,6 +757,18 @@ class HuntTests(unittest.TestCase):
         self.assertEqual(result, "baron")
         engine._collect_hunt_batch.assert_not_called()
         engine._execute_formation_attack.assert_called_once()
+
+    def test_on_screen_attack_stops_on_no_commanders_inscription(self) -> None:
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.config = {}
+        engine._hunt_queue = []
+        engine._blocked_screen_targets = []
+        engine._image = Mock(return_value=Image.new("RGB", (900, 1600), (80, 50, 30)))
+        engine._dismiss_empty_wave_warning = Mock(return_value=False)
+        engine._dismiss_no_commanders = Mock(return_value=True)
+        engine._collect_hunt_batch = Mock()
+        self.assertEqual(engine.on_screen_attack("baron"), "no_commanders")
+        engine._collect_hunt_batch.assert_not_called()
 
     def test_second_prepare_still_clicks_confirm_like_first(self) -> None:
         dummy = Image.new("RGB", (900, 1600), (80, 50, 30))
@@ -669,10 +784,11 @@ class HuntTests(unittest.TestCase):
         engine._dump_picker_max = Mock(
             side_effect=lambda: setattr(engine, "_last_picker_fill", (10, 10)) or True
         )
+        engine._dismiss_empty_wave_warning = Mock(return_value=False)
         engine._read_ratio_from_image = Mock(
             side_effect=lambda _image, key: {
                 "picker_units": (10, 10),
-                "formation_units": (0, 10),
+                "formation_units": None,
                 "formation_tools": None,
             }.get(key)
         )
@@ -701,10 +817,11 @@ class HuntTests(unittest.TestCase):
         engine._dump_picker_max = Mock(
             side_effect=lambda: setattr(engine, "_last_picker_fill", (10, 10)) or True
         )
+        engine._dismiss_empty_wave_warning = Mock(return_value=False)
         engine._read_ratio_from_image = Mock(
             side_effect=lambda _image, key: {
                 "picker_units": (10, 10),
-                "formation_units": (0, 10),
+                "formation_units": None,
                 "formation_tools": None,
             }.get(key)
         )

@@ -269,7 +269,8 @@ class AttackBot:
             f"Режим: {engine_name} / {self.config.get('attack_style') or 'on_screen'}\n"
             f"DRY-RUN: {self.store.live.dry_run}\n"
             "Каденс: 8–10 сек от прошлой успешной отправки. "
-            "Бароны до таблички «нет военачальников», потом красный крестик и ожидание возврата"
+            "Бароны до таблички «нет свободных военачальников/наместников», "
+            "потом красный крестик (не нанимать за рубины) и ожидание возврата"
         )
 
     def _ensure_engines(self) -> bool:
@@ -315,7 +316,7 @@ class AttackBot:
 
     def report_no_commanders_summary(self) -> None:
         self._send_session_summary(
-            "Нет свободных военачальников — закрыл красным крестиком, жду возврат"
+            "Нет свободных военачальников/наместников — закрыл красным крестиком, жду возврат"
         )
 
     def handle_no_commanders_result(self) -> None:
@@ -334,9 +335,13 @@ class AttackBot:
                 wait_until - time.time(),
             )
             return
-        logger.info("Нет военачальников и никто не в пути — пауза до ВКЛ")
-        self._armed_for_report = False
-        CONTROL.disable()
+        fallback = time.time() + 12 * 60
+        self.store.live.next_attack_at = fallback
+        self.store.live.mode = "wait_commanders"
+        self.store.save()
+        logger.info(
+            "Нет свободных наместников, локального таймера нет — жду 12 мин и продолжу"
+        )
 
     def _send_session_summary(self, reason: str) -> None:
         summary = self.store.session_summary()

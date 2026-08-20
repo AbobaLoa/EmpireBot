@@ -26,6 +26,8 @@ from e4kbot.telegram_bot import TelegramReporter
 from e4kbot.vision import (
     choose_movement,
     crop_rel,
+    _no_commanders_red_closes,
+    find_empty_wave_warning_confirm,
     find_picker_cards,
     find_picker_confirm_button,
     find_picker_max_control,
@@ -36,11 +38,14 @@ from e4kbot.vision import (
     flank_fill_allowed,
     is_formation_screen,
     is_burning_candidate,
+    is_green_hire_point,
     is_map_screen,
+    is_no_commanders_parchment,
     is_offer_rail_point,
     is_special_offers_screen,
     is_travel_dialog,
     movement_confirm_diagnostics,
+    no_commanders_diagnostics,
     ocr_text,
     parse_count,
     parse_coordinate_pair,
@@ -130,6 +135,7 @@ class BlueStacksEngine:
         self._last_picker_fill: tuple[int, int] | None = None
         self._hunt_queue: list[HuntTarget] = []
         self._picker_stall_count = 0
+        self._no_commanders_seen = False
 
     _PICKER_STALL_REASONS = frozenset(
         {
@@ -138,6 +144,7 @@ class BlueStacksEngine:
             "unit_picker_fill_not_retained",
             "unit_picker_confirm_not_confident",
             "unit_picker_confirm_transition_failed",
+            "formation_units_empty",
         }
     )
 
@@ -209,6 +216,8 @@ class BlueStacksEngine:
             )
             return False
         if not is_special_offers_screen(image):
+            if is_no_commanders_parchment(image) and ny < 0.55:
+                return True
             logger.warning(
                 "Блокирую тап на правом rail ({:.3f}, {:.3f}) — магазин/сундуки/оплату не открываю",
                 nx,
@@ -283,12 +292,71 @@ class BlueStacksEngine:
         return bool(ratio and ratio[0] > 0 and ratio[1] > 0)
 
     def _picker_overlay_open(self, image: Any) -> bool:
-        """True when the unit picker overlay is visible (OCR or vision)."""
-        if self._read_ratio_from_image(image, "picker_units") is not None:
+        """True when the unit picker overlay is visible. Never the empty-wave warning."""
+        if find_picker_cards(image):
             return True
         if find_picker_confirm_button(image) is not None:
             return True
-        return bool(find_picker_cards(image))
+        if find_picker_max_control(image) is not None:
+            return True
+        return False
+
+    def _dismiss_empty_wave_warning(self) -> bool:
+        """Close «не назначив солдат» with its mid-dialog green check."""
+        try:
+            image = self._image()
+        except Exception:
+            return False
+        if is_no_commanders_parchment(image):
+            return False
+        point = find_empty_wave_warning_confirm(image)
+        if point is None:
+            return False
+        logger.warning(
+            "Закрываю предупреждение пустой волны ({:.3f}, {:.3f}) — солдат в волне нет",
+            point[0],
+            point[1],
+        )
+        self._tap_norm_exact(*point)
+        CONTROL.sleep(0.45)
+        return True
+
+    def _dismiss_no_commanders(self, image: Any | None = None) -> bool:
+        """If the hire-reserve parchment is open, read it and close with red X only."""
+        try:
+            shot = image if image is not None else self._image()
+        except Exception:
+            return False
+        diagnostic = no_commanders_diagnostics(shot)
+        if not diagnostic["valid"] or diagnostic["point"] is None:
+            return False
+        save_shot(shot, "no-commanders.png")
+        logger.warning(
+            "Надпись: {} → {}",
+            (diagnostic.get("text") or "").replace("\n", " ")[:180],
+            diagnostic.get("conclusion") or "нет свободных военачальников",
+        )
+        point = diagnostic["point"]
+        if is_green_hire_point(*point):
+            logger.error("Отказ: зелёная печать найма за рубины — не жму")
+            return False
+        if is_offer_rail_point(*point):
+            alt = [
+                (nx, ny)
+                for _score, nx, ny in _no_commanders_red_closes(shot)
+                if not is_offer_rail_point(nx, ny) and not is_green_hire_point(nx, ny)
+            ]
+            if alt:
+                point = alt[0]
+        logger.warning(
+            "Закрываю табличку наместников/военачальников красным крестиком ({:.3f}, {:.3f})",
+            point[0],
+            point[1],
+        )
+        self._tap_norm_exact(*point)
+        CONTROL.sleep(0.5)
+        self._no_commanders_seen = True
+        return True
 
     def _open_unit_picker(self, slot_key: str) -> tuple[Any | None, str]:
         """Tap the flank cell unless the picker is already open."""
@@ -440,12 +508,17 @@ class BlueStacksEngine:
             draw.line((x, y - 35, x, y + 35), fill=color, width=3)
         save_shot(annotated, "movement-confirm-before.png")
         logger.info("Movement confirm diagnostic: {}", diagnostic)
+        if self._dismiss_no_commanders(image):
+            return False, "no_commanders", None
         if not diagnostic["valid"] or point is None:
             return False, "movement_confirm_not_confident", None
         if not click:
             return True, "diagnostic_only", image
         self._tap_norm_exact(*point)
         after = self._wait_for(is_map_screen, timeout=8)
+        latest = after if after is not None else self._image()
+        if self._dismiss_no_commanders(latest):
+            return False, "no_commanders", None
         if after is None or is_formation_screen(self._image()):
             failed = self._image()
             save_shot(failed, "movement-confirm-transition-failed.png")
@@ -702,6 +775,12 @@ class BlueStacksEngine:
         if ingest(image):
             logger.info("Пачка охоты готова: {} целей, полный скан больше не нужен", len(found))
             return found
+        if found:
+            logger.info(
+                "На экране у замка уже {} целей — бью их до скана остальной карты",
+                len(found),
+            )
+            return found
         for dx, dy in self._map_scan_offsets():
             logger.info("Скан карты: сдвиг ({:+.2f}, {:+.2f})", dx, dy)
             self._pan_map(dx, dy)
@@ -745,6 +824,11 @@ class BlueStacksEngine:
         if self._dismiss_special_offers_if_open(image):
             image = self._await_world_map(timeout=4) or self._image()
         visible = self._match_visible_target(image, kind, target)
+        if visible:
+            self._selected_target_coords = target.coords
+            return visible
+        recentered = self._recenter_on_main_castle(image)
+        visible = self._match_visible_target(recentered, kind, target)
         if visible:
             self._selected_target_coords = target.coords
             return visible
@@ -946,20 +1030,31 @@ class BlueStacksEngine:
         target_x = parse_count(ocr_text(crop_rel(popup, x_region), psm=6)) if x_region else None
         target_y = parse_count(ocr_text(crop_rel(popup, y_region), psm=6)) if y_region else None
         if target_x is None or target_y is None:
-            return False
-        self._selected_target_coords = (target_x, target_y)
-        kingdom = int((self.config.get("baron_attacks") or {}).get("kingdom", 0))
-        if not self.store.target_available(kind, kingdom, target_x, target_y):
-            logger.info(f"Цель {target_x}:{target_y} ещё на локальной перезарядке")
-            self.tap_rel("map")
-            return False
+            logger.warning(
+                "Координаты цели с таблички не прочитались — атакую по видимой кнопке"
+            )
+        else:
+            self._selected_target_coords = (target_x, target_y)
+            kingdom = int((self.config.get("baron_attacks") or {}).get("kingdom", 0))
+            if not self.store.target_available(kind, kingdom, target_x, target_y):
+                logger.info(f"Цель {target_x}:{target_y} ещё на локальной перезарядке")
+                self.tap_rel("map")
+                return False
         attack_point = find_target_attack_button(popup)
         if attack_point is None:
             return False
         self._tap_norm(*attack_point)
         time.sleep(1.0)
         self.tap_rel("start_attack_confirm")
-        return self._wait_for(is_formation_screen, timeout=10) is not None
+        opened = self._wait_for(
+            lambda img: is_formation_screen(img) or is_no_commanders_parchment(img),
+            timeout=10,
+            label="формирование",
+        )
+        shot = opened if opened is not None else self._image()
+        if self._dismiss_no_commanders(shot):
+            return False
+        return opened is not None and is_formation_screen(self._image())
 
     def _read_ratio(self, key: str) -> tuple[int, int] | None:
         return parse_ratio(self.read_region(key))
@@ -1026,11 +1121,11 @@ class BlueStacksEngine:
             cap = self._last_picker_fill[1]
         if cap <= 0:
             cap = 10
-        cur = ratio[0] if ratio and ratio[0] > 0 else cap
+        cur = ratio[0] if ratio and ratio[0] > 0 else 0
         if before and before[0] > cur:
             cur = before[0]
-        if cur < cap:
-            cur = cap
+        if self._last_picker_fill and self._last_picker_fill[0] > cur:
+            cur = self._last_picker_fill[0]
         return cur, cap
 
     def _vision_fill_picker_fallback(self) -> bool:
@@ -1048,6 +1143,9 @@ class BlueStacksEngine:
                 self._tap_norm_exact(float(layout[0]), float(layout[1]))
         CONTROL.sleep(0.5)
         cur, cap = self._assume_picker_capacity(self._image(), self._last_picker_fill)
+        if cur <= 0:
+            logger.warning("Пикер: fallback MAX не дал заполнения")
+            return False
         self._last_picker_fill = (cur, cap)
         logger.info("Пикер: overlay виден — считаю {}/{} и иду к галочке", cur, cap)
         return True
@@ -1085,19 +1183,20 @@ class BlueStacksEngine:
                         or ratio[0] > before[0]
                         or ratio[1] != before[1]
                     )
-                    if progressed or find_picker_confirm_button(shot) is not None:
+                    if progressed:
                         self._last_picker_fill = ratio
                         logger.info("Пикер после MAX: {}/{}", ratio[0], ratio[1])
                         return True
             if self._picker_confirm_point(shot) is not None:
                 cur, cap = self._assume_picker_capacity(shot, before)
-                self._last_picker_fill = (cur, cap)
-                logger.info(
-                    "Пикер: галочка видна после MAX — считаю {}/{}",
-                    cur,
-                    cap,
-                )
-                return True
+                if cur > 0:
+                    self._last_picker_fill = (cur, cap)
+                    logger.info(
+                        "Пикер: галочка видна после MAX — считаю {}/{}",
+                        cur,
+                        cap,
+                    )
+                    return True
             if time.time() >= next_heartbeat:
                 logger.info("Пикер: жду MAX… ({:.0f}s)", time.time() - started)
                 next_heartbeat = time.time() + 2.0
@@ -1107,14 +1206,18 @@ class BlueStacksEngine:
         return bool(latest and latest[0] >= latest[1] > 0)
 
     def _fill_picker_to_capacity(self) -> bool:
-        """Cell already open: MAX, then wait until current==capacity (Юниты 10/10)."""
+        """Select a unit row if empty, then MAX until current==capacity."""
+        if not self._positive_unit_fill(self._last_picker_fill):
+            self._select_best_picker_card()
         max_attempts = int((self.config.get("vision") or {}).get("picker_max_attempts") or 3)
         wait_seconds = self._vision_seconds("picker_fill_timeout_seconds", 10)
         for attempt in range(max(1, max_attempts)):
             if self._dump_picker_max():
                 return True
+            if not self._positive_unit_fill(self._last_picker_fill):
+                self._select_best_picker_card()
             if attempt + 1 < max_attempts:
-                logger.info("MAX без 10/10 — повтор {}/{}", attempt + 2, max_attempts)
+                logger.info("MAX без заполнения — повтор {}/{}", attempt + 2, max_attempts)
                 CONTROL.sleep(0.35)
         if self._vision_fill_picker_fallback():
             return True
@@ -1131,13 +1234,11 @@ class BlueStacksEngine:
                 self._last_picker_fill = ratio
                 logger.info("Пикер заполнен {}/{}", ratio[0], ratio[1])
                 return True
-            if self._picker_confirm_point(shot) is not None:
-                cur, cap = self._assume_picker_capacity(shot, self._last_picker_fill)
-                self._last_picker_fill = (cur, cap)
-                logger.info("Пикер: жду 10/10, но галочка видна — {}/{}", cur, cap)
-                return True
             if self._positive_unit_fill(ratio):
                 self._last_picker_fill = ratio
+                if self._picker_confirm_point(shot) is not None:
+                    logger.info("Пикер: есть солдаты {}/{} и галочка", ratio[0], ratio[1])
+                    return True
             if time.time() >= next_heartbeat:
                 logger.info("Пикер: жду 10/10… ({:.0f}s)", time.time() - started)
                 next_heartbeat = time.time() + 2.0
@@ -1152,6 +1253,7 @@ class BlueStacksEngine:
         # Do not skip confirm because leftover OCR still looks like 10/10.
         last_reason = ""
         for sequence_attempt in range(2):
+            self._dismiss_empty_wave_warning()
             if sequence_attempt:
                 logger.warning("Пикер: повтор полной последовательности 2/2")
                 slot = self.layout.get("buttons", {}).get("unit_slot")
@@ -1194,18 +1296,22 @@ class BlueStacksEngine:
             units = self._read_ratio_from_image(formation, "formation_units")
             if units and units[0] == units[1] and units[1] > 0:
                 break
-            if (
-                self._last_picker_fill
-                and self._last_picker_fill[0] >= self._last_picker_fill[1] > 0
-            ):
+            if units is None and self._positive_unit_fill(self._last_picker_fill):
                 break
         observed = self._last_picker_fill
         final_units = self._read_ratio_from_image(formation, "formation_units")
-        if self._positive_unit_fill(observed) and (
-            not final_units or final_units[0] <= 0
-        ):
+        if final_units is not None and final_units[0] <= 0:
+            save_shot(formation, "formation-units-empty.png")
+            logger.warning(
+                "Формирование {}/{} после пикера {} — Нападение не жму",
+                final_units[0],
+                final_units[1],
+                observed,
+            )
+            return False, "formation_units_empty"
+        if self._positive_unit_fill(observed) and not final_units:
             logger.info(
-                "Пикер закрылся после заполнения {}/{}; продолжаю к Нападению",
+                "OCR формирования пуст после {}/{}; беру заполнение пикера",
                 observed[0],
                 observed[1],
             )
@@ -1286,6 +1392,10 @@ class BlueStacksEngine:
         if getattr(self, "_blocked_screen_targets", None) is None:
             self._blocked_screen_targets = []
         current = self._image()
+        if self._dismiss_no_commanders(current):
+            return "no_commanders"
+        self._dismiss_empty_wave_warning()
+        current = self._image()
         if self._plan_or_picker_open(current):
             logger.info(
                 "Экран планирования уже открыт — не закрываю, продолжаю набор/Нападение"
@@ -1327,6 +1437,8 @@ class BlueStacksEngine:
                 if self._open_formation(point, kind):
                     opened = True
                     break
+                if self._no_commanders_seen:
+                    return "no_commanders"
                 self._blocked_screen_targets.append(point)
                 blocked = self._image()
                 if self._plan_or_picker_open(blocked):
@@ -1359,6 +1471,7 @@ class BlueStacksEngine:
         self.tap_rel("formation_attack")
 
     def _execute_formation_attack(self, kind: str, point: tuple[float, float]) -> str:
+        self._dismiss_empty_wave_warning()
         self._last_picker_fill = None
         ok, reason = self._prepare_single_center_wave()
         if not ok:
@@ -1395,11 +1508,18 @@ class BlueStacksEngine:
         self._picker_stall_count = 0
         self._tap_formation_attack()
         travel = self._wait_for(
-            is_travel_dialog,
+            lambda img: is_travel_dialog(img) or is_no_commanders_parchment(img),
             timeout=self._vision_seconds("travel_dialog_timeout_seconds", 15),
             label="диалог похода",
         )
+        if travel is not None and self._dismiss_no_commanders(travel):
+            return "no_commanders"
         if travel is None:
+            if self._dismiss_empty_wave_warning():
+                logger.warning("Нападение отклонено: волна пустая")
+                return "unsafe_formation"
+            if self._dismiss_no_commanders():
+                return "no_commanders"
             logger.warning("Нет диалога похода — план не закрываю крестиком")
             return "travel_dialog_not_found"
         movement, feathers = self._movement_option(travel)
@@ -1480,6 +1600,8 @@ class BlueStacksEngine:
             return kind
         wait_for_send_slot(self.store, self.config)
         confirmed, reason, _ = self.diagnose_movement_confirm(click=True)
+        if reason == "no_commanders":
+            return "no_commanders"
         if not confirmed:
             self.store.live.last_error = reason
             self.store.save()

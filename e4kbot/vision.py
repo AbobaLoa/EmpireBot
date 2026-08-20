@@ -330,6 +330,8 @@ def is_map_screen(image: Image.Image) -> bool:
 
 def is_formation_screen(image: Image.Image) -> bool:
     """Attack-planning screen: parchment plus a wave header (often above y=0.61)."""
+    if _no_commanders_unique_template_score(image) >= 0.48:
+        return False
     wave = formation_wave_diagnostics(image)
     bgr = _reference_bgr(image)
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
@@ -343,6 +345,8 @@ def is_formation_screen(image: Image.Image) -> bool:
 
 
 def is_travel_dialog(image: Image.Image) -> bool:
+    if _no_commanders_unique_template_score(image) >= 0.48:
+        return False
     bgr = _reference_bgr(image)
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     brown = cv2.inRange(hsv[230:1360, 70:830], (3, 35, 20), (30, 255, 190))
@@ -475,16 +479,101 @@ def is_green_hire_point(nx: float, ny: float) -> bool:
     return nx > 0.52 and ny > 0.55
 
 
+def _ocr_compact(text: str) -> str:
+    """Letters/digits only so Latin-garbled Tesseract still matches Russian UI."""
+    return "".join(ch for ch in (text or "").lower().replace("ё", "е") if ch.isalnum())
+
+
+_COMMANDER_TOKENS = (
+    "военачаль",
+    "наместник",
+    "командир",
+    "boehay",
+    "bochan",
+    "bochay",
+    "boeeha",
+    "voenach",
+    "namestn",
+)
+_NONE_FREE_TOKENS = (
+    "нетсвобод",
+    "hetcbogo",
+    "hetcbooo",
+    "cbogoqh",
+    "cboooqh",
+    "свободных",
+)
+_HIRE_RESERVE_TOKENS = (
+    "нанятьрезерв",
+    "hanatbpe",
+    "резервн",
+    "pe3epb",
+    "pezepb",
+    "pezerb",
+    "pesepb",
+)
+
+
 def _no_commanders_text_hit(text: str) -> bool:
-    blob = (text or "").lower().replace("ё", "е")
-    if "начать нападен" in blob:
+    """True for «нет свободных военачальников/наместников» hire parchment.
+
+    Tesseract often emits Latin lookalikes: HeT CBOGOQHbIX BOCHANANbHMKOB.
+    """
+    blob = _ocr_compact(text)
+    if not blob:
         return False
-    if "военачаль" not in blob and "командир" not in blob:
+    if "начатьнападен" in blob or "nachatnapaden" in blob:
         return False
-    return any(
+    commander = any(token in blob for token in _COMMANDER_TOKENS)
+    none_free = any(token in blob for token in _NONE_FREE_TOKENS)
+    hire_reserve = any(token in blob for token in _HIRE_RESERVE_TOKENS)
+    return commander and (none_free or hire_reserve)
+
+
+def _inscription_ruby_price(text: str) -> int | None:
+    """Price from «Цена: 125» / garbled «Uena: 125» / «LleHa: 125»."""
+    blob = _ocr_compact(text)
+    labeled = re.search(r"(?:cena|uena|lleha|цена|ueha)(\d{2,4})", blob)
+    if labeled:
+        value = int(labeled.group(1))
+        if 50 <= value <= 5000:
+            return value
+    for raw in re.findall(r"\d{2,4}", text or ""):
+        value = int(raw)
+        if 50 <= value <= 5000:
+            return value
+    return None
+
+
+def _no_commanders_conclusion(text: str) -> str:
+    """Turn the parchment inscription into an action, not a canned label."""
+    blob = _ocr_compact(text)
+    parts: list[str] = []
+    namestnik = "наместник" in blob or "namestn" in blob
+    voenachal = any(
         token in blob
-        for token in ("нет свобод", "нанять резерв", "резервного", "законч")
+        for token in ("военачаль", "boehay", "bochan", "bochay", "boeeha", "voenach")
     )
+    if any(token in blob for token in _NONE_FREE_TOKENS):
+        if namestnik and not voenachal:
+            parts.append("надпись: нет свободных наместников")
+        elif voenachal and not namestnik:
+            parts.append("надпись: нет свободных военачальников")
+        else:
+            parts.append("надпись: нет свободных военачальников/наместников")
+    elif any(token in blob for token in _COMMANDER_TOKENS):
+        parts.append("надпись: нет свободных военачальников/наместников")
+    if any(token in blob for token in _HIRE_RESERVE_TOKENS):
+        parts.append("предлагают нанять резерв")
+    price = _inscription_ruby_price(text)
+    if price is not None:
+        parts.append(f"цена {price} рубинов")
+    elif "рубин" in blob or "rubin" in blob:
+        parts.append("цена в рубинах")
+    if not parts:
+        parts.append("табличка найма военачальника")
+    parts.append("нанимать нельзя — закрываю красным крестиком и жду возврат")
+    return "; ".join(parts)
 
 
 def _no_commanders_unique_template_score(image: Image.Image) -> float:
@@ -567,11 +656,19 @@ def _looks_like_hire_parchment(image: Image.Image) -> bool:
     return bool(_no_commanders_red_closes(image))
 
 
+def _parchment_ocr(image: Image.Image) -> str:
+    """OCR the hire/attention parchment; full image if it is already a crop."""
+    width, height = image.size
+    if width <= 600 or height <= 500:
+        return ocr_text_ui(image, psm=6)
+    return ocr_text_ui(crop_rel(image, [0.08, 0.18, 0.92, 0.70]), psm=6)
+
+
 def no_commanders_diagnostics(
     image: Image.Image,
     recognized_text: str | None = None,
 ) -> dict[str, Any]:
-    """Strict hire-reserve parchment only. Uncertain screens must not match."""
+    """Hire-reserve parchment only. Never the green 125-ruby seal."""
     diagnostic: dict[str, Any] = {
         "point": None,
         "popup_bounds": None,
@@ -579,30 +676,26 @@ def no_commanders_diagnostics(
         "text": "",
         "valid": False,
         "template_score": 0.0,
+        "conclusion": "",
     }
     if is_special_offers_screen(image, recognized_text):
         return diagnostic
-    if recognized_text is None and (
-        is_formation_screen(image)
-        or is_travel_dialog(image)
-        or movement_confirm_diagnostics(image)["valid"]
-        or find_target_attack_button(image) is not None
-    ):
-        return diagnostic
-    template_score = 0.0 if recognized_text is not None else _no_commanders_unique_template_score(image)
+    template_score = (
+        0.0 if recognized_text is not None else _no_commanders_unique_template_score(image)
+    )
     diagnostic["template_score"] = template_score
-    strong_template = template_score >= 0.62
+    strong_template = template_score >= 0.55
     if recognized_text is not None:
-        text = recognized_text.lower().replace("ё", "е")
-    elif strong_template:
-        text = ""
-    else:
-        text = ocr_text_ui(image, psm=6).lower().replace("ё", "е")
-    diagnostic["text"] = text
-    if "начать нападен" in text.replace("ё", "е"):
+        text = recognized_text
+    elif template_score < 0.48:
         return diagnostic
+    else:
+        text = _parchment_ocr(image)
+    diagnostic["text"] = text
     text_hit = _no_commanders_text_hit(text)
     if not (text_hit or strong_template):
+        return diagnostic
+    if find_target_attack_button(image) is not None and not text_hit:
         return diagnostic
     if not _looks_like_hire_parchment(image):
         return diagnostic
@@ -613,7 +706,13 @@ def no_commanders_diagnostics(
     diagnostic["point"] = point
     diagnostic["valid"] = True
     diagnostic["red_ratio"] = 1.0
+    diagnostic["conclusion"] = _no_commanders_conclusion(text)
     return diagnostic
+
+
+def is_no_commanders_parchment(image: Image.Image) -> bool:
+    """Cheap template gate for wait-loops. Full OCR runs on dismiss."""
+    return _no_commanders_unique_template_score(image) >= 0.48
 
 
 def generic_modal_diagnostics(
@@ -972,7 +1071,10 @@ def picker_confirm_diagnostics(
     image: Image.Image,
     template_path: Path = PICKER_CONFIRM_TEMPLATE,
     threshold: float = 0.72,
+    y_min: float = 0.70,
+    y_max: float = 0.92,
 ) -> dict[str, Any]:
+    """Green check in a vertical band. Picker confirm is lower-right (~0.73, 0.80)."""
     diagnostic: dict[str, Any] = {
         "point": None,
         "popup_bounds": (0.08, 0.18, 0.92, 0.90),
@@ -980,6 +1082,8 @@ def picker_confirm_diagnostics(
         "green_ratio": 0.0,
         "check_ratio": 0.0,
         "valid": False,
+        "y_min": y_min,
+        "y_max": y_max,
     }
     if not template_path.exists():
         return diagnostic
@@ -994,11 +1098,10 @@ def picker_confirm_diagnostics(
         return diagnostic
     x = location[0] + template.shape[1] / 2
     y = location[1] + template.shape[0] / 2
-    left, top, right, bottom = diagnostic["popup_bounds"]
-    if not (
-        (left + right) / 2 < x / 900 < right
-        and (top + bottom) / 2 < y / 1600 < bottom
-    ):
+    nx = x / REFERENCE_SIZE[0]
+    ny = y / REFERENCE_SIZE[1]
+    diagnostic["point"] = (nx, ny)
+    if not (0.55 <= nx <= 0.95 and y_min <= ny <= y_max):
         return diagnostic
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     patch = hsv[
@@ -1011,7 +1114,6 @@ def picker_confirm_diagnostics(
         return diagnostic
     diagnostic["green_ratio"] = float(np.count_nonzero(green)) / green.size
     diagnostic["check_ratio"] = float(np.count_nonzero(check)) / check.size
-    diagnostic["point"] = (x / 900, y / 1600)
     diagnostic["valid"] = (
         diagnostic["green_ratio"] >= 0.12 and diagnostic["check_ratio"] >= 0.015
     )
@@ -1024,6 +1126,22 @@ def find_picker_confirm_button(
     threshold: float = 0.72,
 ) -> tuple[float, float] | None:
     diagnostic = picker_confirm_diagnostics(image, template_path, threshold)
+    return diagnostic["point"] if diagnostic["valid"] else None
+
+
+def find_empty_wave_warning_confirm(
+    image: Image.Image,
+    template_path: Path = PICKER_CONFIRM_TEMPLATE,
+    threshold: float = 0.72,
+) -> tuple[float, float] | None:
+    """Mid-dialog green check for «не назначив солдат в волны», never the picker."""
+    diagnostic = picker_confirm_diagnostics(
+        image,
+        template_path,
+        threshold,
+        y_min=0.48,
+        y_max=0.68,
+    )
     return diagnostic["point"] if diagnostic["valid"] else None
 
 
