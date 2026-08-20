@@ -62,6 +62,9 @@ class LiveState:
     session_attacks: int = 0
     session_gold: int = 0
     session_rubies: int = 0
+    session_by_mode: dict[str, int] = field(default_factory=dict)
+    skipped_modes: list[str] = field(default_factory=list)
+    active_mode: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         from e4kbot.control import CONTROL
@@ -105,6 +108,9 @@ class LiveState:
             "session_attacks": int(self.session_attacks),
             "session_gold": int(self.session_gold),
             "session_rubies": int(self.session_rubies),
+            "session_by_mode": dict(self.session_by_mode),
+            "skipped_modes": list(self.skipped_modes),
+            "active_mode": self.active_mode,
             "server_time": int(now),
         }
 
@@ -194,6 +200,8 @@ class StateStore:
         )
         self.live.marches.append(march)
         self.live.session_attacks += 1
+        mode_id = self.live.active_mode or kind
+        self.live.session_by_mode[mode_id] = int(self.live.session_by_mode.get(mode_id) or 0) + 1
         self.live.last_confirmed_one_way_sec = one_way
         target_key = self.target_key(kind, kingdom, x, y)
         self.live.cooldowns[target_key] = march.cooldown_until
@@ -243,6 +251,14 @@ class StateStore:
         self.live.session_attacks = 0
         self.live.session_gold = 0
         self.live.session_rubies = 0
+        self.live.session_by_mode = {}
+        self.live.skipped_modes = []
+        self.live.active_mode = ""
+
+    def skip_mode(self, mode_id: str) -> None:
+        if mode_id not in self.live.skipped_modes:
+            self.live.skipped_modes.append(mode_id)
+            self.save()
 
     def update_return_timer(
         self,

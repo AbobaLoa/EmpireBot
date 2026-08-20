@@ -52,11 +52,29 @@
     "picker_max_actions": 4,
     "minimum_flank_fill": 0.7
   },
-  "control": {
-    "hotkey": "N",
-    "always_on_top": true,
-    "start_paused": true
-  },
+    "control": {
+        "hotkey": "N",
+        "always_on_top": true,
+        "start_paused": true
+    },
+    "campaign": {
+        "enabled": true,
+        "fill_without_waiting_returns": true,
+        "queue": [
+            {"mode": "robber_barons", "count": 20, "enabled": true},
+            {"mode": "storm_forts", "count": 10, "enabled": false},
+            {"mode": "barbarian_towers", "count": 10, "enabled": false},
+            {"mode": "barbarian_fortresses", "count": 5, "enabled": false},
+            {"mode": "desert_towers", "count": 10, "enabled": false},
+            {"mode": "desert_fortresses", "count": 5, "enabled": false},
+            {"mode": "cultist_towers", "count": 15, "enabled": false},
+            {"mode": "dragons", "count": 5, "enabled": false},
+            {"mode": "nomad_camps", "count": 8, "enabled": false},
+            {"mode": "samurai_camps", "count": 8, "enabled": false},
+            {"mode": "bloodcrows", "count": 6, "enabled": false},
+            {"mode": "alien_castles", "count": 6, "enabled": false}
+        ]
+    },
     "telegram": {
         "enabled": true,
         "bot_token": "PUT_E4KMOBILE_BOT_TOKEN_HERE",

@@ -160,7 +160,7 @@ def main() -> None:
         "command",
         nargs="?",
         default="run",
-        choices=["run", "calibrate", "check"],
+        choices=["run", "calibrate", "check", "worker"],
     )
     parser.add_argument(
         "--max-cycles",
@@ -178,6 +178,10 @@ def main() -> None:
         cmd_calibrate()
     elif args.command == "check":
         cmd_check()
+    elif args.command == "worker":
+        from e4kbot.runtime.worker import main as worker_main
+
+        worker_main()
     else:
         cmd_run(max_cycles=args.max_cycles, no_panel=args.no_panel)
 

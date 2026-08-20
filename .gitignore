@@ -6,6 +6,10 @@ __pycache__/
 .idea/
 logs/
 data/*.json
+data/*.jsonl
 shots/
 *.log
 tessdata/
+desktop/node_modules/
+desktop/src-tauri/target/
+desktop/dist/

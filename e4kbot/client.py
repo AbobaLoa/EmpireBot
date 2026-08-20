@@ -13,6 +13,7 @@ from PIL import ImageDraw
 from e4kbot.bluestacks import AdbClient, capture_game_image, save_shot
 from e4kbot.control import CONTROL
 from e4kbot.paths import LAYOUTS_DIR, ROOT
+from e4kbot.runtime.live import emit
 from e4kbot.safety import (
     commander_number_ok,
     concurrent_ok,
@@ -1509,10 +1510,29 @@ class BlueStacksEngine:
         )
         mark_successful_send(self.store, self.config)
         self.store.save()
+        emit(
+            "attack.sent",
+            mode=self.store.live.active_mode or kind,
+            kind=kind,
+            kingdom=kid,
+            x=x,
+            y=y,
+            one_way=one_way,
+            movement=movement,
+            commander=commander_no,
+            screenshot=str(shot_path) if shot_path else "",
+        )
         return kind
 
     def run_cycle(self) -> str:
         kind = str(self.config.get("current_target_kind") or "baron")
+        emit(
+            "attack.cycle.start",
+            mode=self.store.live.active_mode or kind,
+            kind=kind,
+            style=str(self.config.get("attack_style") or "on_screen"),
+            dry_run=bool(self.config.get("dry_run", True)),
+        )
         style = str(self.config.get("attack_style") or "on_screen")
         if style == "search_coords":
             targets = load_targets()
@@ -1531,10 +1551,19 @@ class BlueStacksEngine:
             return f"client:{sent}"
 
         if not concurrent_ok(len(self.store.in_flight()), self.config)[0]:
+            emit("attack.cycle.end", result="wait_return", kind=kind)
             return "wait_return"
         result = self.on_screen_attack(kind)
         if result == "stop":
+            emit("attack.cycle.end", result="stop", kind=kind, error=self.store.live.stopped_reason)
             return "stop"
         if result != kind:
+            emit(
+                "attack.cycle.end",
+                result=result,
+                kind=kind,
+                error=self.store.live.last_error,
+            )
             return result
+        emit("attack.cycle.end", result="client:1", kind=kind)
         return f"client:1"

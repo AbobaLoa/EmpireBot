@@ -9,6 +9,8 @@ from e4kbot.bluestacks import AdbClient, diagnose_targeting, probe_bluestacks
 from e4kbot.client import BlueStacksEngine
 from e4kbot.control import CONTROL, BotPaused
 from e4kbot.protocol import ProtocolEngine
+from e4kbot.runtime.live import emit, emit_state
+from e4kbot.runtime.scheduler import pick_next_step, snapshot
 from e4kbot.safety import wait_active_hours
 from e4kbot.state import StateStore
 from e4kbot.telegram_bot import TelegramReporter
@@ -27,6 +29,7 @@ FAST_RETRY_RESULTS = {
     "travel_dialog_not_found",
     "march_time_not_read",
     "feather_count_not_read",
+    "campaign_complete",
 }
 
 
@@ -147,12 +150,7 @@ class AttackBot:
                 self.store.live.mode = "attack"
                 self.store.live.paused = False
                 self.store.save()
-                if self.protocol:
-                    result = self.protocol.run_cycle()
-                elif self.client:
-                    result = self.client.run_cycle()
-                else:
-                    result = "idle"
+                result = self._run_scheduled_cycle()
             except BotPaused:
                 self.store.live.mode = "paused"
                 self.store.live.paused = True
@@ -199,6 +197,9 @@ class AttackBot:
             if result == "no_commanders":
                 self.handle_no_commanders_result()
                 continue
+            if str(result).startswith("stub:"):
+                emit("cycle.stub_skip", result=result)
+                continue
             if str(result) in FAST_RETRY_RESULTS or str(result).startswith("movement_"):
                 try:
                     CONTROL.sleep(0.4)
@@ -209,6 +210,56 @@ class AttackBot:
         self.store.live.running = False
         self.store.live.mode = "stopped"
         self.store.save()
+
+    def _run_scheduled_cycle(self) -> str:
+        campaign = self.config.get("campaign") or {}
+        if campaign.get("enabled", True):
+            step = pick_next_step(self.config, self.store)
+            emit(
+                "cycle.next",
+                campaign=snapshot(self.config, self.store),
+                in_flight=len(self.store.in_flight()),
+            )
+            if step is None:
+                emit("campaign.complete", level="INFO")
+                logger.info("Кампания по квотам закрыта — жду возвраты/новые квоты")
+                emit_state(self.store.live.to_dict())
+                return "campaign_complete"
+            self.store.live.active_mode = step.mode_id
+            self.config["current_target_kind"] = step.spec.target_kind
+            emit(
+                "mode.select",
+                mode=step.mode_id,
+                official_name=step.spec.official_name,
+                remaining=step.remaining,
+                status=step.spec.status,
+            )
+            if step.spec.status == "stub":
+                emit(
+                    "mode.stub",
+                    level="WARNING",
+                    mode=step.mode_id,
+                    official_name=step.spec.official_name,
+                    reason="not_implemented",
+                )
+                logger.warning(
+                    "Режим «{}» ({}) — заглушка, реализация позже",
+                    step.spec.title_ru,
+                    step.spec.official_name,
+                )
+                self.store.skip_mode(step.mode_id)
+                emit_state(self.store.live.to_dict())
+                return f"stub:{step.mode_id}"
+        if self.protocol:
+            result = self.protocol.run_cycle()
+        elif self.client:
+            result = self.client.run_cycle()
+        else:
+            emit("cycle.idle", level="WARNING")
+            result = "idle"
+        emit("cycle.result", result=result, mode=self.store.live.active_mode)
+        emit_state(self.store.live.to_dict())
+        return result
 
     def _announce(self) -> None:
         engine_name = self.store.live.engine

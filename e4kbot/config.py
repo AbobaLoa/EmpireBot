@@ -5,6 +5,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from e4kbot.modes.catalog import default_campaign_queue
 from e4kbot.paths import CONFIG_PATH, DEFAULT_LEGACY_BOT
 
 E4K_SERVERS: dict[str, tuple[str, str]] = {
@@ -48,6 +49,11 @@ DEFAULTS: dict[str, Any] = {
         "nomads": True,
         "shogun": True,
         "prefer_events": True,
+    },
+    "campaign": {
+        "enabled": True,
+        "fill_without_waiting_returns": True,
+        "queue": default_campaign_queue(),
     },
     "baron_attacks": {
         "kingdom": 0,
