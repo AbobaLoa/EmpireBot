@@ -5,6 +5,7 @@ from typing import Any
 
 from loguru import logger
 
+from e4kbot.attacks.registry import get_attack_module
 from e4kbot.bluestacks import AdbClient, diagnose_targeting, probe_bluestacks
 from e4kbot.client import BlueStacksEngine
 from e4kbot.control import CONTROL, BotPaused
@@ -30,6 +31,10 @@ FAST_RETRY_RESULTS = {
     "march_time_not_read",
     "feather_count_not_read",
     "campaign_complete",
+    "map_loading",
+    "retry_samurai_tools",
+    "autoselect_failed",
+    "samurai_complete",
 }
 
 
@@ -49,7 +54,8 @@ class AttackBot:
         CONTROL.on_change(self._on_control_change)
 
     def start(self) -> None:
-        self.store.reset_session_stats()
+        if not bool(self.config.get("resume_session_stats")):
+            self.store.reset_session_stats()
         self.store.live.running = True
         self.store.live.dry_run = bool(self.config.get("dry_run", True))
         self.store.live.engine = str(self.config.get("engine") or "bluestacks")
@@ -253,7 +259,17 @@ class AttackBot:
         if self.protocol:
             result = self.protocol.run_cycle()
         elif self.client:
-            result = self.client.run_cycle()
+            if self.client.wait_out_loading():
+                result = "map_loading"
+            else:
+                mode_id = self.store.live.active_mode
+                if not mode_id:
+                    kind = str(self.config.get("current_target_kind") or "baron")
+                    mode_id = {
+                        "samurai": "samurai_camps",
+                        "baron": "robber_barons",
+                    }.get(kind, kind)
+                result = get_attack_module(mode_id).run_cycle(self.client)
         else:
             emit("cycle.idle", level="WARNING")
             result = "idle"

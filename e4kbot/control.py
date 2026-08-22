@@ -159,15 +159,28 @@ class ControlBus:
     def _hotkey_loop(self) -> None:
         user32 = ctypes.windll.user32
         vk = _vk_code(self.hotkey)
+        hotkey_id = 0xE4
+        wm_hotkey = 0x0312
+        mod_norepeat = 0x4000
+        registered = bool(user32.RegisterHotKey(None, hotkey_id, mod_norepeat, vk))
+        if not registered:
+            self._hotkey_error = "RegisterHotKey вернул 0"
         self._hotkey_ready.set()
+        if not registered:
+            return
         logger.info("Глобальный хоткей {} — вкл/выкл бота", self.hotkey)
-        was_down = bool(user32.GetAsyncKeyState(vk) & 0x8000)
-        while not self._hotkey_stop.is_set() and not self.stop:
-            is_down = bool(user32.GetAsyncKeyState(vk) & 0x8000)
-            if is_down and not was_down:
-                self.toggle()
-            was_down = is_down
-            time.sleep(0.02)
+        message = ctypes.wintypes.MSG()
+        pm_remove = 0x0001
+        try:
+            while not self._hotkey_stop.is_set() and not self.stop:
+                while user32.PeekMessageW(
+                    ctypes.byref(message), None, 0, 0, pm_remove
+                ):
+                    if message.message == wm_hotkey and message.wParam == hotkey_id:
+                        self.toggle()
+                time.sleep(0.02)
+        finally:
+            user32.UnregisterHotKey(None, hotkey_id)
 
 
 CONTROL = ControlBus()

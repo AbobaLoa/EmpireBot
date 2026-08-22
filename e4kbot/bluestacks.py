@@ -177,7 +177,17 @@ class AdbClient:
         self.shell(f"input text {safe}")
 
     def key(self, keycode: int) -> None:
-        self.shell(f"input keyevent {int(keycode)}")
+        """Send an Android keyevent; fall back to focused-window Escape when ADB shell is dead."""
+        if self.serial:
+            proc = self._run(
+                ["-s", self.serial, "shell", "input", "keyevent", str(int(keycode))],
+                timeout=8,
+            )
+            if proc.returncode == 0:
+                return
+            logger.debug("ADB keyevent failed ({}) — пробую окно BlueStacks", proc.stderr.strip())
+        if int(keycode) == 4:
+            press_escape_on_game(self.config)
 
     def swipe(
         self,
@@ -217,6 +227,25 @@ class AdbClient:
                 return
         drag_game_window(self.config, x1, y1, x2, y2, size, duration_ms)
 
+    def wheel(
+        self,
+        x: int,
+        y: int,
+        delta: int = -240,
+        source_size: tuple[int, int] | None = None,
+    ) -> None:
+        """Mouse wheel over a game point. Negative delta scrolls the list down."""
+        CONTROL.check()
+        size = source_size or self.display_size
+        method = self._input_method()
+        if method != "adb":
+            try:
+                wheel_game_window(self.config, int(x), int(y), size, delta)
+                return
+            except Exception as exc:
+                logger.warning("Колёсико мыши не удалось ({}), пробую жест вниз", exc)
+        self.swipe(int(x), int(y), int(x), int(y) + 36, 160, size)
+
     def screencap(self) -> Image.Image | None:
         if not self.adb or not self.serial:
             return None
@@ -233,6 +262,33 @@ class AdbClient:
         except Exception as exc:
             logger.debug(f"ADB screencap failed: {exc}")
             return None
+
+
+def press_escape_on_game(config: dict[str, Any]) -> None:
+    """VK_ESCAPE to the BlueStacks HWND — closes mid-map offer / hire overlays."""
+    import win32con
+    import win32gui
+
+    hints = (config.get("bluestacks") or {}).get("window_title_hints")
+    window = find_game_window(list(hints) if hints else None)
+    if not window:
+        return
+    hwnd = window[0]
+    try:
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        win32gui.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+    time.sleep(0.05)
+    try:
+        win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, win32con.VK_ESCAPE, 0)
+        win32gui.PostMessage(hwnd, win32con.WM_KEYUP, win32con.VK_ESCAPE, 0)
+    except Exception:
+        try:
+            ctypes.windll.user32.keybd_event(0x1B, 0, 0, 0)
+            ctypes.windll.user32.keybd_event(0x1B, 0, 2, 0)
+        except Exception as exc:
+            logger.debug("Escape в окно BlueStacks не отправился: {}", exc)
 
 
 def _ensure_dpi_aware() -> None:
@@ -573,6 +629,30 @@ def drag_game_window(
             time.sleep(duration_ms / steps / 1000)
     finally:
         win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0)
+
+
+def wheel_game_window(
+    config: dict[str, Any],
+    x: int,
+    y: int,
+    source_size: tuple[int, int],
+    delta: int = -240,
+) -> None:
+    """Spin the mouse wheel over a game point. Negative delta = scroll down."""
+    import win32api
+    import win32con
+
+    hints = (config.get("bluestacks") or {}).get("window_title_hints")
+    window = find_game_window(list(hints) if hints else None)
+    if not window:
+        raise RuntimeError("Окно BlueStacks не найдено для колёсика")
+    hwnd = _render_window(window[0])
+    point = game_to_screen(hwnd, x, y, source_size)
+    CONTROL.check()
+    win32api.SetCursorPos(point)
+    time.sleep(0.05)
+    win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, int(delta), 0)
+
 
 
 def _window_enum() -> list[tuple[int, str]]:

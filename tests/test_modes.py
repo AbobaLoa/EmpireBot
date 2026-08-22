@@ -21,6 +21,7 @@ class ModeCatalogTests(unittest.TestCase):
         self.assertEqual(MODE_BY_ID["dragons"].official_name, "Dragons")
         self.assertEqual(MODE_BY_ID["nomad_camps"].official_name, "Nomad Invasion / Nomad Camps")
         self.assertEqual(MODE_BY_ID["samurai_camps"].official_name, "Samurai Invasion / Samurai Camps")
+        self.assertEqual(MODE_BY_ID["samurai_camps"].status, "live")
         self.assertEqual(MODE_BY_ID["bloodcrows"].official_name, "Bloodcrow Invasion")
         self.assertEqual(MODE_BY_ID["alien_castles"].official_name, "Alien Invasion / Alien Castles")
         stubs = [mode.id for mode in MODES if mode.status == "stub"]

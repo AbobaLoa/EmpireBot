@@ -9,6 +9,13 @@ import requests
 from loguru import logger
 
 BARON_THREAD_NAMES = ("барон разбойников", "бароны разбойников", "разбойников")
+SAMURAI_THREAD_NAMES = (
+    "вторжение самураев",
+    "вторжения самураев",
+    "лагери самураев",
+    "лагеря самураев",
+    "самураев",
+)
 
 
 def parse_loot_amounts(text: str) -> tuple[int, int]:
@@ -78,6 +85,7 @@ class TelegramReporter:
         self.message_thread_id = self._coerce_thread(
             cfg.get("message_thread_id", cfg.get("thread_baron", cfg.get("thread_id")))
         )
+        self.thread_samurai = self._coerce_thread(cfg.get("thread_samurai"))
         self._base = f"https://api.telegram.org/bot{self.token}"
 
     @staticmethod
@@ -94,9 +102,12 @@ class TelegramReporter:
     def ready(self) -> bool:
         return self.enabled and bool(self.token) and bool(self.chat_id)
 
-    def _thread_payload(self) -> dict[str, int]:
-        if self.message_thread_id:
-            return {"message_thread_id": int(self.message_thread_id)}
+    def _thread_payload(self, kind: str | None = None) -> dict[str, int]:
+        thread = self.message_thread_id
+        if kind in {"samurai", "samurai_camps"}:
+            thread = self.thread_samurai or self.resolve_samurai_thread() or thread
+        if thread:
+            return {"message_thread_id": int(thread)}
         return {}
 
     def _post(self, method: str, data: dict | None = None, files: dict | None = None) -> dict[str, Any]:
@@ -125,6 +136,20 @@ class TelegramReporter:
         """Keep a configured topic id, otherwise learn it from recent forum messages."""
         if self.message_thread_id:
             return self.message_thread_id
+        found = self._resolve_topic(BARON_THREAD_NAMES)
+        if found:
+            self.message_thread_id = found
+        return self.message_thread_id
+
+    def resolve_samurai_thread(self) -> int | None:
+        if self.thread_samurai:
+            return self.thread_samurai
+        found = self._resolve_topic(SAMURAI_THREAD_NAMES)
+        if found:
+            self.thread_samurai = found
+        return self.thread_samurai
+
+    def _resolve_topic(self, names: tuple[str, ...]) -> int | None:
         if not self.token:
             return None
         payload = self._post("getUpdates", {"timeout": 0, "allowed_updates": json.dumps(["message"])})
@@ -136,31 +161,31 @@ class TelegramReporter:
             thread_id = message.get("message_thread_id")
             topic = (message.get("reply_to_message") or {}).get("forum_topic_created") or {}
             name = str(topic.get("name") or message.get("forum_topic_created", {}).get("name") or "")
-            if thread_id and _thread_name_matches(name):
-                self.message_thread_id = int(thread_id)
-                logger.info("Telegram topic «{}» → thread {}", name, self.message_thread_id)
-                return self.message_thread_id
-        return self.message_thread_id
+            lowered = name.lower().replace("ё", "е")
+            if thread_id and any(token in lowered for token in names):
+                logger.info("Telegram topic «{}» → thread {}", name, thread_id)
+                return int(thread_id)
+        return None
 
-    def send_text(self, text: str) -> bool:
+    def send_text(self, text: str, kind: str | None = None) -> bool:
         if not self.ready:
             return False
         extra: dict[str, Any] = {
             "chat_id": self.chat_id,
             "text": text[:4096],
-            **self._thread_payload(),
+            **self._thread_payload(kind),
         }
         if self.public_webapp_url:
             extra["reply_markup"] = json.dumps(_webapp_markup(self.public_webapp_url))
         return bool(self._post("sendMessage", extra).get("ok"))
 
-    def send_photo(self, image_path: Path, caption: str) -> bool:
+    def send_photo(self, image_path: Path, caption: str, kind: str | None = None) -> bool:
         if not self.ready or not image_path.exists():
             return False
         data: dict[str, Any] = {
             "chat_id": self.chat_id,
             "caption": caption[:1024],
-            **self._thread_payload(),
+            **self._thread_payload(kind),
         }
         if self.public_webapp_url:
             data["reply_markup"] = json.dumps(_webapp_markup(self.public_webapp_url))
@@ -204,7 +229,10 @@ class TelegramReporter:
         prefix = "🧪 DRY-RUN" if dry_run else "✅ Атака отправлена"
         kind_ru = {
             "baron": "Барон",
+            "robber_barons": "Барон",
             "nomad": "Лагерь кочевников",
+            "samurai": "Лагерь самураев",
+            "samurai_camps": "Лагерь самураев",
             "shogun": "Лагерь сёгуна",
         }.get(kind, kind)
         mins, sec = divmod(max(0, int(one_way_sec)), 60)
@@ -227,9 +255,19 @@ class TelegramReporter:
         if extra:
             text += f"\n{extra}"
         if screenshot and screenshot.exists():
-            self.send_photo(screenshot, text)
+            self.send_photo(screenshot, text, kind=kind)
         else:
-            self.send_text(text)
+            self.send_text(text, kind=kind)
+
+    def report_samurai_complete(self, attacks: int, gold: int = 0, rubies: int = 0) -> None:
+        text = (
+            "✅ Вторжение самураев закрыто\n"
+            f"⚔️ Атак: {int(attacks)}\n"
+            f"💰 Золото: {int(gold)}\n"
+            f"💎 Рубины: {int(rubies)}\n"
+            "Модуль лагерей самураев выключен."
+        )
+        self.send_text(text, kind="samurai")
 
     def report_stop(self, reason: str) -> None:
         self.send_text(f"⛔ Бот остановил атаки\n{reason}")

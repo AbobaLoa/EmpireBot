@@ -65,6 +65,8 @@ class LiveState:
     session_by_mode: dict[str, int] = field(default_factory=dict)
     skipped_modes: list[str] = field(default_factory=list)
     active_mode: str = ""
+    target_hits: dict[str, int] = field(default_factory=dict)
+    samurai_remaining: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         from e4kbot.control import CONTROL
@@ -111,6 +113,8 @@ class LiveState:
             "session_by_mode": dict(self.session_by_mode),
             "skipped_modes": list(self.skipped_modes),
             "active_mode": self.active_mode,
+            "target_hits": dict(self.target_hits),
+            "samurai_remaining": dict(self.samurai_remaining),
             "server_time": int(now),
         }
 
@@ -134,6 +138,34 @@ class StateStore:
             self.live.last_confirmed_one_way_sec = int(
                 raw.get("last_confirmed_one_way_sec") or 0
             )
+            self.live.last_coords = str(raw.get("last_coords") or "—")
+            self.live.last_screenshot = str(raw.get("last_screenshot") or "")
+            hits = raw.get("target_hits") or {}
+            self.live.target_hits = {
+                str(key): int(value) for key, value in hits.items() if int(value) > 0
+            }
+            remaining = raw.get("samurai_remaining") or {}
+            self.live.samurai_remaining = {
+                str(key): int(value) for key, value in remaining.items()
+            }
+            self.live.session_attacks = int(raw.get("session_attacks") or 0)
+            self.live.session_gold = int(raw.get("session_gold") or 0)
+            self.live.session_rubies = int(raw.get("session_rubies") or 0)
+            self.live.session_by_mode = {
+                str(key): int(value)
+                for key, value in (raw.get("session_by_mode") or {}).items()
+            }
+            self.live.skipped_modes = [
+                str(value) for value in (raw.get("skipped_modes") or [])
+            ]
+            self.live.active_mode = str(raw.get("active_mode") or "")
+            self.live.history = list(raw.get("history") or [])
+            march_fields = set(March.__dataclass_fields__)
+            self.live.marches = [
+                March(**{key: value for key, value in item.items() if key in march_fields})
+                for item in (raw.get("marches_raw") or [])
+                if isinstance(item, dict)
+            ]
         except Exception:
             self.live.cooldowns = {}
 
@@ -182,6 +214,18 @@ class StateStore:
     ) -> March:
         now = time.time()
         one_way = max(1, int(one_way_sec))
+        hit_key = f"{kind}:{int(x)}:{int(y)}"
+        hits = int(self.live.target_hits.get(hit_key) or 0) + 1
+        self.live.target_hits[hit_key] = hits
+        if kind == "samurai":
+            budget = self.live.samurai_remaining.get(hit_key)
+            if budget is None:
+                budget = 10
+            left = max(0, int(budget) - 1)
+            self.live.samurai_remaining[hit_key] = left
+            cooldown_until = now + 24 * 60 * 60 if left <= 0 else 0.0
+        else:
+            cooldown_until = now + one_way + 3 * 60 * 60
         march = March(
             commander_no=int(commander_no),
             lord_id=int(lord_id),
@@ -193,7 +237,7 @@ class StateStore:
             one_way_sec=one_way,
             arrive_at=now + one_way,
             return_at=now + one_way * 2,
-            cooldown_until=now + one_way + 3 * 60 * 60,
+            cooldown_until=cooldown_until,
             screenshot=screenshot,
             movement=movement,
             timer_source="outbound_x2",
@@ -212,6 +256,32 @@ class StateStore:
         self.prune()
         self.save()
         return march
+
+    def target_hits(self, kind: str, coords: tuple[int, int] | None) -> int:
+        if not coords:
+            return 0
+        return int(self.live.target_hits.get(f"{kind}:{int(coords[0])}:{int(coords[1])}") or 0)
+
+    def samurai_remaining_for(self, coords: tuple[int, int] | None) -> int | None:
+        if not coords:
+            return None
+        key = f"samurai:{int(coords[0])}:{int(coords[1])}"
+        if key not in self.live.samurai_remaining:
+            return None
+        return int(self.live.samurai_remaining[key])
+
+    def set_samurai_remaining(self, coords: tuple[int, int] | None, remaining: int) -> None:
+        if not coords:
+            return
+        key = f"samurai:{int(coords[0])}:{int(coords[1])}"
+        self.live.samurai_remaining[key] = max(0, int(remaining))
+        self.save()
+
+    def camp_has_samurai_budget(self, coords: tuple[int, int] | None) -> bool:
+        remaining = self.samurai_remaining_for(coords)
+        if remaining is not None:
+            return remaining > 0
+        return self.target_hits("samurai", coords) < 10
 
     @staticmethod
     def target_key(kind: str, kingdom: int, x: int, y: int) -> str:
@@ -234,6 +304,8 @@ class StateStore:
         y: int,
         now: float | None = None,
     ) -> bool:
+        if kind == "samurai":
+            return self.camp_has_samurai_budget((x, y))
         return self.target_cooldown_until(kind, kingdom, x, y) <= (now or time.time())
 
     def record_loot(self, gold: int = 0, rubies: int = 0) -> None:

@@ -70,7 +70,7 @@
             {"mode": "cultist_towers", "count": 15, "enabled": false},
             {"mode": "dragons", "count": 5, "enabled": false},
             {"mode": "nomad_camps", "count": 8, "enabled": false},
-            {"mode": "samurai_camps", "count": 8, "enabled": false},
+            {"mode": "samurai_camps", "count": 44, "enabled": false},
             {"mode": "bloodcrows", "count": 6, "enabled": false},
             {"mode": "alien_castles", "count": 6, "enabled": false}
         ]
@@ -81,6 +81,7 @@
         "chat_id": "-100...",
         "message_thread_id": 5,
         "thread_baron": 5,
+        "thread_samurai": 0,
         "miniapp_host": "127.0.0.1",
         "miniapp_port": 8766,
         "public_webapp_url": ""
