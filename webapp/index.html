@@ -96,7 +96,7 @@
   </div>
   <div class="card">
     <button id="toggle" class="off" type="button">ВЫКЛ</button>
-    <div class="muted" id="hotkeyHint" style="margin-top:8px">Клавиша N сразу отпускает мышь</div>
+    <div class="muted" id="hotkeyHint" style="margin-top:8px">Num0 (цифровая 0) сразу отпускает мышь</div>
     <label>Цель
       <select id="kind">
         <option value="baron">Разбойники</option>
@@ -105,7 +105,7 @@
       </select>
     </label>
     <label>Горячая клавиша
-      <input id="hotkey" maxlength="3" placeholder="N" />
+      <input id="hotkey" maxlength="8" placeholder="NUM0" />
     </label>
     <label>Макс. атак в пути
       <input id="maxConcurrent" type="number" min="1" max="30" />
@@ -144,7 +144,7 @@
       const res = await fetch("/api/settings");
       const s = await res.json();
       document.getElementById("kind").value = s.current_target_kind || "baron";
-      document.getElementById("hotkey").value = s.hotkey || "N";
+      document.getElementById("hotkey").value = s.hotkey || "NUM0";
       document.getElementById("maxConcurrent").value = s.max_concurrent_attacks || 30;
       document.getElementById("delayMin").value = s.attack_delay_min || 4;
       document.getElementById("delayMax").value = s.attack_delay_max || 10;
@@ -182,7 +182,7 @@
       btn.textContent = on ? "ВКЛ — ищет цели" : "ВЫКЛ — мышь свободна";
       btn.className = on ? "on" : "off";
       document.getElementById("hotkeyHint").textContent =
-        "Клавиша " + (data.hotkey || "N") + " сразу отпускает мышь";
+        (data.hotkey_label || data.hotkey || "Num0") + " сразу отпускает мышь";
       const status = [];
       status.push(data.running ? (on ? "бот работает" : "на паузе") : "бот остановлен");
       if (data.dry_run) status.push("DRY-RUN");

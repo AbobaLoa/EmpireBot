@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from e4kbot.control import CONTROL, BotPaused, apply_public_settings, normalize_hotkey, public_settings
+from e4kbot.control import CONTROL, BotPaused, apply_public_settings, hotkey_label, normalize_hotkey, public_settings
 
 
 class ControlTests(unittest.TestCase):
@@ -13,7 +13,35 @@ class ControlTests(unittest.TestCase):
     def test_normalizes_letter_and_function_keys(self) -> None:
         self.assertEqual(normalize_hotkey("n"), "N")
         self.assertEqual(normalize_hotkey("f8"), "F8")
-        self.assertEqual(normalize_hotkey("???"), "N")
+        self.assertEqual(normalize_hotkey("num0"), "NUM0")
+        self.assertEqual(normalize_hotkey("numpad0"), "NUM0")
+        self.assertEqual(normalize_hotkey("kp_0"), "NUM0")
+        self.assertEqual(normalize_hotkey("???"), "NUM0")
+        self.assertEqual(hotkey_label("NUM0"), "Num0")
+
+    def test_num0_tracks_numlock_on_and_off(self) -> None:
+        from e4kbot.control import _pause_key_down
+
+        class FakeUser32:
+            def __init__(self, *, numpad0: int = 0, insert: int = 0, numlock: int = 1) -> None:
+                self.numpad0 = numpad0
+                self.insert = insert
+                self.numlock = numlock
+
+            def GetAsyncKeyState(self, vk: int) -> int:
+                if vk == 0x60:
+                    return self.numpad0
+                if vk == 0x2D:
+                    return self.insert
+                return 0
+
+            def GetKeyState(self, vk: int) -> int:
+                return self.numlock if vk == 0x90 else 0
+
+        self.assertTrue(_pause_key_down(FakeUser32(numpad0=0x8000, numlock=1), "NUM0"))
+        self.assertFalse(_pause_key_down(FakeUser32(insert=0x8000, numlock=1), "NUM0"))
+        self.assertTrue(_pause_key_down(FakeUser32(insert=0x8000, numlock=0), "NUM0"))
+        self.assertFalse(_pause_key_down(FakeUser32(numlock=0), "NUM0"))
 
     def test_toggle_pauses_and_blocks_clicks(self) -> None:
         CONTROL.enable()

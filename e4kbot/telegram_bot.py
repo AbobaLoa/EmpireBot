@@ -16,6 +16,13 @@ SAMURAI_THREAD_NAMES = (
     "лагеря самураев",
     "самураев",
 )
+NOMAD_THREAD_NAMES = (
+    "вторжение кочевников",
+    "вторжения кочевников",
+    "лагери кочевников",
+    "лагеря кочевников",
+    "кочевников",
+)
 
 
 def parse_loot_amounts(text: str) -> tuple[int, int]:
@@ -86,6 +93,7 @@ class TelegramReporter:
             cfg.get("message_thread_id", cfg.get("thread_baron", cfg.get("thread_id")))
         )
         self.thread_samurai = self._coerce_thread(cfg.get("thread_samurai"))
+        self.thread_nomad = self._coerce_thread(cfg.get("thread_nomad"))
         self._base = f"https://api.telegram.org/bot{self.token}"
 
     @staticmethod
@@ -106,6 +114,8 @@ class TelegramReporter:
         thread = self.message_thread_id
         if kind in {"samurai", "samurai_camps"}:
             thread = self.thread_samurai or self.resolve_samurai_thread() or thread
+        if kind in {"nomad", "nomad_camps"}:
+            thread = self.thread_nomad or self.resolve_nomad_thread() or thread
         if thread:
             return {"message_thread_id": int(thread)}
         return {}
@@ -148,6 +158,14 @@ class TelegramReporter:
         if found:
             self.thread_samurai = found
         return self.thread_samurai
+
+    def resolve_nomad_thread(self) -> int | None:
+        if self.thread_nomad:
+            return self.thread_nomad
+        found = self._resolve_topic(NOMAD_THREAD_NAMES)
+        if found:
+            self.thread_nomad = found
+        return self.thread_nomad
 
     def _resolve_topic(self, names: tuple[str, ...]) -> int | None:
         if not self.token:
@@ -231,6 +249,7 @@ class TelegramReporter:
             "baron": "Барон",
             "robber_barons": "Барон",
             "nomad": "Лагерь кочевников",
+            "nomad_camps": "Лагерь кочевников",
             "samurai": "Лагерь самураев",
             "samurai_camps": "Лагерь самураев",
             "shogun": "Лагерь сёгуна",
@@ -268,6 +287,43 @@ class TelegramReporter:
             "Модуль лагерей самураев выключен."
         )
         self.send_text(text, kind="samurai")
+
+    def report_nomad_complete(
+        self,
+        attacks: int,
+        gold: int = 0,
+        rubies: int = 0,
+        resources: dict[str, int] | None = None,
+    ) -> None:
+        lines = [
+            "✅ Вторжение кочевников закрыто",
+            f"⚔️ Атак: {int(attacks)}",
+        ]
+        labels = {
+            "wood": "🌲 Дерево",
+            "stone": "🪨 Камень",
+            "food": "🍖 Еда",
+            "gold": "💰 Золото",
+            "rubies": "💎 Рубины",
+            "coal": "⬛ Уголь",
+            "iron": "⚙️ Железо",
+        }
+        loot = dict(resources or {})
+        if gold and "gold" not in loot:
+            loot["gold"] = int(gold)
+        if rubies and "rubies" not in loot:
+            loot["rubies"] = int(rubies)
+        if loot:
+            for key, label in labels.items():
+                if loot.get(key):
+                    lines.append(f"{label}: {int(loot[key])}")
+            extra = [f"{key}: {value}" for key, value in loot.items() if key not in labels]
+            lines.extend(extra)
+        else:
+            lines.append(f"💰 Золото: {int(gold)}")
+            lines.append(f"💎 Рубины: {int(rubies)}")
+        lines.append("Модуль лагерей кочевников выключен.")
+        self.send_text("\n".join(lines), kind="nomad")
 
     def report_stop(self, reason: str) -> None:
         self.send_text(f"⛔ Бот остановил атаки\n{reason}")

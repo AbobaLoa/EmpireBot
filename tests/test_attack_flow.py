@@ -572,6 +572,28 @@ class HuntTests(unittest.TestCase):
         self.assertIsNone(point)
         engine._jump_to_coords.assert_not_called()
 
+    def test_focus_nomad_clicks_queued_camp_not_any_visible(self) -> None:
+        green = Image.new("RGB", (900, 1600), (104, 151, 57))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine._await_world_map = Mock(return_value=green)
+        engine._dismiss_special_offers_if_open = Mock(return_value=False)
+        engine._match_visible_target = Mock(return_value=None)
+        engine._recenter_on_main_castle = Mock(return_value=green)
+        engine._is_blocked_screen_target = Mock(return_value=False)
+        engine._last_nomad_point = None
+        engine._jump_to_coords = Mock()
+        point = engine._focus_hunt_target(
+            "nomad", HuntTarget((0.42, 0.51), (599, 735))
+        )
+        self.assertEqual(point, (0.42, 0.51))
+        engine._recenter_on_main_castle.assert_not_called()
+        engine._jump_to_coords.assert_not_called()
+        engine._is_blocked_screen_target = Mock(return_value=True)
+        blocked = engine._focus_hunt_target(
+            "nomad", HuntTarget((0.42, 0.51), (599, 735))
+        )
+        self.assertEqual(blocked, (0.42, 0.51))
+
     def test_recenter_does_not_jump_via_search(self) -> None:
         green = Image.new("RGB", (900, 1600), (104, 151, 57))
         engine = BlueStacksEngine.__new__(BlueStacksEngine)

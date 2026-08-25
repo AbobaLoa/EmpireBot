@@ -98,9 +98,11 @@ DEFAULTS: dict[str, Any] = {
         "minimum_flank_fill": 0.70,
         "map_scan_span": [0.30, 0.24],
         "map_scan_rings": 2,
+        "samurai_threshold": 0.65,
+        "nomad_threshold": 0.65,
     },
     "control": {
-        "hotkey": "N",
+        "hotkey": "NUM0",
         "always_on_top": True,
         "start_paused": True,
     },
@@ -113,6 +115,8 @@ DEFAULTS: dict[str, Any] = {
         "miniapp_host": "127.0.0.1",
         "miniapp_port": 8766,
         "public_webapp_url": "",
+        "thread_samurai": None,
+        "thread_nomad": None,
     },
     "accounts": [],
 }

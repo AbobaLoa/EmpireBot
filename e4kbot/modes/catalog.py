@@ -137,10 +137,10 @@ MODES: tuple[ModeSpec, ...] = (
         kingdom_ru="Великая империя",
         kingdom_en="The Great Empire",
         official_name="Nomad Invasion / Nomad Camps",
-        notes="Заглушка. Ивент Nomad Invasion, не путать с ханским лагерем альянса.",
-        status="stub",
+        notes="Живой экранный сценарий Nomad Invasion: 4 лагеря, орудия с биркой и предустановки.",
+        status="live",
         target_kind="nomad",
-        default_quota=8,
+        default_quota=44,
         priority=60,
     ),
     ModeSpec(

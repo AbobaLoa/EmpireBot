@@ -20,12 +20,13 @@ class ModeCatalogTests(unittest.TestCase):
         self.assertEqual(MODE_BY_ID["cultist_towers"].official_name, "Cultist Towers")
         self.assertEqual(MODE_BY_ID["dragons"].official_name, "Dragons")
         self.assertEqual(MODE_BY_ID["nomad_camps"].official_name, "Nomad Invasion / Nomad Camps")
+        self.assertEqual(MODE_BY_ID["nomad_camps"].status, "live")
         self.assertEqual(MODE_BY_ID["samurai_camps"].official_name, "Samurai Invasion / Samurai Camps")
         self.assertEqual(MODE_BY_ID["samurai_camps"].status, "live")
         self.assertEqual(MODE_BY_ID["bloodcrows"].official_name, "Bloodcrow Invasion")
         self.assertEqual(MODE_BY_ID["alien_castles"].official_name, "Alien Invasion / Alien Castles")
         stubs = [mode.id for mode in MODES if mode.status == "stub"]
-        self.assertGreaterEqual(len(stubs), 10)
+        self.assertGreaterEqual(len(stubs), 9)
         self.assertEqual(len(catalog_payload()), len(MODES))
 
     def test_stub_mode_does_not_claim_a_send(self) -> None:

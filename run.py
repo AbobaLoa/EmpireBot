@@ -13,7 +13,7 @@ if str(ROOT) not in sys.path:
 from loguru import logger
 
 from e4kbot.config import load_config
-from e4kbot.control import CONTROL
+from e4kbot.control import CONTROL, hotkey_label
 from e4kbot.engine import AttackBot
 from e4kbot.miniapp import run_miniapp
 from e4kbot.paths import DATA_DIR, LOG_DIR, ensure_dirs
@@ -83,8 +83,11 @@ def cmd_run(max_cycles: int = 0, no_panel: bool = False) -> None:
     telegram = TelegramReporter(config.get("telegram") or {})
     if telegram.token:
         telegram.resolve_baron_thread()
+        telegram.resolve_nomad_thread()
         if telegram.message_thread_id:
             logger.info("Telegram topic thread_id={}", telegram.message_thread_id)
+        if telegram.thread_nomad:
+            logger.info("Telegram nomad topic thread_id={}", telegram.thread_nomad)
     me = telegram.verify() if telegram.token else {}
     if me:
         logger.info(f"Telegram: @{me.get('username')}")
@@ -108,7 +111,7 @@ def cmd_run(max_cycles: int = 0, no_panel: bool = False) -> None:
     bot_thread.start()
     logger.info(
         "Панель: кнопка вкл/выкл. Горячая клавиша {} выключает бота сразу и отпускает мышь.",
-        CONTROL.hotkey,
+        hotkey_label(CONTROL.hotkey),
     )
     try:
         if no_panel:

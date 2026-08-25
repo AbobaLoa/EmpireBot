@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from e4kbot.attacks.base import AttackModule, StubAttackModule
+from e4kbot.attacks.nomad_camps import NomadCampsModule
 from e4kbot.attacks.robber_barons import RobberBaronsModule
 from e4kbot.attacks.samurai_camps import SamuraiCampsModule
 from e4kbot.modes.catalog import MODES
 
 _LIVE = {
     "robber_barons": RobberBaronsModule,
+    "nomad_camps": NomadCampsModule,
     "samurai_camps": SamuraiCampsModule,
 }
 

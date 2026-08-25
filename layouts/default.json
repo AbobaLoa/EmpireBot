@@ -3,6 +3,8 @@
   "dismiss": [],
   "buttons": {
     "map": [0.12, 0.94],
+    "messages": [0.69, 0.94],
+    "messages": [0.69, 0.94],
     "search": [0.90, 0.14],
     "coord_x": [0.35, 0.48],
     "coord_y": [0.65, 0.48],

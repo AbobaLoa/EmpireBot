@@ -22,6 +22,7 @@ from e4kbot.vision import (
     find_target_attack_button,
     find_tool_bonus_candidates,
     find_tool_slider_plus,
+    find_travel_seal_pair,
     is_autoselect_dialog,
     is_difficulty_dialog,
     is_event_reward_popup,
@@ -168,6 +169,19 @@ class SamuraiCampsModule:
         if is_special_offers_screen(current):
             driver._dismiss_special_offers_if_open(current)
             return "popup_dismissed"
+        if is_travel_dialog(current):
+            if not driver._selected_target_coords:
+                match = re.search(
+                    r"\((\d+)\s*,\s*(\d+)\)",
+                    str(driver.store.live.last_coords or ""),
+                )
+                if match:
+                    driver._selected_target_coords = (
+                        int(match.group(1)),
+                        int(match.group(2)),
+                    )
+            logger.info("Диалог «Начать нападение» уже открыт — подтверждаю поход")
+            return self._execute(driver, (0.50, 0.50))
         if is_formation_screen(current):
             if not driver._selected_target_coords:
                 match = re.search(
@@ -192,41 +206,53 @@ class SamuraiCampsModule:
     def _execute(self, driver: Any, point: tuple[float, float]) -> str:
         if driver._dismiss_no_commanders():
             return "no_commanders"
-        self._maybe_pick_difficulty_after_attack(driver)
-        if not is_formation_screen(driver._image()):
-            formation = driver._wait_for(is_formation_screen, timeout=10, label="план самураев")
-            if formation is None:
-                logger.warning("Нет плана атаки самураев")
-                return "formation_not_found"
-        prepared, reason = self._prepare_waves(driver)
-        if not prepared:
-            driver.store.live.last_error = reason
-            driver.store.save()
-            logger.warning("Самураи: подготовка не прошла ({}) — план не закрываю зелёной печатью", reason)
-            return reason
-        driver._tap_formation_attack()
-        travel = driver._wait_for(
-            lambda img: is_travel_dialog(img) or is_no_commanders_parchment(img),
-            timeout=driver._vision_seconds("travel_dialog_timeout_seconds", 15),
-            label="диалог похода самураев",
-        )
-        if travel is not None and driver._dismiss_no_commanders(travel):
-            return "no_commanders"
-        if travel is None:
-            if driver._dismiss_no_commanders():
+        current = driver._image()
+        travel_already = is_travel_dialog(current)
+        if not travel_already:
+            self._maybe_pick_difficulty_after_attack(driver)
+            if not is_formation_screen(driver._image()):
+                formation = driver._wait_for(is_formation_screen, timeout=10, label="план самураев")
+                if formation is None:
+                    logger.warning("Нет плана атаки самураев")
+                    return "formation_not_found"
+            prepared, reason = self._prepare_waves(driver)
+            if not prepared:
+                driver.store.live.last_error = reason
+                driver.store.save()
+                logger.warning("Самураи: подготовка не прошла ({}) — план не закрываю зелёной печатью", reason)
+                return reason
+            driver._tap_formation_attack()
+            travel = driver._wait_for(
+                lambda img: is_travel_dialog(img) or is_no_commanders_parchment(img),
+                timeout=driver._vision_seconds("travel_dialog_timeout_seconds", 15),
+                label="диалог похода самураев",
+            )
+            if travel is not None and driver._dismiss_no_commanders(travel):
                 return "no_commanders"
-            logger.warning("Нет диалога похода самураев")
-            return "travel_dialog_not_found"
-        movement, feathers = driver._movement_option(travel)
-        if movement == "unknown":
-            driver.tap_rel("travel_cancel")
-            return "feather_count_not_read"
-        CONTROL.sleep(0.4)
+            if travel is None:
+                if driver._dismiss_no_commanders():
+                    return "no_commanders"
+                logger.warning("Нет диалога похода самураев")
+                return "travel_dialog_not_found"
         travel = driver._image()
+        if find_travel_seal_pair(travel) is not None:
+            logger.info("Компактный «Начать нападение» — перья не трогаю, подтверждаю галочкой")
+            movement = "gold"
+        else:
+            movement, feathers = driver._movement_option(travel)
+            if movement == "unknown":
+                driver.tap_rel("travel_cancel")
+                return "feather_count_not_read"
+            CONTROL.sleep(0.4)
+            travel = driver._image()
         one_way = driver._read_march_time(travel)
         if one_way is None:
-            driver.tap_rel("travel_cancel")
-            return "march_time_not_read"
+            if find_travel_seal_pair(travel) is not None:
+                one_way = 30
+                logger.info("Время похода не прочиталось — беру 30с для ближнего лагеря")
+            else:
+                driver.tap_rel("travel_cancel")
+                return "march_time_not_read"
         fake_target = {
             "kingdom": int((driver.config.get("baron_attacks") or {}).get("kingdom", 0)),
             "x": int(

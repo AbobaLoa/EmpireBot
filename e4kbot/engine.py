@@ -8,7 +8,7 @@ from loguru import logger
 from e4kbot.attacks.registry import get_attack_module
 from e4kbot.bluestacks import AdbClient, diagnose_targeting, probe_bluestacks
 from e4kbot.client import BlueStacksEngine
-from e4kbot.control import CONTROL, BotPaused
+from e4kbot.control import CONTROL, BotPaused, hotkey_label
 from e4kbot.protocol import ProtocolEngine
 from e4kbot.runtime.live import emit, emit_state
 from e4kbot.runtime.scheduler import pick_next_step, snapshot
@@ -33,8 +33,11 @@ FAST_RETRY_RESULTS = {
     "campaign_complete",
     "map_loading",
     "retry_samurai_tools",
+    "retry_nomad_tools",
     "autoselect_failed",
     "samurai_complete",
+    "nomad_complete",
+    "waiting_camp_template",
 }
 
 
@@ -68,7 +71,7 @@ class AttackBot:
         except Exception:
             logger.exception("ADB не подключился на старте — продолжаю, жду ВКЛ")
         diagnose_targeting(self.config, self.adb)
-        logger.info("Бот готов. ВКЛ / клавиша {} запускает атаки", CONTROL.hotkey)
+        logger.info("Бот готов. ВКЛ / клавиша {} запускает атаки", hotkey_label(CONTROL.hotkey))
         try:
             self._loop()
         except BotPaused:
@@ -98,7 +101,7 @@ class AttackBot:
                     self.store.live.mode = "paused"
                     self.store.live.paused = True
                     self.store.save()
-                    logger.info("На паузе — жми {} или кнопку ВКЛ", CONTROL.hotkey)
+                    logger.info("На паузе — жми {} или кнопку ВКЛ", hotkey_label(CONTROL.hotkey))
                     CONTROL.wait_until_enabled()
                     if self.stop or CONTROL.stop:
                         break
@@ -267,6 +270,7 @@ class AttackBot:
                     kind = str(self.config.get("current_target_kind") or "baron")
                     mode_id = {
                         "samurai": "samurai_camps",
+                        "nomad": "nomad_camps",
                         "baron": "robber_barons",
                     }.get(kind, kind)
                 result = get_attack_module(mode_id).run_cycle(self.client)

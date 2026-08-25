@@ -20,6 +20,6 @@ class StubMode:
 
 def is_success_result(result: str, mode_id: str) -> bool:
     return (
-        result in {mode_id, "baron", "samurai", "client:1", "samurai_complete"}
+        result in {mode_id, "baron", "samurai", "nomad", "client:1", "samurai_complete", "nomad_complete"}
         or result.startswith("client:")
     )

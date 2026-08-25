@@ -9,6 +9,8 @@ from typing import Any
 from e4kbot.paths import STATE_PATH
 from e4kbot.safety import MAX_COMMANDER_NUMBER, MAX_CONCURRENT_ATTACKS
 
+NOMAD_HITS_PER_CAMP = 11
+
 
 @dataclass
 class March:
@@ -67,9 +69,10 @@ class LiveState:
     active_mode: str = ""
     target_hits: dict[str, int] = field(default_factory=dict)
     samurai_remaining: dict[str, int] = field(default_factory=dict)
+    nomad_remaining: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from e4kbot.control import CONTROL
+        from e4kbot.control import CONTROL, hotkey_label
 
         now = time.time()
         in_flight = [m for m in self.marches if m.return_at > now]
@@ -88,6 +91,7 @@ class LiveState:
             "paused": paused,
             "enabled": not paused,
             "hotkey": CONTROL.hotkey,
+            "hotkey_label": hotkey_label(CONTROL.hotkey),
             "dry_run": self.dry_run,
             "engine": self.engine,
             "account": self.account,
@@ -115,6 +119,7 @@ class LiveState:
             "active_mode": self.active_mode,
             "target_hits": dict(self.target_hits),
             "samurai_remaining": dict(self.samurai_remaining),
+            "nomad_remaining": dict(self.nomad_remaining),
             "server_time": int(now),
         }
 
@@ -147,6 +152,10 @@ class StateStore:
             remaining = raw.get("samurai_remaining") or {}
             self.live.samurai_remaining = {
                 str(key): int(value) for key, value in remaining.items()
+            }
+            nomad_remaining = raw.get("nomad_remaining") or {}
+            self.live.nomad_remaining = {
+                str(key): int(value) for key, value in nomad_remaining.items()
             }
             self.live.session_attacks = int(raw.get("session_attacks") or 0)
             self.live.session_gold = int(raw.get("session_gold") or 0)
@@ -217,12 +226,13 @@ class StateStore:
         hit_key = f"{kind}:{int(x)}:{int(y)}"
         hits = int(self.live.target_hits.get(hit_key) or 0) + 1
         self.live.target_hits[hit_key] = hits
-        if kind == "samurai":
-            budget = self.live.samurai_remaining.get(hit_key)
+        if kind in {"samurai", "nomad"}:
+            bucket = self.live.samurai_remaining if kind == "samurai" else self.live.nomad_remaining
+            budget = bucket.get(hit_key)
             if budget is None:
-                budget = 10
+                budget = NOMAD_HITS_PER_CAMP if kind == "nomad" else 10
             left = max(0, int(budget) - 1)
-            self.live.samurai_remaining[hit_key] = left
+            bucket[hit_key] = left
             cooldown_until = now + 24 * 60 * 60 if left <= 0 else 0.0
         else:
             cooldown_until = now + one_way + 3 * 60 * 60
@@ -283,6 +293,46 @@ class StateStore:
             return remaining > 0
         return self.target_hits("samurai", coords) < 10
 
+    def nomad_remaining_for(self, coords: tuple[int, int] | None) -> int | None:
+        if not coords:
+            return None
+        key = f"nomad:{int(coords[0])}:{int(coords[1])}"
+        if key not in self.live.nomad_remaining:
+            return None
+        return int(self.live.nomad_remaining[key])
+
+    def set_nomad_remaining(self, coords: tuple[int, int] | None, remaining: int) -> None:
+        if not coords:
+            return
+        key = f"nomad:{int(coords[0])}:{int(coords[1])}"
+        self.live.nomad_remaining[key] = max(0, int(remaining))
+        self.save()
+
+    def camp_has_nomad_budget(self, coords: tuple[int, int] | None) -> bool:
+        if self.target_hits("nomad", coords) >= NOMAD_HITS_PER_CAMP:
+            return False
+        remaining = self.nomad_remaining_for(coords)
+        if remaining is not None:
+            return remaining > 0
+        return True
+
+    def apply_nomad_ocr_remaining(self, coords: tuple[int, int] | None, remaining_from_ocr: int) -> int:
+        """Never raise remaining after hits started, never go past 11 - hits."""
+        if not coords:
+            return 0
+        hits = self.target_hits("nomad", coords)
+        cap = max(0, NOMAD_HITS_PER_CAMP - hits)
+        ocr = max(0, min(int(remaining_from_ocr), NOMAD_HITS_PER_CAMP))
+        current = self.nomad_remaining_for(coords)
+        if hits >= NOMAD_HITS_PER_CAMP:
+            chosen = 0
+        elif hits == 0 or current is None:
+            chosen = min(ocr, cap)
+        else:
+            chosen = min(int(current), ocr, cap)
+        self.set_nomad_remaining(coords, chosen)
+        return chosen
+
     @staticmethod
     def target_key(kind: str, kingdom: int, x: int, y: int) -> str:
         return f"{kind}:{int(kingdom)}:{int(x)}:{int(y)}"
@@ -306,6 +356,8 @@ class StateStore:
     ) -> bool:
         if kind == "samurai":
             return self.camp_has_samurai_budget((x, y))
+        if kind == "nomad":
+            return self.camp_has_nomad_budget((x, y))
         return self.target_cooldown_until(kind, kingdom, x, y) <= (now or time.time())
 
     def record_loot(self, gold: int = 0, rubies: int = 0) -> None:

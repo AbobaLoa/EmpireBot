@@ -5,7 +5,8 @@ from tkinter import ttk
 from typing import Any
 
 from e4kbot.config import save_config
-from e4kbot.control import CONTROL, apply_public_settings, public_settings
+from e4kbot.control import CONTROL, apply_public_settings, hotkey_label, public_settings
+from e4kbot.modes.catalog import MODE_BY_ID, MODES
 from e4kbot.state import StateStore
 
 
@@ -15,13 +16,13 @@ class ControlPanel:
         self.store = store
         self.root = tk.Tk()
         self.root.title("EmpireBot")
-        self.root.geometry("360x640+40+40")
-        self.root.minsize(340, 560)
+        self.root.geometry("380x780+40+40")
+        self.root.minsize(360, 640)
         self.root.configure(bg="#12141c")
         self.root.attributes("-topmost", CONTROL.always_on_top)
         self._binding = False
         self._status = tk.StringVar()
-        self._hotkey = tk.StringVar(value=f"Клавиша: {CONTROL.hotkey}")
+        self._hotkey = tk.StringVar(value=f"Клавиша: {hotkey_label(CONTROL.hotkey)}")
         self._enabled_label = tk.StringVar()
         self._build()
         CONTROL.on_change(self._schedule_refresh)
@@ -77,7 +78,7 @@ class ControlPanel:
 
         tk.Label(
             self.root,
-            text="Нажми назначенную букву в любой момент — бот сразу отпустит мышь.",
+            text="Нажми Num0 на цифровой клавиатуре в любой момент — бот сразу отпустит мышь.",
             fg="#9aa3b5",
             bg="#12141c",
             wraplength=320,
@@ -123,7 +124,7 @@ class ControlPanel:
         ttk.Combobox(
             grid,
             textvariable=self.kind,
-            values=["baron", "nomad", "shogun"],
+            values=["baron", "nomad", "samurai"],
             state="readonly",
             width=16,
         ).grid(row=0, column=1, sticky="ew", pady=3)
@@ -193,6 +194,42 @@ class ControlPanel:
 
         grid.columnconfigure(1, weight=1)
 
+        campaign = tk.LabelFrame(
+            settings,
+            text=" Модули кампании ",
+            fg="#e4c27a",
+            bg="#1c2130",
+            font=("Segoe UI", 10, "bold"),
+        )
+        campaign.pack(fill="both", expand=True, padx=10, pady=(4, 8))
+        self._mode_enabled: dict[str, tk.BooleanVar] = {}
+        queue = {str(item.get("mode")): item for item in ((self.config.get("campaign") or {}).get("queue") or [])}
+        for spec in MODES:
+            row = tk.Frame(campaign, bg="#1c2130")
+            row.pack(fill="x", pady=1)
+            enabled = False
+            if spec.id in queue:
+                enabled = bool(queue[spec.id].get("enabled", False))
+            elif spec.status == "live":
+                enabled = False
+            var = tk.BooleanVar(value=enabled)
+            self._mode_enabled[spec.id] = var
+            label = spec.title_ru
+            if spec.status != "live":
+                label = f"{label} (заглушка)"
+            tk.Checkbutton(
+                row,
+                text=label,
+                variable=var,
+                command=self._save_campaign,
+                fg="#f3f4f8" if spec.status == "live" else "#9aa3b5",
+                bg="#1c2130",
+                selectcolor="#12141c",
+                activebackground="#1c2130",
+                activeforeground="#f3f4f8",
+                anchor="w",
+            ).pack(side="left", fill="x", expand=True)
+
         tk.Button(
             settings,
             text="Сохранить настройки",
@@ -224,16 +261,19 @@ class ControlPanel:
 
     def _start_bind(self) -> None:
         self._binding = True
-        self._hotkey.set("Нажми букву или F1–F12…")
+        self._hotkey.set("Нажми Num0, букву или F1–F12…")
 
     def _on_key(self, event: tk.Event) -> None:  # type: ignore[name-defined]
         if not self._binding:
             return
         keysym = str(event.keysym)
-        if len(keysym) == 1 and keysym.isalnum():
+        upper = keysym.upper()
+        if upper in {"KP_0", "KP_INSERT", "NUMPAD0"}:
+            hotkey = "NUM0"
+        elif len(keysym) == 1 and keysym.isalnum():
             hotkey = keysym.upper()
-        elif keysym.upper().startswith("F") and keysym[1:].isdigit():
-            hotkey = keysym.upper()
+        elif upper.startswith("F") and keysym[1:].isdigit():
+            hotkey = upper
         else:
             return
         self._binding = False
@@ -242,7 +282,7 @@ class ControlPanel:
         control["hotkey"] = CONTROL.hotkey
         self.config["control"] = control
         save_config(self.config)
-        self._hotkey.set(f"Клавиша: {CONTROL.hotkey}")
+        self._hotkey.set(f"Клавиша: {hotkey_label(CONTROL.hotkey)}")
 
     def _apply_topmost(self) -> None:
         CONTROL.always_on_top = bool(self.always_on_top.get())
@@ -266,7 +306,40 @@ class ControlPanel:
         )
         save_config(self.config)
         self._apply_topmost()
+        self._save_campaign()
         self._status.set("Настройки сохранены")
+
+    def _campaign_queue(self) -> list[dict[str, Any]]:
+        existing = {
+            str(item.get("mode")): item
+            for item in ((self.config.get("campaign") or {}).get("queue") or [])
+        }
+        queue: list[dict[str, Any]] = []
+        for spec in MODES:
+            prev = existing.get(spec.id) or {}
+            enabled = bool(self._mode_enabled[spec.id].get()) if spec.id in self._mode_enabled else False
+            queue.append(
+                {
+                    "mode": spec.id,
+                    "count": int(prev.get("count") or spec.default_quota),
+                    "enabled": enabled,
+                }
+            )
+        return queue
+
+    def _save_campaign(self) -> None:
+        queue = self._campaign_queue()
+        campaign = dict(self.config.get("campaign") or {})
+        campaign["enabled"] = True
+        campaign["queue"] = queue
+        self.config["campaign"] = campaign
+        first = next((item for item in queue if item.get("enabled")), None)
+        if first:
+            spec = MODE_BY_ID.get(str(first["mode"]))
+            if spec is not None:
+                self.config["current_target_kind"] = spec.target_kind
+                self.kind.set(spec.target_kind if spec.target_kind in {"baron", "nomad", "shogun"} else self.kind.get())
+        save_config(self.config)
 
     def _schedule_refresh(self) -> None:
         try:
@@ -283,10 +356,10 @@ class ControlPanel:
             activebackground="#3d8556" if on else "#a33b3b",
         )
         self._enabled_label.set(
-            f"Нажми {CONTROL.hotkey} или эту кнопку, чтобы {'выключить' if on else 'включить'}"
+            f"Нажми {hotkey_label(CONTROL.hotkey)} или эту кнопку, чтобы {'выключить' if on else 'включить'}"
         )
         self._hotkey.set(
-            "Нажми букву или F1–F12…" if self._binding else f"Клавиша: {CONTROL.hotkey}"
+            "Нажми Num0, букву или F1–F12…" if self._binding else f"Клавиша: {hotkey_label(CONTROL.hotkey)}"
         )
 
     def _tick(self) -> None:
