@@ -15,6 +15,7 @@ REFERENCE_SIZE = (900, 1600)
 OFFER_RAIL_X = 0.82
 SPECIAL_OFFERS_CLOSE_FALLBACK = (0.93, 0.04)
 ROBBER_TEMPLATE = ROOT / "assets" / "robber_castle.png"
+NOMAD_CAMP_TEMPLATE = ROOT / "assets" / "nomad_camp.png"
 PICKER_MAX_TEMPLATE = ROOT / "assets" / "picker_max.png"
 TARGET_ATTACK_TEMPLATE = ROOT / "assets" / "target_attack.png"
 PICKER_CONFIRM_TEMPLATE = ROOT / "assets" / "picker_confirm.png"
@@ -276,6 +277,33 @@ def parse_ratio(text: str) -> tuple[int, int] | None:
 def parse_count(text: str) -> int | None:
     match = re.search(r"\d+", text.replace("O", "0"))
     return int(match.group()) if match else None
+
+
+def parse_camp_level(text: str) -> int | None:
+    """Extract nomad camp level (1–99) from OCR near a map icon or popup."""
+    cleaned = text.replace("O", "0").replace("o", "0")
+    values = [int(value) for value in re.findall(r"\d{1,2}", cleaned)]
+    if not values:
+        return None
+    for value in reversed(values):
+        if 1 <= value <= 99:
+            return value
+    return None
+
+
+def camp_level_region(point: tuple[float, float]) -> list[float]:
+    """Relative crop above a map camp icon where the level badge is shown."""
+    nx, ny = point
+    return [
+        max(0.0, nx - 0.045),
+        max(0.0, ny - 0.095),
+        min(1.0, nx + 0.045),
+        max(0.0, ny - 0.015),
+    ]
+
+
+def read_camp_level_at_point(image: Image.Image, point: tuple[float, float]) -> int | None:
+    return parse_camp_level(ocr_text(crop_rel(image, camp_level_region(point)), psm=7))
 
 
 def parse_coordinate_pair(text: str) -> tuple[int, int] | None:
@@ -750,6 +778,17 @@ def find_robber_candidates(
         (x / REFERENCE_SIZE[0], y / REFERENCE_SIZE[1], score)
         for score, x, y in selected
     ]
+
+
+def find_nomad_candidates(
+    image: Image.Image,
+    threshold: float = 0.65,
+    template_path: Path | None = None,
+) -> list[tuple[float, float, float]]:
+    path = template_path or (
+        NOMAD_CAMP_TEMPLATE if NOMAD_CAMP_TEMPLATE.exists() else ROBBER_TEMPLATE
+    )
+    return find_robber_candidates(image, threshold, template_path=path)
 
 
 def is_burning_candidate(

@@ -113,6 +113,9 @@ class ControlPanel:
         self.delay_min = tk.IntVar()
         self.delay_max = tk.IntVar()
         self.input_method = tk.StringVar()
+        self.nomad_start = tk.IntVar()
+        self.nomad_end = tk.IntVar()
+        self.nomad_max_attacks = tk.IntVar()
 
         self._load_vars()
 
@@ -149,6 +152,19 @@ class ControlPanel:
             width=16,
         ).grid(row=3, column=1, sticky="ew", pady=3)
 
+        tk.Label(grid, text="Коч. с ур.", fg="#9aa3b5", bg="#1c2130").grid(row=4, column=0, sticky="w")
+        tk.Spinbox(grid, from_=1, to=99, textvariable=self.nomad_start, width=16).grid(
+            row=4, column=1, sticky="ew", pady=3
+        )
+        tk.Label(grid, text="Коч. по ур.", fg="#9aa3b5", bg="#1c2130").grid(row=5, column=0, sticky="w")
+        tk.Spinbox(grid, from_=1, to=99, textvariable=self.nomad_end, width=16).grid(
+            row=5, column=1, sticky="ew", pady=3
+        )
+        tk.Label(grid, text="Атак/лагерь", fg="#9aa3b5", bg="#1c2130").grid(row=6, column=0, sticky="w")
+        tk.Spinbox(grid, from_=1, to=99, textvariable=self.nomad_max_attacks, width=16).grid(
+            row=6, column=1, sticky="ew", pady=3
+        )
+
         tk.Checkbutton(
             grid,
             text="DRY-RUN (не отправлять)",
@@ -158,7 +174,7 @@ class ControlPanel:
             selectcolor="#12141c",
             activebackground="#1c2130",
             activeforeground="#f3f4f8",
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=2)
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=2)
         tk.Checkbutton(
             grid,
             text="Использовать перья",
@@ -168,7 +184,7 @@ class ControlPanel:
             selectcolor="#12141c",
             activebackground="#1c2130",
             activeforeground="#f3f4f8",
-        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=2)
+        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=2)
         tk.Checkbutton(
             grid,
             text="Если перьев нет — золото",
@@ -178,7 +194,7 @@ class ControlPanel:
             selectcolor="#12141c",
             activebackground="#1c2130",
             activeforeground="#f3f4f8",
-        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=2)
+        ).grid(row=9, column=0, columnspan=2, sticky="w", pady=2)
         tk.Checkbutton(
             grid,
             text="Панель поверх окон",
@@ -189,7 +205,7 @@ class ControlPanel:
             selectcolor="#12141c",
             activebackground="#1c2130",
             activeforeground="#f3f4f8",
-        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=2)
+        ).grid(row=10, column=0, columnspan=2, sticky="w", pady=2)
 
         grid.columnconfigure(1, weight=1)
 
@@ -217,6 +233,9 @@ class ControlPanel:
         self.delay_min.set(data["attack_delay_min"])
         self.delay_max.set(data["attack_delay_max"])
         self.input_method.set(data["input"])
+        self.nomad_start.set(data["nomad_start_level"])
+        self.nomad_end.set(data["nomad_end_level"])
+        self.nomad_max_attacks.set(data["nomad_max_attacks_per_camp"])
 
     def _toggle(self) -> None:
         CONTROL.toggle()
@@ -262,6 +281,9 @@ class ControlPanel:
                 "always_on_top": self.always_on_top.get(),
                 "input": self.input_method.get(),
                 "hotkey": CONTROL.hotkey,
+                "nomad_start_level": self.nomad_start.get(),
+                "nomad_end_level": self.nomad_end.get(),
+                "nomad_max_attacks_per_camp": self.nomad_max_attacks.get(),
             },
         )
         save_config(self.config)

@@ -62,6 +62,11 @@ DEFAULTS: dict[str, Any] = {
         "feathers_percent": 1,
         "gold_fallback_when_no_feathers": True,
     },
+    "nomad_farm": {
+        "start_level": 40,
+        "end_level": 50,
+        "max_attacks_per_camp": 11,
+    },
     "event_attacks": {
         "use_currency_boost": True,
         "min_tools_required": 1,
@@ -83,6 +88,7 @@ DEFAULTS: dict[str, Any] = {
     },
     "vision": {
         "robber_threshold": 0.65,
+        "nomad_threshold": 0.65,
         "screen_timeout_seconds": 8,
         "popup_retries": 4,
         "map_anchor": [0.50, 0.54],

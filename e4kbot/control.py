@@ -179,6 +179,7 @@ def public_settings(config: dict[str, Any]) -> dict[str, Any]:
     baron = config.get("baron_attacks") or {}
     modes = config.get("modes") or {}
     control = config.get("control") or {}
+    nomad = config.get("nomad_farm") or {}
     return {
         "current_target_kind": str(config.get("current_target_kind") or "baron"),
         "dry_run": bool(config.get("dry_run")),
@@ -193,6 +194,9 @@ def public_settings(config: dict[str, Any]) -> dict[str, Any]:
         "barons": bool(modes.get("barons", True)),
         "nomads": bool(modes.get("nomads", True)),
         "shogun": bool(modes.get("shogun", True)),
+        "nomad_start_level": int(nomad.get("start_level", 40)),
+        "nomad_end_level": int(nomad.get("end_level", 50)),
+        "nomad_max_attacks_per_camp": int(nomad.get("max_attacks_per_camp", 11)),
         "hotkey": normalize_hotkey(str(control.get("hotkey") or CONTROL.hotkey)),
         "always_on_top": bool(control.get("always_on_top", True)),
         "start_paused": bool(control.get("start_paused", False)),
@@ -228,6 +232,17 @@ def apply_public_settings(config: dict[str, Any], updates: dict[str, Any]) -> di
         if key in updates:
             modes[key] = bool(updates[key])
     config["modes"] = modes
+    nomad_farm = dict(config.get("nomad_farm") or {})
+    if "nomad_start_level" in updates:
+        nomad_farm["start_level"] = max(1, min(99, int(updates["nomad_start_level"])))
+    if "nomad_end_level" in updates:
+        nomad_farm["end_level"] = max(1, min(99, int(updates["nomad_end_level"])))
+    if "nomad_max_attacks_per_camp" in updates:
+        nomad_farm["max_attacks_per_camp"] = max(
+            1, min(99, int(updates["nomad_max_attacks_per_camp"]))
+        )
+    if nomad_farm:
+        config["nomad_farm"] = nomad_farm
     bluestacks = dict(config.get("bluestacks") or {})
     if updates.get("input") in {"mouse", "adb"}:
         bluestacks["input"] = updates["input"]

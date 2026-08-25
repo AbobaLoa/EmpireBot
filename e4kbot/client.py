@@ -12,6 +12,7 @@ from PIL import ImageDraw
 
 from e4kbot.bluestacks import AdbClient, capture_game_image, save_shot
 from e4kbot.control import CONTROL
+from e4kbot.nomad_farm import NomadFarmSettings
 from e4kbot.paths import LAYOUTS_DIR, ROOT
 from e4kbot.safety import (
     commander_number_ok,
@@ -29,6 +30,7 @@ from e4kbot.vision import (
     find_picker_confirm_button,
     find_picker_max_control,
     find_main_castle_marker,
+    find_nomad_candidates,
     find_robber_candidates,
     find_formation_attack_button,
     find_target_attack_button,
@@ -41,12 +43,14 @@ from e4kbot.vision import (
     is_travel_dialog,
     movement_confirm_diagnostics,
     ocr_text,
+    parse_camp_level,
     parse_count,
     parse_coordinate_pair,
     parse_ratio,
     picker_confirm_diagnostics,
     popup_action,
     project_map_coordinate,
+    read_camp_level_at_point,
     special_offers_close_point,
 )
 
@@ -781,6 +785,189 @@ class BlueStacksEngine:
         logger.info("Скан карты: вокруг главного замка свободных разбойников нет")
         return None
 
+    def _nomad_settings(self) -> NomadFarmSettings:
+        return NomadFarmSettings.from_config(self.config)
+
+    def _nomad_threshold(self) -> float:
+        vision = self.config.get("vision") or {}
+        return float(vision.get("nomad_threshold") or vision.get("robber_threshold") or 0.65)
+
+    def _nomad_candidates(self, image: Any) -> list[tuple[float, float, float]]:
+        return find_nomad_candidates(image, self._nomad_threshold())
+
+    def _read_target_popup_level(self, image: Any) -> int | None:
+        region = self.layout.get("regions", {}).get("target_level")
+        if region:
+            return parse_camp_level(ocr_text(crop_rel(image, region), psm=7))
+        preview = self.layout.get("regions", {}).get("castle_preview")
+        if preview:
+            return parse_camp_level(ocr_text(crop_rel(image, preview), psm=6))
+        return None
+
+    def _nomad_level_on_map(self, image: Any, point: tuple[float, float]) -> int | None:
+        return read_camp_level_at_point(image, point)
+
+    def _list_nomad_targets_for_level(
+        self,
+        image: Any,
+        kind: str,
+        target_level: int,
+    ) -> list[HuntTarget]:
+        candidates = self._nomad_candidates(image)
+        if not candidates:
+            return []
+        main, viewport = self._read_map_coords(image)
+        vision = self.config.get("vision") or {}
+        anchor_raw = vision.get("map_anchor") or [0.50, 0.54]
+        scale_raw = vision.get("map_coordinate_scale") or [0.044, 0.044]
+        kingdom = int((self.config.get("baron_attacks") or {}).get("kingdom", 0))
+        found: list[HuntTarget] = []
+        for candidate in candidates:
+            point = (candidate[0], candidate[1])
+            if is_burning_candidate(image, point):
+                continue
+            if is_offer_rail_point(point[0], point[1]):
+                continue
+            if self._is_blocked_screen_target(point):
+                continue
+            level = self._nomad_level_on_map(image, point)
+            if level != int(target_level):
+                continue
+            coords: tuple[int, int] | None = None
+            if (
+                main is not None
+                and viewport is not None
+                and self._coords_plausible(main, viewport)
+            ):
+                projected = project_map_coordinate(
+                    point,
+                    viewport,
+                    (float(anchor_raw[0]), float(anchor_raw[1])),
+                    (float(scale_raw[0]), float(scale_raw[1])),
+                )
+                coords = (round(projected[0]), round(projected[1]))
+                if not self.store.target_available(kind, kingdom, coords[0], coords[1]):
+                    continue
+            found.append(HuntTarget(point, coords))
+        main_marker = find_main_castle_marker(image)
+        if main_marker:
+            found.sort(
+                key=lambda item: (item.point[0] - main_marker[0]) ** 2
+                + (item.point[1] - main_marker[1]) ** 2
+            )
+        elif main is not None:
+            found.sort(
+                key=lambda item: (
+                    (item.coords[0] - main[0]) ** 2 + (item.coords[1] - main[1]) ** 2
+                    if item.coords is not None
+                    else 10**9
+                )
+            )
+        return found
+
+    def _find_nomad_camp_point(self, kind: str, target_level: int) -> tuple[float, float] | None:
+        logger.info(
+            "Ищу лагерь кочевников уровня {} ({}–{})",
+            target_level,
+            self._nomad_settings().start_level,
+            self._nomad_settings().end_level,
+        )
+        self.store.live.mode = "search"
+        self.store.save()
+        image = self._recenter_on_main_castle(self._image())
+        if not is_map_screen(image):
+            return None
+        targets = self._list_nomad_targets_for_level(image, kind, target_level)
+        if targets:
+            chosen = targets[0]
+            if chosen.coords is not None:
+                self._selected_target_coords = chosen.coords
+            return chosen.point
+        for dx, dy in self._map_scan_offsets():
+            logger.info("Скан кочевников ур.{}: сдвиг ({:+.2f}, {:+.2f})", target_level, dx, dy)
+            self._pan_map(dx, dy)
+            CONTROL.sleep(0.25)
+            image = self._image()
+            if not is_map_screen(image):
+                return None
+            targets = self._list_nomad_targets_for_level(image, kind, target_level)
+            if targets:
+                chosen = targets[0]
+                if chosen.coords is not None:
+                    self._selected_target_coords = chosen.coords
+                return chosen.point
+            self._pan_map(-dx, -dy)
+            CONTROL.sleep(0.15)
+        logger.info("На карте нет лагеря кочевников уровня {}", target_level)
+        return None
+
+    def _open_nomad_formation(self, point: tuple[float, float], kind: str, target_level: int) -> bool:
+        if not self._open_formation(point, kind):
+            return False
+        popup = self._image()
+        popup_level = self._read_target_popup_level(popup)
+        if popup_level is not None and popup_level != int(target_level):
+            logger.warning(
+                "Открыт лагерь уровня {}, нужен {} — закрываю и пропускаю",
+                popup_level,
+                target_level,
+            )
+            self.tap_rel("map")
+            return False
+        return True
+
+    def on_screen_nomad_attack(self, kind: str) -> str:
+        settings = self._nomad_settings()
+        progress = self.store.nomad_progress()
+        if progress.is_complete(settings):
+            logger.info(
+                "Цикл кочевников {}–{} завершён ({} лагерей × до {} атак) — сброс",
+                settings.start_level,
+                settings.end_level,
+                settings.camp_count,
+                settings.max_attacks_per_camp,
+            )
+            progress.reset()
+            self.store.save_nomad_progress(progress)
+        target_level = progress.current_level(settings)
+        if target_level is None:
+            return "no_targets"
+        logger.info("Кочевники: {}", progress.status_line(settings))
+        current = self._image()
+        if self._plan_or_picker_open(current):
+            return self._execute_formation_attack(kind, (0.50, 0.50))
+        self._dismiss_special_offers_if_open(current)
+        point = self._find_nomad_camp_point(kind, target_level)
+        if point is None:
+            return "no_targets"
+        opened = False
+        attempts = min(
+            int((self.config.get("vision") or {}).get("popup_retries") or 4) + 1,
+            3,
+        )
+        for _ in range(max(1, attempts)):
+            if self._open_nomad_formation(point, kind, target_level):
+                opened = True
+                break
+            self._blocked_screen_targets.append(point)
+            blocked = self._image()
+            if self._plan_or_picker_open(blocked):
+                opened = True
+                break
+            if self._dismiss_special_offers_if_open(blocked):
+                time.sleep(0.8)
+                point = self._find_nomad_camp_point(kind, target_level) or point
+                continue
+            action = popup_action(blocked)
+            if action:
+                self._tap_norm(*action)
+            time.sleep(0.8)
+            point = self._find_nomad_camp_point(kind, target_level) or point
+        if not opened:
+            logger.warning("Не открылся лагерь кочевников уровня {}", target_level)
+            return "no_targets"
+        return self._execute_formation_attack(kind, point)
+
     def dismiss_popups(self) -> None:
         if self._dismiss_blocking_overlay():
             return
@@ -1280,6 +1467,8 @@ class BlueStacksEngine:
         return "search_disabled"
 
     def on_screen_attack(self, kind: str) -> str:
+        if kind == "nomad":
+            return self.on_screen_nomad_attack(kind)
         if getattr(self, "_hunt_queue", None) is None:
             self._hunt_queue = []
         if getattr(self, "_blocked_screen_targets", None) is None:
@@ -1508,6 +1697,27 @@ class BlueStacksEngine:
             dry_run=False,
         )
         mark_successful_send(self.store, self.config)
+        if kind == "nomad":
+            settings = self._nomad_settings()
+            progress = self.store.nomad_progress()
+            target_level = progress.current_level(settings)
+            if target_level is not None:
+                finished_camp = progress.record_success(settings, target_level)
+                self.store.save_nomad_progress(progress)
+                if finished_camp:
+                    logger.info(
+                        "Лагерь {}: {} атак — переход к следующему уровню",
+                        target_level,
+                        settings.max_attacks_per_camp,
+                    )
+                elif progress.is_complete(settings):
+                    logger.info(
+                        "Фарм кочевников {}–{} завершён",
+                        settings.start_level,
+                        settings.end_level,
+                    )
+                else:
+                    logger.info("Кочевники: {}", progress.status_line(settings))
         self.store.save()
         return kind
 

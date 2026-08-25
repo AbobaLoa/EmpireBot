@@ -33,6 +33,11 @@
     "use_feathers": true,
     "gold_fallback_when_no_feathers": true
   },
+  "nomad_farm": {
+    "start_level": 40,
+    "end_level": 50,
+    "max_attacks_per_camp": 11
+  },
   "bluestacks": {
     "adb_host": "127.0.0.1",
     "adb_ports": [5555, 5556, 5565],
@@ -44,6 +49,7 @@
   },
   "vision": {
     "robber_threshold": 0.65,
+    "nomad_threshold": 0.65,
     "screen_timeout_seconds": 8,
     "popup_retries": 4,
     "map_anchor": [0.50, 0.54],

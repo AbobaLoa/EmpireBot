@@ -62,6 +62,7 @@ class LiveState:
     session_attacks: int = 0
     session_gold: int = 0
     session_rubies: int = 0
+    nomad_farm: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         from e4kbot.control import CONTROL
@@ -105,6 +106,7 @@ class LiveState:
             "session_attacks": int(self.session_attacks),
             "session_gold": int(self.session_gold),
             "session_rubies": int(self.session_rubies),
+            "nomad_farm": dict(self.nomad_farm or {}),
             "server_time": int(now),
         }
 
@@ -128,6 +130,9 @@ class StateStore:
             self.live.last_confirmed_one_way_sec = int(
                 raw.get("last_confirmed_one_way_sec") or 0
             )
+            nomad_raw = raw.get("nomad_farm")
+            if isinstance(nomad_raw, dict):
+                self.live.nomad_farm = nomad_raw
         except Exception:
             self.live.cooldowns = {}
 
@@ -243,6 +248,15 @@ class StateStore:
         self.live.session_attacks = 0
         self.live.session_gold = 0
         self.live.session_rubies = 0
+
+    def nomad_progress(self) -> Any:
+        from e4kbot.nomad_farm import NomadProgress
+
+        return NomadProgress.from_dict(self.live.nomad_farm)
+
+    def save_nomad_progress(self, progress: Any) -> None:
+        self.live.nomad_farm = progress.to_dict()
+        self.save()
 
     def update_return_timer(
         self,
