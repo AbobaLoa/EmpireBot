@@ -82,11 +82,8 @@ class NomadCampsModule:
         if not NOMAD_TEMPLATE.exists():
             logger.warning("Нет assets/nomad_camp.png — охоту не начинаю, жду шаблон лагеря")
             return "waiting_camp_template"
-        target_level = driver.prepare_nomad_level_cycle()
-        if target_level is None:
-            logger.info("Все уровни кочевников в диапазоне пройдены")
-            return "nomad_levels_complete"
-        logger.info("Кочевники: цикл охоты, пресет={}, целевой уровень {}", self._preset_ready, target_level)
+        driver.prepare_nomad_farm_cycle()
+        logger.info("Кочевники: цикл охоты, пресет={}", self._preset_ready)
         if bool(driver.config.get("nomad_preset_ready")):
             self._preset_ready = True
         ok, _ = concurrent_ok(len(driver.store.in_flight()), driver.config)
@@ -372,10 +369,9 @@ class NomadCampsModule:
                 return self._finish_event(driver, sent)
             if self._camp_just_finished(driver):
                 logger.info(
-                    "Лагерь {} закрыт после 11 ударов — сразу беру следующий",
+                    "Лагерь {} закрыт после 11 ударов — переключаюсь на следующий",
                     driver._selected_target_coords,
                 )
-                driver.advance_nomad_level_after_camp()
                 driver._hunt_queue = []
                 self._drop_exhausted_camps(driver)
                 follow = self._attack_next_camp_now(driver)
@@ -1087,10 +1083,10 @@ class NomadCampsModule:
         path = DATA_DIR / "nomad_eleven_report.json"
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         text = (
-            "✅ Кочевники: 11 атак отправлено\n"
+            "✅ Кочевники: 11 атак по одному лагерю\n"
             f"🎯 Последний лагерь: {coords}\n"
             f"⚔️ Ударов по нему: {hits}\n"
-            "После 11 ударов по одному лагерю сразу беру следующий."
+            "Лагерь уходит на CD 1.5ч — беру следующий из 4."
         )
         logger.info("Отчёт 11 атак кочевников: {}", text.replace("\n", " | "))
         sent_ok = driver.telegram.send_text(text, kind="nomad")

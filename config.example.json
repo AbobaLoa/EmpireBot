@@ -34,9 +34,10 @@
     "gold_fallback_when_no_feathers": true
   },
   "nomad_farm": {
-    "start_level": 40,
-    "end_level": 50,
-    "max_attacks_per_camp": 11
+    "start_level": 41,
+    "max_attacks_per_camp": 11,
+    "camp_cooldown_hours": 1.5,
+    "num_camps": 4
   },
   "bluestacks": {
     "adb_host": "127.0.0.1",

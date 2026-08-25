@@ -10,6 +10,7 @@ from e4kbot.paths import STATE_PATH
 from e4kbot.safety import MAX_COMMANDER_NUMBER, MAX_CONCURRENT_ATTACKS
 
 NOMAD_HITS_PER_CAMP = 11
+NOMAD_CAMP_COOLDOWN_SEC = 90 * 60
 
 
 @dataclass
@@ -134,6 +135,7 @@ class StateStore:
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or STATE_PATH
         self.live = LiveState()
+        self.nomad_cooldown_sec = float(NOMAD_CAMP_COOLDOWN_SEC)
         self._load_persisted()
 
     def _load_persisted(self) -> None:
@@ -252,7 +254,12 @@ class StateStore:
                 budget = NOMAD_HITS_PER_CAMP if kind == "nomad" else 10
             left = max(0, int(budget) - 1)
             bucket[hit_key] = left
-            cooldown_until = now + 24 * 60 * 60 if left <= 0 else 0.0
+            if kind == "nomad" and left <= 0:
+                cooldown_until = now + float(self.nomad_cooldown_sec)
+            elif left <= 0:
+                cooldown_until = now + 24 * 60 * 60
+            else:
+                cooldown_until = 0.0
         else:
             cooldown_until = now + one_way + 3 * 60 * 60
         march = March(
@@ -414,9 +421,46 @@ class StateStore:
         self.live.nomad_remaining[key] = max(0, int(remaining))
         self.save()
 
+    def nomad_cooldown_until(self, coords: tuple[int, int] | None) -> float:
+        coords = self.canonicalize_nomad_coords(coords)
+        if not coords:
+            return 0.0
+        kingdom = 0
+        return self.target_cooldown_until("nomad", kingdom, int(coords[0]), int(coords[1]))
+
+    def reset_nomad_camp(self, coords: tuple[int, int] | None) -> None:
+        coords = self.canonicalize_nomad_coords(coords)
+        if not coords:
+            return
+        x, y = int(coords[0]), int(coords[1])
+        hit_key = f"nomad:{x}:{y}"
+        self.live.target_hits.pop(hit_key, None)
+        self.live.nomad_remaining.pop(hit_key, None)
+        for key in list(self.live.cooldowns):
+            if key.endswith(f":{x}:{y}") and key.startswith("nomad:"):
+                self.live.cooldowns.pop(key, None)
+        farm = self.nomad_farm_xy()
+        if farm and abs(farm[0] - x) <= 4 and abs(farm[1] - y) <= 4:
+            self.live.nomad_farm_coords = None
+            self.live.nomad_farm_point = None
+        self.save()
+
     def camp_has_nomad_budget(self, coords: tuple[int, int] | None) -> bool:
-        if self.target_hits("nomad", coords) >= NOMAD_HITS_PER_CAMP:
+        coords = self.canonicalize_nomad_coords(coords)
+        if not coords:
             return False
+        now = time.time()
+        hits = self.target_hits("nomad", coords)
+        if hits >= NOMAD_HITS_PER_CAMP:
+            cd = self.nomad_cooldown_until(coords)
+            if cd > now:
+                return False
+            self.reset_nomad_camp(coords)
+            progress = self.nomad_progress()
+            settings = self._nomad_settings()
+            progress.reset_camp_if_cooldown_expired(coords, settings, now)
+            self.save_nomad_progress(progress)
+            return True
         remaining = self.nomad_remaining_for(coords)
         if remaining is not None:
             return remaining > 0
@@ -490,10 +534,15 @@ class StateStore:
             self.live.skipped_modes.append(mode_id)
             self.save()
 
-    def nomad_progress(self) -> Any:
-        from e4kbot.nomad_farm import NomadProgress
+    def _nomad_settings(self) -> Any:
+        from e4kbot.nomad_farm import NomadFarmSettings
 
-        return NomadProgress.from_dict(self.live.nomad_farm)
+        return NomadFarmSettings()
+
+    def nomad_progress(self) -> Any:
+        from e4kbot.nomad_farm import NomadFarmProgress
+
+        return NomadFarmProgress.from_dict(self.live.nomad_farm)
 
     def save_nomad_progress(self, progress: Any) -> None:
         self.live.nomad_farm = progress.to_dict()

@@ -236,9 +236,10 @@ def public_settings(config: dict[str, Any]) -> dict[str, Any]:
         "barons": bool(modes.get("barons", True)),
         "nomads": bool(modes.get("nomads", True)),
         "shogun": bool(modes.get("shogun", True)),
-        "nomad_start_level": int(nomad.get("start_level", 40)),
-        "nomad_end_level": int(nomad.get("end_level", 50)),
+        "nomad_start_level": int(nomad.get("start_level", 41)),
         "nomad_max_attacks_per_camp": int(nomad.get("max_attacks_per_camp", 11)),
+        "nomad_camp_cooldown_hours": float(nomad.get("camp_cooldown_hours", 1.5)),
+        "nomad_num_camps": int(nomad.get("num_camps", 4)),
         "hotkey": normalize_hotkey(str(control.get("hotkey") or CONTROL.hotkey)),
         "hotkey_label": hotkey_label(str(control.get("hotkey") or CONTROL.hotkey)),
         "always_on_top": bool(control.get("always_on_top", True)),
@@ -300,12 +301,16 @@ def apply_public_settings(config: dict[str, Any], updates: dict[str, Any]) -> di
     nomad_farm = dict(config.get("nomad_farm") or {})
     if "nomad_start_level" in updates:
         nomad_farm["start_level"] = max(1, min(99, int(updates["nomad_start_level"])))
-    if "nomad_end_level" in updates:
-        nomad_farm["end_level"] = max(1, min(99, int(updates["nomad_end_level"])))
     if "nomad_max_attacks_per_camp" in updates:
         nomad_farm["max_attacks_per_camp"] = max(
             1, min(99, int(updates["nomad_max_attacks_per_camp"]))
         )
+    if "nomad_camp_cooldown_hours" in updates:
+        nomad_farm["camp_cooldown_hours"] = max(
+            0.1, min(24.0, float(updates["nomad_camp_cooldown_hours"]))
+        )
+    if "nomad_num_camps" in updates:
+        nomad_farm["num_camps"] = max(1, min(10, int(updates["nomad_num_camps"])))
     if nomad_farm:
         config["nomad_farm"] = nomad_farm
     bluestacks = dict(config.get("bluestacks") or {})

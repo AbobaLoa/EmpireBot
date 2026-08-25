@@ -12,7 +12,7 @@ from PIL import ImageDraw
 
 from e4kbot.bluestacks import AdbClient, capture_game_image, save_shot
 from e4kbot.control import CONTROL
-from e4kbot.nomad_farm import NomadFarmSettings
+from e4kbot.nomad_farm import NomadFarmProgress, NomadFarmSettings
 from e4kbot.paths import LAYOUTS_DIR, ROOT
 from e4kbot.runtime.live import emit
 from e4kbot.safety import (
@@ -169,6 +169,8 @@ class BlueStacksEngine:
         self._nomad_recenter_next = False
         self._picker_stall_count = 0
         self._no_commanders_seen = False
+        nomad_settings = NomadFarmSettings.from_config(config)
+        self.store.nomad_cooldown_sec = nomad_settings.camp_cooldown_sec
 
     _PICKER_STALL_REASONS = frozenset(
         {
@@ -1048,49 +1050,47 @@ class BlueStacksEngine:
     def _nomad_farm_settings(self) -> NomadFarmSettings:
         return NomadFarmSettings.from_config(self.config)
 
-    def _nomad_target_level(self) -> int | None:
-        progress = self.store.nomad_progress()
-        return progress.current_level(self._nomad_farm_settings())
-
-    def prepare_nomad_level_cycle(self) -> int | None:
-        progress = self.store.nomad_progress()
+    def prepare_nomad_farm_cycle(self) -> None:
+        """Log nomad farm status for the current 4-camp rotation."""
         settings = self._nomad_farm_settings()
-        if progress.is_complete(settings):
-            logger.info(
-                "Цикл кочевников {}–{} завершён — сброс прогресса уровней",
-                settings.start_level,
-                settings.end_level,
-            )
-            progress.reset()
-            self.store.save_nomad_progress(progress)
-        level = progress.current_level(settings)
-        if level is not None:
-            logger.info("Кочевники: {}", progress.status_line(settings))
-        return level
-
-    def advance_nomad_level_after_camp(self) -> None:
-        level = self._last_nomad_level
-        if level is None:
-            return
         progress = self.store.nomad_progress()
-        settings = self._nomad_farm_settings()
-        progress.advance_after_camp(settings, int(level))
+        logger.info("Кочевники: {}", progress.status_line(settings))
         self.store.save_nomad_progress(progress)
-        self._last_nomad_level = None
+
+    def record_nomad_attack(self, coords: tuple[int, int], ocr_level: int | None = None) -> None:
+        settings = self._nomad_farm_settings()
+        progress = self.store.nomad_progress()
+        progress.record_attack(coords, settings, ocr_level=ocr_level)
+        self.store.save_nomad_progress(progress)
+        record = progress.get_camp(coords, settings)
         logger.info(
-            "Лагерь {} выбит — следующий уровень: {}",
-            level,
-            progress.current_level(settings),
+            "Лагерь {}: {} атак, ур. {}, осталось {}",
+            coords,
+            record.attacks_done,
+            record.current_level,
+            settings.attacks_remaining(record.attacks_done),
         )
 
+    def _nomad_camp_level_ok(self, coords: tuple[int, int], observed_level: int) -> bool:
+        settings = self._nomad_farm_settings()
+        progress = self.store.nomad_progress()
+        hits = self.store.target_hits("nomad", coords)
+        progress.sync_from_store_hits(coords, hits, settings)
+        expected = progress.get_camp(coords, settings).current_level
+        if expected is None:
+            expected = settings.level_after_attacks(hits)
+        low = max(settings.start_level, expected - 1)
+        high = min(settings.end_level, expected + 1)
+        return low <= int(observed_level) <= high
+
     def _nomad_level_matches(self, image: Any, point: tuple[float, float]) -> bool:
-        target_level = self._nomad_target_level()
-        if target_level is None:
-            return False
+        """Accept any visible nomad camp in the configured level band (not a map-wide level chain)."""
+        settings = self._nomad_farm_settings()
         map_level = read_camp_level_at_point(image, point)
         if map_level is None:
             return True
-        return int(map_level) == int(target_level)
+        level = int(map_level)
+        return settings.start_level <= level <= settings.end_level
 
     def _list_eligible_targets(
         self,
@@ -1764,19 +1764,18 @@ class BlueStacksEngine:
             if level is not None and self._selected_target_coords:
                 if kind == "nomad":
                     self._last_nomad_level = int(level)
-                    target_level = self._nomad_target_level()
-                    if target_level is not None and int(level) != int(target_level):
+                    coords = self._selected_target_coords
+                    if not self._nomad_camp_level_ok(coords, int(level)):
                         logger.warning(
-                            "Лагерь уровня {}, нужен {} — закрываю и ищу другой",
+                            "Лагерь {} уровня {} вне ожидания для {} атак — закрываю",
+                            coords,
                             level,
-                            target_level,
+                            self.store.target_hits("nomad", coords),
                         )
                         self.tap_rel("map")
                         return False
                     remaining = remaining_attacks_from_nomad_level(level)
-                    remaining = self.store.apply_nomad_ocr_remaining(
-                        self._selected_target_coords, remaining
-                    )
+                    remaining = self.store.apply_nomad_ocr_remaining(coords, remaining)
                 else:
                     remaining = remaining_attacks_from_level(level)
                     self.store.set_samurai_remaining(self._selected_target_coords, remaining)
@@ -2434,6 +2433,8 @@ class BlueStacksEngine:
             str(shot_path) if shot_path else "",
             movement=movement,
         )
+        if kind == "nomad":
+            self.record_nomad_attack((x, y), ocr_level=self._last_nomad_level)
         self.telegram.report_attack(
             self.store.live.account or "BlueStacks",
             kind,

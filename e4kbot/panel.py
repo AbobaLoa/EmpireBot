@@ -115,8 +115,9 @@ class ControlPanel:
         self.delay_max = tk.IntVar()
         self.input_method = tk.StringVar()
         self.nomad_start = tk.IntVar()
-        self.nomad_end = tk.IntVar()
+        self.nomad_num_camps = tk.IntVar()
         self.nomad_max_attacks = tk.IntVar()
+        self.nomad_cooldown_hours = tk.DoubleVar()
 
         self._load_vars()
 
@@ -153,19 +154,27 @@ class ControlPanel:
             width=16,
         ).grid(row=3, column=1, sticky="ew", pady=3)
 
-        tk.Label(grid, text="Коч. с ур.", fg="#9aa3b5", bg="#1c2130").grid(row=4, column=0, sticky="w")
+        tk.Label(grid, text="Коч. старт ур.", fg="#9aa3b5", bg="#1c2130").grid(row=4, column=0, sticky="w")
         tk.Spinbox(grid, from_=1, to=99, textvariable=self.nomad_start, width=16).grid(
             row=4, column=1, sticky="ew", pady=3
         )
-        tk.Label(grid, text="Коч. по ур.", fg="#9aa3b5", bg="#1c2130").grid(row=5, column=0, sticky="w")
-        tk.Spinbox(grid, from_=1, to=99, textvariable=self.nomad_end, width=16).grid(
+        tk.Label(grid, text="Лагерей на карте", fg="#9aa3b5", bg="#1c2130").grid(row=5, column=0, sticky="w")
+        tk.Spinbox(grid, from_=1, to=10, textvariable=self.nomad_num_camps, width=16).grid(
             row=5, column=1, sticky="ew", pady=3
         )
         tk.Label(grid, text="Атак/лагерь", fg="#9aa3b5", bg="#1c2130").grid(row=6, column=0, sticky="w")
         tk.Spinbox(grid, from_=1, to=99, textvariable=self.nomad_max_attacks, width=16).grid(
             row=6, column=1, sticky="ew", pady=3
         )
-
+        tk.Label(grid, text="CD лагеря, ч", fg="#9aa3b5", bg="#1c2130").grid(row=7, column=0, sticky="w")
+        tk.Spinbox(
+            grid,
+            from_=0.5,
+            to=24.0,
+            increment=0.5,
+            textvariable=self.nomad_cooldown_hours,
+            width=16,
+        ).grid(row=7, column=1, sticky="ew", pady=3)
         tk.Checkbutton(
             grid,
             text="DRY-RUN (не отправлять)",
@@ -175,7 +184,7 @@ class ControlPanel:
             selectcolor="#12141c",
             activebackground="#1c2130",
             activeforeground="#f3f4f8",
-        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=2)
+        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=2)
         tk.Checkbutton(
             grid,
             text="Использовать перья",
@@ -185,7 +194,7 @@ class ControlPanel:
             selectcolor="#12141c",
             activebackground="#1c2130",
             activeforeground="#f3f4f8",
-        ).grid(row=8, column=0, columnspan=2, sticky="w", pady=2)
+        ).grid(row=9, column=0, columnspan=2, sticky="w", pady=2)
         tk.Checkbutton(
             grid,
             text="Если перьев нет — золото",
@@ -195,7 +204,7 @@ class ControlPanel:
             selectcolor="#12141c",
             activebackground="#1c2130",
             activeforeground="#f3f4f8",
-        ).grid(row=9, column=0, columnspan=2, sticky="w", pady=2)
+        ).grid(row=10, column=0, columnspan=2, sticky="w", pady=2)
         tk.Checkbutton(
             grid,
             text="Панель поверх окон",
@@ -206,7 +215,7 @@ class ControlPanel:
             selectcolor="#12141c",
             activebackground="#1c2130",
             activeforeground="#f3f4f8",
-        ).grid(row=10, column=0, columnspan=2, sticky="w", pady=2)
+        ).grid(row=11, column=0, columnspan=2, sticky="w", pady=2)
 
         grid.columnconfigure(1, weight=1)
 
@@ -271,8 +280,9 @@ class ControlPanel:
         self.delay_max.set(data["attack_delay_max"])
         self.input_method.set(data["input"])
         self.nomad_start.set(data["nomad_start_level"])
-        self.nomad_end.set(data["nomad_end_level"])
+        self.nomad_num_camps.set(data["nomad_num_camps"])
         self.nomad_max_attacks.set(data["nomad_max_attacks_per_camp"])
+        self.nomad_cooldown_hours.set(data["nomad_camp_cooldown_hours"])
 
     def _toggle(self) -> None:
         CONTROL.toggle()
@@ -322,8 +332,9 @@ class ControlPanel:
                 "input": self.input_method.get(),
                 "hotkey": CONTROL.hotkey,
                 "nomad_start_level": self.nomad_start.get(),
-                "nomad_end_level": self.nomad_end.get(),
+                "nomad_num_camps": self.nomad_num_camps.get(),
                 "nomad_max_attacks_per_camp": self.nomad_max_attacks.get(),
+                "nomad_camp_cooldown_hours": self.nomad_cooldown_hours.get(),
             },
         )
         save_config(self.config)

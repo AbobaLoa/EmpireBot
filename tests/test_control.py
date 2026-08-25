@@ -62,7 +62,12 @@ class ControlTests(unittest.TestCase):
             "cycle_pause_seconds": [12, 25],
             "baron_attacks": {"use_feathers": True, "gold_fallback_when_no_feathers": True},
             "modes": {"barons": True, "nomads": True, "shogun": True},
-            "nomad_farm": {"start_level": 40, "end_level": 50, "max_attacks_per_camp": 11},
+            "nomad_farm": {
+                "start_level": 41,
+                "max_attacks_per_camp": 11,
+                "camp_cooldown_hours": 1.5,
+                "num_camps": 4,
+            },
             "bluestacks": {"input": "mouse"},
             "control": {"hotkey": "N", "always_on_top": True},
         }
