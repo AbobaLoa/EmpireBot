@@ -1262,7 +1262,7 @@ def find_target_attack_button(
     template_path: Path = TARGET_ATTACK_TEMPLATE,
     threshold: float = 0.72,
     near: tuple[float, float] | None = None,
-    max_dist: float = 0.24,
+    max_dist: float = 0.36,
 ) -> tuple[float, float] | None:
     if not template_path.exists():
         return None

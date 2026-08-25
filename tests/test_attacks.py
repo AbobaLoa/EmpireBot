@@ -434,6 +434,33 @@ class NomadCampsTests(unittest.TestCase):
         module._keep_current_camp_queued(driver)
         self.assertEqual(driver._hunt_queue[0].point, (0.39, 0.41))
         self.assertEqual(driver._hunt_queue[0].coords, (598, 735))
+        self.assertEqual(store.nomad_farm_xy(), (598, 735))
+
+    def test_canonicalize_nomad_coords_merges_jitter(self) -> None:
+        store = StateStore(path=self._tmp("canon.json"))
+        store.register_march(1, 1, "nomad", 0, 605, 732, 30)
+        self.assertEqual(store.canonicalize_nomad_coords((602, 732)), (605, 732))
+        self.assertEqual(store.target_hits("nomad", (602, 734)), 1)
+        store.register_march(2, 2, "nomad", 0, 603, 733, 30)
+        self.assertEqual(store.target_hits("nomad", (605, 732)), 2)
+        self.assertEqual(store.nomad_farm_xy(), (605, 732))
+
+    def test_restore_farm_queue_after_restart(self) -> None:
+        from e4kbot.attacks.nomad_camps import NomadCampsModule
+
+        store = StateStore(path=self._tmp("farm.json"))
+        store.set_nomad_remaining((605, 732), 10)
+        store.live.target_hits["nomad:605:732"] = 1
+        store.live.last_screenshot = r"C:\shots\nomad_605_732_1.png"
+        module = NomadCampsModule()
+        driver = type("D", (), {})()
+        driver.store = store
+        driver._hunt_queue = []
+        driver._last_nomad_point = None
+        driver._selected_target_coords = None
+        module._restore_farm_queue(driver)
+        self.assertEqual(driver._hunt_queue[0].coords, (605, 732))
+        self.assertTrue(driver._nomad_recenter_next)
 
     def test_badge_template_matches_itself(self) -> None:
         image = _canvas_with(NOMAD_TOOL_BADGE_TEMPLATE, (0.62, 0.55))

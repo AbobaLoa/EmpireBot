@@ -40,6 +40,7 @@ from e4kbot.vision import (
     find_formation_attack_button,
     find_red_cross_force,
     find_target_attack_button,
+    find_travel_seal_pair,
     find_plaque_attack_button,
     find_parchment_title_close,
     flank_fill_allowed,
@@ -89,6 +90,12 @@ class HuntTarget:
         if self.coords is not None:
             return ("xy", int(self.coords[0]), int(self.coords[1]))
         return ("sc", round(self.point[0], 2), round(self.point[1], 2))
+
+
+def _dummy_center(point: tuple[float, float] | None) -> bool:
+    if point is None:
+        return True
+    return abs(float(point[0]) - 0.50) < 0.02 and abs(float(point[1]) - 0.50) < 0.02
 
 
 def load_layout(name: str) -> dict[str, Any]:
@@ -156,6 +163,7 @@ class BlueStacksEngine:
         self._last_picker_fill: tuple[int, int] | None = None
         self._hunt_queue: list[HuntTarget] = []
         self._last_nomad_point: tuple[float, float] | None = None
+        self._nomad_recenter_next = False
         self._picker_stall_count = 0
         self._no_commanders_seen = False
 
@@ -799,16 +807,24 @@ class BlueStacksEngine:
         )
         CONTROL.sleep(0.6)
 
-    def scroll_tool_inventory(self, stride: float = 0.04) -> None:
+    def scroll_tool_inventory(self, stride: float = 0.04, upward: bool = False) -> None:
         """One inventory row, then caller screenshots. Never shop/search."""
         size = self._size()
         cx, cy = 0.40, 0.56
         x, y = _abs_point(size, [cx, cy])
-        logger.info("Скролл орудий ({:.3f}, {:.3f}) stride={:.3f}", cx, cy, float(stride))
-        self.adb.wheel(x, y, delta=-120, source_size=size)
+        logger.info(
+            "Скролл орудий ({:.3f}, {:.3f}) stride={:.3f} {}",
+            cx,
+            cy,
+            float(stride),
+            "вверх" if upward else "вниз",
+        )
+        wheel = 120 if upward else -120
+        self.adb.wheel(x, y, delta=wheel, source_size=size)
         width, height = size
-        start_y = 0.57
-        end_y = min(0.70, start_y + max(0.03, min(0.05, float(stride))))
+        span = max(0.03, min(0.05, float(stride)))
+        start_y = 0.62 if upward else 0.57
+        end_y = (start_y - span) if upward else min(0.70, start_y + span)
         self.adb.swipe(
             round(0.40 * width),
             round(start_y * height),
@@ -818,6 +834,10 @@ class BlueStacksEngine:
             source_size=size,
         )
         CONTROL.sleep(0.55)
+
+    def reset_tool_inventory_scroll(self, stride: float = 0.04) -> None:
+        for _ in range(5):
+            self.scroll_tool_inventory(stride=stride, upward=True)
 
     def _pan_map(self, view_dx: float, view_dy: float) -> None:
         """Move the kingdom-map view. Positive dx looks east; the drag is inverted."""
@@ -888,6 +908,18 @@ class BlueStacksEngine:
             if (point[0] - bx) ** 2 + (point[1] - by) ** 2 < 0.035**2:
                 return True
         return False
+
+    def _unblock_screen_target(self, point: tuple[float, float] | None) -> None:
+        if point is None:
+            return
+        blocked = getattr(self, "_blocked_screen_targets", None)
+        if not blocked:
+            return
+        self._blocked_screen_targets = [
+            (bx, by)
+            for bx, by in blocked
+            if (point[0] - bx) ** 2 + (point[1] - by) ** 2 >= 0.035**2
+        ]
 
     def _block_screen_target(self, point: tuple[float, float]) -> None:
         if self._is_blocked_screen_target(point):
@@ -1010,7 +1042,12 @@ class BlueStacksEngine:
             timeout=timeout,
         )
 
-    def _list_eligible_targets(self, image: Any, kind: str) -> list[HuntTarget]:
+    def _list_eligible_targets(
+        self,
+        image: Any,
+        kind: str,
+        include_blocked: bool = False,
+    ) -> list[HuntTarget]:
         if kind == "samurai":
             threshold = float((self.config.get("vision") or {}).get("samurai_threshold") or 0.65)
             candidates = find_samurai_candidates(image, threshold)
@@ -1037,7 +1074,7 @@ class BlueStacksEngine:
                     continue
                 if is_offer_rail_point(point[0], point[1]):
                     continue
-                if self._is_blocked_screen_target(point):
+                if not include_blocked and self._is_blocked_screen_target(point):
                     continue
                 eligible.append(candidate)
             if not eligible:
@@ -1063,7 +1100,7 @@ class BlueStacksEngine:
                 continue
             if is_offer_rail_point(point[0], point[1]):
                 continue
-            if self._is_blocked_screen_target(point):
+            if not include_blocked and self._is_blocked_screen_target(point):
                 blocked += 1
                 continue
             coords = project_map_coordinate(
@@ -1073,6 +1110,10 @@ class BlueStacksEngine:
                 (float(scale_raw[0]), float(scale_raw[1])),
             )
             stable = (round(coords[0]), round(coords[1]))
+            if kind == "nomad":
+                snapped = self.store.canonicalize_nomad_coords(stable)
+                if snapped:
+                    stable = snapped
             if not self.store.target_available(kind, kingdom, stable[0], stable[1]):
                 cooling += 1
                 continue
@@ -1124,6 +1165,17 @@ class BlueStacksEngine:
                 logger.info("Скан карты остановлен — экран больше не карта")
                 return True
             for target in self._list_eligible_targets(image, kind):
+                if kind == "nomad" and target.coords:
+                    snapped = self.store.canonicalize_nomad_coords(target.coords)
+                    if snapped:
+                        target = HuntTarget(target.point, snapped)
+                    if any(
+                        existing.coords
+                        and abs(existing.coords[0] - target.coords[0]) <= 4
+                        and abs(existing.coords[1] - target.coords[1]) <= 4
+                        for existing in found
+                    ):
+                        continue
                 ident = target.identity()
                 if ident in seen:
                     continue
@@ -1137,6 +1189,7 @@ class BlueStacksEngine:
                 )
                 if kind == "nomad" and len(found) == 1:
                     self._last_nomad_point = target.point
+                    self._nomad_recenter_next = False
                     if target.coords:
                         self._selected_target_coords = target.coords
                 if len(found) >= quota:
@@ -1189,13 +1242,53 @@ class BlueStacksEngine:
         kind: str,
         target: HuntTarget,
     ) -> tuple[float, float] | None:
-        expected = target.point
         last = getattr(self, "_last_nomad_point", None)
-        if kind == "nomad" and last is not None:
-            if abs(expected[0] - 0.50) < 0.02 and abs(expected[1] - 0.50) < 0.02:
-                expected = last
-        screen_tol = 0.10 if kind == "nomad" else 0.04
-        for item in self._list_eligible_targets(image, kind):
+        items = self._list_eligible_targets(
+            image,
+            kind,
+            include_blocked=(kind == "nomad" and target.coords is not None),
+        )
+        if kind == "nomad" and target.coords is not None:
+            for item in items:
+                if is_burning_candidate(image, item.point):
+                    continue
+                if item.coords and (
+                    abs(item.coords[0] - target.coords[0]) <= 4
+                    and abs(item.coords[1] - target.coords[1]) <= 4
+                ):
+                    logger.info(
+                        "Тот же лагерь {} на экране ({:.3f}, {:.3f}) — очередь {}",
+                        item.coords,
+                        item.point[0],
+                        item.point[1],
+                        target.coords,
+                    )
+                    return item.point
+            # Coords missing on screen: only the last click of THIS camp, never a yurt near map center.
+            expected = last if last and not _dummy_center(last) else (
+                None if _dummy_center(target.point) else target.point
+            )
+            if expected is None:
+                return None
+            nearest: tuple[float, HuntTarget] | None = None
+            for item in items:
+                if is_burning_candidate(image, item.point):
+                    continue
+                dist2 = (item.point[0] - expected[0]) ** 2 + (item.point[1] - expected[1]) ** 2
+                if dist2 < 0.04**2 and (nearest is None or dist2 < nearest[0]):
+                    nearest = (dist2, item)
+            if nearest is not None:
+                logger.info(
+                    "Тот же лагерь {} по точке очереди ({:.3f}, {:.3f})",
+                    target.coords,
+                    nearest[1].point[0],
+                    nearest[1].point[1],
+                )
+                return nearest[1].point
+            return None
+        expected = target.point
+        screen_tol = 0.04
+        for item in items:
             if is_burning_candidate(image, item.point):
                 continue
             if target.coords and item.coords:
@@ -1209,12 +1302,9 @@ class BlueStacksEngine:
             ) ** 2
             if dist2 < screen_tol**2:
                 return item.point
-        # Nomad 11-hit farm: never switch to a nearer unrelated yurt.
-        if kind == "nomad" and target.coords is not None:
-            return None
-        if kind in {"samurai", "nomad"}:
-            nearest: tuple[float, HuntTarget] | None = None
-            for item in self._list_eligible_targets(image, kind):
+        if kind == "samurai":
+            nearest = None
+            for item in items:
                 if is_burning_candidate(image, item.point):
                     continue
                 dist2 = (item.point[0] - target.point[0]) ** 2 + (
@@ -1242,40 +1332,59 @@ class BlueStacksEngine:
         if self._dismiss_special_offers_if_open(image):
             image = self._await_world_map(timeout=4) or self._image()
         self._selected_target_coords = target.coords
-        if kind == "nomad" and target.point and getattr(self, "_last_nomad_point", None) is None:
-            self._last_nomad_point = target.point
+        if kind == "nomad":
+            self._unblock_screen_target(target.point)
+            self._unblock_screen_target(getattr(self, "_last_nomad_point", None))
+            if target.point and not _dummy_center(target.point) and getattr(self, "_last_nomad_point", None) is None:
+                self._last_nomad_point = target.point
         visible = self._match_visible_target(image, kind, target)
         if visible:
             if not self._selected_target_coords:
                 self._selected_target_coords = target.coords
             if kind == "nomad":
                 self._last_nomad_point = visible
+                logger.info(
+                    "Очередь лагеря {} — жму совпавшую юрту ({:.3f}, {:.3f})",
+                    target.coords,
+                    visible[0],
+                    visible[1],
+                )
             return visible
         if kind == "nomad" and target.coords is not None:
-            queued = getattr(self, "_last_nomad_point", None) or target.point
-            if queued:
-                if self._is_blocked_screen_target(queued):
-                    logger.info(
-                        "Точка очереди {} была в блоке — всё равно жму тот же лагерь ({:.3f}, {:.3f})",
-                        target.coords,
-                        queued[0],
-                        queued[1],
-                    )
-                else:
-                    logger.info(
-                        "Жму очередь того же лагеря {} ({:.3f}, {:.3f}), чужой не беру",
-                        target.coords,
-                        queued[0],
-                        queued[1],
-                    )
+            queued = getattr(self, "_last_nomad_point", None)
+            if queued is None or _dummy_center(queued):
+                queued = None if _dummy_center(target.point) else target.point
+            if not getattr(self, "_nomad_recenter_next", False) and queued:
+                logger.info(
+                    "Жму очередь того же лагеря {} ({:.3f}, {:.3f}), чужой не беру",
+                    target.coords,
+                    queued[0],
+                    queued[1],
+                )
                 self._last_nomad_point = queued
                 return queued
             logger.info("Лагерь {} не совпал на экране — центрирую замок, чужой не беру", target.coords)
+            self._nomad_recenter_next = False
             image = self._recenter_on_main_castle(image)
             visible = self._match_visible_target(image, kind, target)
             if visible:
                 self._last_nomad_point = visible
+                logger.info(
+                    "После центра очередь {} — жму ту же юрту ({:.3f}, {:.3f})",
+                    target.coords,
+                    visible[0],
+                    visible[1],
+                )
                 return visible
+            if queued:
+                logger.info(
+                    "После центра жму очередь того же лагеря {} ({:.3f}, {:.3f}), чужой не беру",
+                    target.coords,
+                    queued[0],
+                    queued[1],
+                )
+                self._last_nomad_point = queued
+                return queued
             logger.info("Лагерь {} не на экране — очередь не сбрасываю", target.coords)
             return None
         if kind == "samurai":
@@ -1520,9 +1629,16 @@ class BlueStacksEngine:
                 and not is_difficulty_dialog(popup)
                 and not is_formation_screen(popup)
                 and not is_overview_plaque(popup)
+                and not is_travel_dialog(popup)
+                and find_travel_seal_pair(popup) is None
             ):
                 blocked = self._image()
-                if self._plan_or_picker_open(blocked):
+                if (
+                    self._plan_or_picker_open(blocked)
+                    or is_travel_dialog(blocked)
+                    or find_travel_seal_pair(blocked) is not None
+                ):
+                    logger.info("После клика открыт поход/план — лагерь не блокирую")
                     return True
                 if kind != "nomad":
                     self._block_screen_target(point)

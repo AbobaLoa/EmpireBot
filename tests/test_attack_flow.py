@@ -581,6 +581,7 @@ class HuntTests(unittest.TestCase):
         engine._recenter_on_main_castle = Mock(return_value=green)
         engine._is_blocked_screen_target = Mock(return_value=False)
         engine._last_nomad_point = None
+        engine._nomad_recenter_next = False
         engine._jump_to_coords = Mock()
         point = engine._focus_hunt_target(
             "nomad", HuntTarget((0.42, 0.51), (599, 735))
@@ -588,11 +589,36 @@ class HuntTests(unittest.TestCase):
         self.assertEqual(point, (0.42, 0.51))
         engine._recenter_on_main_castle.assert_not_called()
         engine._jump_to_coords.assert_not_called()
+        engine._nomad_recenter_next = True
         engine._is_blocked_screen_target = Mock(return_value=True)
         blocked = engine._focus_hunt_target(
             "nomad", HuntTarget((0.42, 0.51), (599, 735))
         )
         self.assertEqual(blocked, (0.42, 0.51))
+        engine._recenter_on_main_castle.assert_called()
+
+    def test_match_nomad_ignores_dummy_center_and_other_yurt(self) -> None:
+        from e4kbot.client import HuntTarget
+
+        green = Image.new("RGB", (900, 1600), (104, 151, 57))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine._last_nomad_point = (0.48, 0.34)
+        engine._list_eligible_targets = Mock(
+            return_value=[
+                HuntTarget((0.51, 0.50), (600, 733)),
+                HuntTarget((0.48, 0.34), (605, 732)),
+            ]
+        )
+        with patch("e4kbot.client.is_burning_candidate", return_value=False):
+            point = engine._match_visible_target(
+                green, "nomad", HuntTarget((0.50, 0.50), (605, 732))
+            )
+        self.assertEqual(point, (0.48, 0.34))
+        with patch("e4kbot.client.is_burning_candidate", return_value=False):
+            missed = engine._match_visible_target(
+                green, "nomad", HuntTarget((0.50, 0.50), (611, 740))
+            )
+        self.assertIsNone(missed)
 
     def test_recenter_does_not_jump_via_search(self) -> None:
         green = Image.new("RGB", (900, 1600), (104, 151, 57))

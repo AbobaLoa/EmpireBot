@@ -21,6 +21,7 @@ from e4kbot.vision import (
     find_formation_attack_button,
     find_messages_nav,
     find_nomad_tool_inventory,
+    find_picker_max_control,
     find_preset_button,
     find_preset_dialog_close,
     find_red_cross_force,
@@ -124,6 +125,7 @@ class NomadCampsModule:
         resumed = self._resume_open_plan(driver, current)
         if resumed is not None:
             return resumed
+        self._restore_farm_queue(driver)
         if not driver._hunt_queue:
             driver._hunt_queue = driver._collect_hunt_batch("nomad")[:NOMAD_MAP_CAP]
             if not driver._hunt_queue:
@@ -157,6 +159,11 @@ class NomadCampsModule:
             if resumed is not None:
                 return resumed
             target = driver._hunt_queue[0]
+            if target.coords:
+                snapped = driver.store.canonicalize_nomad_coords(target.coords)
+                if snapped and snapped != target.coords:
+                    target = HuntTarget(target.point, snapped)
+                    driver._hunt_queue[0] = target
             if not driver.store.camp_has_nomad_budget(target.coords):
                 logger.info(
                     "Лагерь {} без оставшихся атак — следующий",
@@ -175,19 +182,21 @@ class NomadCampsModule:
             if target.coords:
                 driver._selected_target_coords = target.coords
                 driver.store.live.last_coords = f"K0 ({target.coords[0]}, {target.coords[1]})"
-                driver.store.save()
+                driver.store.set_nomad_farm(target.coords, point)
             if driver._open_formation(point, "nomad"):
                 self._maybe_pick_difficulty_after_attack(driver)
                 return self._execute(driver, point)
             if getattr(driver, "_no_commanders_seen", False):
                 return "no_commanders"
-            if find_target_attack_button(driver._image()) is not None:
-                logger.info("Табличка лагеря ещё открыта — лагерь не выкидываю, повторю Нападение")
-                return "plaque_retry"
+            current = driver._image()
+            resumed = self._resume_open_plan(driver, current)
+            if resumed is not None:
+                return resumed
             logger.info(
                 "Нападение не открылось — лагерь {} оставляю в очереди, чужой не беру",
                 target.coords or target.point,
             )
+            driver._nomad_recenter_next = True
             return "plaque_miss"
         return "no_targets"
 
@@ -390,12 +399,18 @@ class NomadCampsModule:
         same = [target for target in queue if self._same_camp(target, coords)]
         others = [target for target in queue if not self._same_camp(target, coords)]
         point = last_point or (same[0].point if same else None)
-        if point is None:
+        if point is None or (abs(point[0] - 0.50) < 0.02 and abs(point[1] - 0.50) < 0.02):
+            farm_point = driver.store.nomad_farm_screen()
+            if farm_point:
+                point = farm_point
+        if point is None or (abs(point[0] - 0.50) < 0.02 and abs(point[1] - 0.50) < 0.02):
             logger.info("Оставляю лагерь {} в очереди без экранной точки — сверка ±4", coords)
-            point = same[0].point if same else (0.50, 0.50)
+            point = same[0].point if same else (0.42, 0.48)
         head = HuntTarget(point, coords)
         logger.info("Оставляю лагерь {} в очереди — добиваю 11 ударов", coords)
+        driver._nomad_recenter_next = True
         driver._hunt_queue = [head] + others
+        driver.store.set_nomad_farm(coords, point)
 
     def _drop_exhausted_camps(self, driver: Any) -> None:
         coords = driver._selected_target_coords
@@ -409,6 +424,41 @@ class NomadCampsModule:
                 continue
             kept.append(target)
         driver._hunt_queue = kept
+        farm = driver.store.nomad_farm_xy()
+        if farm and coords and abs(farm[0] - coords[0]) <= 4 and abs(farm[1] - coords[1]) <= 4:
+            driver.store.clear_nomad_farm()
+
+    def _restore_farm_queue(self, driver: Any) -> None:
+        """After restart, keep hitting the same camp instead of collecting a new yurt."""
+        farm = driver.store.nomad_farm_xy()
+        if farm is None:
+            shot = str(driver.store.live.last_screenshot or "")
+            match = re.search(r"nomad_(\d+)_(\d+)_", shot.replace("\\", "/"))
+            if match:
+                farm = (int(match.group(1)), int(match.group(2)))
+        if farm is None:
+            return
+        farm = driver.store.canonicalize_nomad_coords(farm) or farm
+        if not driver.store.camp_has_nomad_budget(farm):
+            driver.store.clear_nomad_farm()
+            return
+        queue = list(getattr(driver, "_hunt_queue", []) or [])
+        if queue and self._same_camp(queue[0], farm):
+            return
+        point = driver.store.nomad_farm_screen() or getattr(driver, "_last_nomad_point", None)
+        if point is None or (abs(point[0] - 0.50) < 0.02 and abs(point[1] - 0.50) < 0.02):
+            same = [t for t in list(getattr(driver, "_hunt_queue", []) or []) if self._same_camp(t, farm)]
+            point = same[0].point if same else None
+        if point is None:
+            point = (0.42, 0.48)
+        driver._last_nomad_point = point
+        driver._selected_target_coords = farm
+        driver._nomad_recenter_next = True
+        queue = list(getattr(driver, "_hunt_queue", []) or [])
+        others = [target for target in queue if not self._same_camp(target, farm)]
+        driver._hunt_queue = [HuntTarget(point, farm)] + others
+        driver.store.set_nomad_farm(farm, point)
+        logger.info("Восстанавливаю лагерь {} — добиваю 11 ударов, чужой не беру", farm)
 
     def _attack_next_camp_now(self, driver: Any) -> str | None:
         """After 11 hits, open the next queued camp immediately. One follow-up per cycle."""
@@ -566,8 +616,7 @@ class NomadCampsModule:
                     return False, "preset_setup_failed"
                 self._preset_ready = True
             else:
-                logger.info("Орудий с биркой нет — пресет не сохраняю, сразу автоподбор")
-                self._tools_unavailable = True
+                logger.info("Бирки в инвентаре есть, набор не встал — автоподбор, пресет не помечаю пустым")
                 self._dismiss_tool_picker(driver)
         if not self._run_autoselect(driver):
             return False, "autoselect_failed"
@@ -597,7 +646,12 @@ class NomadCampsModule:
             pass
         inventory = self._scan_inventory(driver)
         if not inventory:
-            logger.info("Бирок орудий с запасом >0 нет — набор и пресет пропускаю")
+            logger.info("Первый скан инвентаря пуст — кручу вверх и сканирую ещё раз")
+            if hasattr(driver, "reset_tool_inventory_scroll"):
+                driver.reset_tool_inventory_scroll(stride=INVENTORY_STRIDE)
+            inventory = self._scan_inventory(driver)
+        if not inventory:
+            logger.info("После полного скролла бирок не видно — набор пропускаю только если инвентарь пуст")
             self._dismiss_tool_picker(driver)
             return False
         planned = list(self._planned_tools) if refill_same and self._planned_tools else assign_flank_tools(inventory, 3)
@@ -612,7 +666,13 @@ class NomadCampsModule:
             driver._tap_norm_exact(float(slot[0]), float(slot[1]))
             CONTROL.sleep(0.40)
             if chosen is None or not self._fill_chosen_tool(driver, chosen, used):
-                extra = [item for item in self._scan_inventory(driver, skip=used) if item.qty > 0]
+                if hasattr(driver, "reset_tool_inventory_scroll"):
+                    driver.reset_tool_inventory_scroll(stride=INVENTORY_STRIDE)
+                extra = [
+                    item
+                    for item in self._scan_inventory(driver, skip=used)
+                    if item.qty > 0 or item.fingerprint
+                ]
                 alt = next((item for item in extra if item.fingerprint not in used), extra[0] if extra else None)
                 if alt is None or not self._fill_chosen_tool(driver, alt, used):
                     logger.info("Фланг {}: нет орудия с биркой — пропускаю слот", index)
@@ -647,7 +707,7 @@ class NomadCampsModule:
         driver: Any,
         skip: set[str] | None = None,
     ) -> list[NomadToolStock]:
-        """Fast page scan: badge + qty>0. One row per step, not a tiny tick."""
+        """Fast page scan: badge + stock. Empty first page is not «нет бирок»."""
         skip = skip or set()
         found: dict[str, NomadToolStock] = {}
         stagnant = 0
@@ -656,18 +716,18 @@ class NomadCampsModule:
             page_items = find_nomad_tool_inventory(image)
             new = 0
             for item in page_items:
-                if item.qty <= 0 or item.fingerprint in skip:
+                if item.fingerprint in skip:
                     continue
                 if item.fingerprint not in found:
                     found[item.fingerprint] = item
                     new += 1
             logger.info(
-                "Инвентарь орудий шаг {}: бирок с запасом {}, новые {}",
+                "Инвентарь орудий шаг {}: бирок {}, новые {}",
                 page + 1,
                 len(found),
                 new,
             )
-            if new == 0 and page > 0:
+            if new == 0 and page > 0 and found:
                 stagnant += 1
                 if stagnant >= 2:
                     break
@@ -679,6 +739,8 @@ class NomadCampsModule:
             if page == INVENTORY_PAGES - 1:
                 break
             driver.scroll_tool_inventory(stride=INVENTORY_STRIDE)
+        if not found:
+            logger.info("За {} шагов бирок не видно — продолжаю скролл не пропускаю набор зря", INVENTORY_PAGES)
         return list(found.values())
 
     def _fill_chosen_tool(
@@ -689,13 +751,12 @@ class NomadCampsModule:
     ) -> bool:
         for page in range(INVENTORY_PAGES):
             items = find_nomad_tool_inventory(driver._image())
-            match = [item for item in items if item.fingerprint == chosen.fingerprint and item.qty > 0]
+            match = [item for item in items if item.fingerprint == chosen.fingerprint]
             if not match:
                 match = [
                     item
                     for item in items
                     if item.percent == chosen.percent
-                    and item.qty > 0
                     and item.fingerprint not in used
                 ]
             if match:
@@ -705,19 +766,28 @@ class NomadCampsModule:
                 if not self._fill_selected_tool(driver, item.tap[1]):
                     return False
                 return True
-            depleted = [item for item in items if item.fingerprint == chosen.fingerprint and item.qty <= 0]
-            if depleted:
-                logger.info("Тип {} закончился (qty=0) — ищу другой", chosen.fingerprint)
-                return False
             driver.scroll_tool_inventory(stride=INVENTORY_STRIDE)
         return False
 
     def _fill_selected_tool(self, driver: Any, row_y: float) -> bool:
         image = driver._image()
         before = driver._read_ratio_from_image(image, "picker_units")
+        max_btn = find_picker_max_control(image)
+        if max_btn is not None:
+            logger.info("MAX орудий ({:.3f}, {:.3f}), было {}", max_btn[0], max_btn[1], before)
+            driver._tap_norm_exact(*max_btn)
+            CONTROL.sleep(0.28)
+            ratio = driver._read_ratio_from_image(driver._image(), "picker_units")
+            if ratio and ratio[1] > 0 and ratio[0] >= max(1, ratio[1] // 2):
+                logger.info("Орудия пикера после MAX {}", ratio)
+                return True
+            if ratio:
+                before = ratio
         plus = find_tool_slider_plus(image, row_y)
+        if plus is None:
+            plus = (0.80, min(0.72, row_y))
         logger.info("Плюс слайдера орудий ({:.3f}, {:.3f}), было {}", plus[0], plus[1], before)
-        for _ in range(35):
+        for _ in range(20):
             driver._tap_norm_exact(*plus)
             CONTROL.sleep(0.16)
             ratio = driver._read_ratio_from_image(driver._image(), "picker_units")
@@ -727,7 +797,11 @@ class NomadCampsModule:
             if ratio and before and ratio[0] > before[0]:
                 before = ratio
         ratio = driver._read_ratio_from_image(driver._image(), "picker_units")
-        return bool(ratio and ratio[1] > 0 and ratio[0] > 0)
+        if ratio and ratio[1] > 0 and ratio[0] > 0:
+            logger.info("Орудия пикера частично {}", ratio)
+            return True
+        logger.info("Слайдер орудий не сдвинул OCR {} — подтверждаю выбранную бирку", ratio)
+        return True
 
     def _dismiss_tool_picker(self, driver: Any) -> None:
         image = driver._image()
