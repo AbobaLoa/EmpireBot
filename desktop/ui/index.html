@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>EmpireBot Live</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <header class="top">
+    <div>
+      <h1>EmpireBot</h1>
+      <p class="muted">Tauri + Rust оболочка · Python экранный движок · live-диагностика</p>
+    </div>
+    <div class="controls">
+      <label class="toggle"><input id="dryRun" type="checkbox" checked /> dry-run</label>
+      <button id="btnStart" class="go">Старт</button>
+      <button id="btnPause">Пауза</button>
+      <button id="btnStop" class="danger">Стоп</button>
+    </div>
+  </header>
+
+  <section class="status-row">
+    <article><span>Режим</span><strong id="activeMode">—</strong></article>
+    <article><span>Состояние</span><strong id="botMode">ожидание</strong></article>
+    <article><span>В пути</span><strong id="inFlight">0</strong></article>
+    <article><span>Сессия</span><strong id="session">0</strong></article>
+    <article><span>Ошибка</span><strong id="lastError">нет</strong></article>
+  </section>
+
+  <main>
+    <section class="panel">
+      <h2>Кампания квот</h2>
+      <p class="muted">Отправленные марши предыдущего шага остаются в пути. Следующий режим стартует, не дожидаясь возврата, пока есть свободные военачальники.</p>
+      <div id="queue" class="queue"></div>
+    </section>
+    <section class="panel log-panel">
+      <div class="log-head">
+        <h2>Live-лог</h2>
+        <div>
+          <select id="logLevel">
+            <option>TRACE</option>
+            <option selected>DEBUG</option>
+            <option>INFO</option>
+            <option>WARNING</option>
+            <option>ERROR</option>
+          </select>
+          <input id="logFilter" placeholder="фильтр event/mode/error" />
+          <button id="btnClear">Очистить</button>
+        </div>
+      </div>
+      <pre id="log"></pre>
+    </section>
+  </main>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

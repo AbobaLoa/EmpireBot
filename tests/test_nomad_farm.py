@@ -4,6 +4,7 @@ import unittest
 
 from e4kbot.control import apply_public_settings, public_settings
 from e4kbot.nomad_farm import NomadFarmSettings, NomadProgress
+from e4kbot.state import NOMAD_HITS_PER_CAMP
 
 
 class NomadFarmSettingsTests(unittest.TestCase):
@@ -20,57 +21,47 @@ class NomadFarmSettingsTests(unittest.TestCase):
         self.assertEqual(settings.levels, list(range(41, 51)))
         self.assertEqual(settings.camp_count, 10)
 
-    def test_clamps_out_of_range_values(self) -> None:
-        settings = NomadFarmSettings.from_config(
-            {"nomad_farm": {"start_level": 0, "end_level": 120, "max_attacks_per_camp": 200}}
-        )
-        self.assertEqual(settings.start_level, 1)
-        self.assertEqual(settings.end_level, 99)
-        self.assertEqual(settings.max_attacks_per_camp, 99)
+    def test_default_max_attacks_matches_state_constant(self) -> None:
+        settings = NomadFarmSettings()
+        self.assertEqual(settings.max_attacks_per_camp, NOMAD_HITS_PER_CAMP)
 
 
 class NomadProgressTests(unittest.TestCase):
-    def test_advances_after_max_attacks_per_camp(self) -> None:
+    def test_advances_level_after_camp_cleared(self) -> None:
         settings = NomadFarmSettings(start_level=40, end_level=42, max_attacks_per_camp=11)
         progress = NomadProgress()
         self.assertEqual(progress.current_level(settings), 40)
-        for _ in range(10):
-            self.assertFalse(progress.record_success(settings, 40))
-            self.assertEqual(progress.current_level(settings), 40)
-        self.assertTrue(progress.record_success(settings, 40))
+        progress.advance_after_camp(settings, 40)
         self.assertEqual(progress.current_level(settings), 41)
-        self.assertEqual(progress.attacks_on(40), 11)
 
     def test_full_cycle_marks_complete(self) -> None:
-        settings = NomadFarmSettings(start_level=49, end_level=50, max_attacks_per_camp=2)
+        settings = NomadFarmSettings(start_level=49, end_level=50, max_attacks_per_camp=11)
         progress = NomadProgress()
-        progress.record_success(settings, 49)
-        progress.record_success(settings, 49)
+        progress.advance_after_camp(settings, 49)
         self.assertEqual(progress.current_level(settings), 50)
-        progress.record_success(settings, 50)
-        progress.record_success(settings, 50)
+        progress.advance_after_camp(settings, 50)
         self.assertTrue(progress.is_complete(settings))
         self.assertIsNone(progress.current_level(settings))
 
     def test_reset_clears_progress(self) -> None:
         settings = NomadFarmSettings(start_level=40, end_level=50, max_attacks_per_camp=11)
-        progress = NomadProgress(level_index=3, attacks_by_level={40: 11, 41: 5})
+        progress = NomadProgress(level_index=3, cleared_levels=[40, 41, 42])
         progress.reset()
         self.assertEqual(progress.level_index, 0)
-        self.assertEqual(progress.attacks_by_level, {})
+        self.assertEqual(progress.cleared_levels, [])
         self.assertEqual(progress.current_level(settings), 40)
 
     def test_roundtrip_dict(self) -> None:
-        original = NomadProgress(level_index=2, attacks_by_level={40: 11, 41: 3})
+        original = NomadProgress(level_index=2, cleared_levels=[40, 41])
         restored = NomadProgress.from_dict(original.to_dict())
         self.assertEqual(restored.level_index, 2)
-        self.assertEqual(restored.attacks_by_level, {40: 11, 41: 3})
+        self.assertEqual(restored.cleared_levels, [40, 41])
 
-    def test_status_line_shows_attack_number(self) -> None:
+    def test_status_line_shows_sequence_position(self) -> None:
         settings = NomadFarmSettings(start_level=40, end_level=50, max_attacks_per_camp=11)
-        progress = NomadProgress(attacks_by_level={40: 10})
+        progress = NomadProgress(level_index=10)
         line = progress.status_line(settings)
-        self.assertIn("40", line)
+        self.assertIn("50", line)
         self.assertIn("11/11", line)
 
 
@@ -113,16 +104,3 @@ class NomadVisionTests(unittest.TestCase):
         self.assertEqual(parse_camp_level("Уровень 50"), 50)
         self.assertEqual(parse_camp_level("1 05/7"), 7)
         self.assertIsNone(parse_camp_level("нет уровня"))
-
-
-class NomadClientRoutingTests(unittest.TestCase):
-    def test_on_screen_attack_routes_nomad_kind(self) -> None:
-        from unittest.mock import Mock
-
-        from e4kbot.client import BlueStacksEngine
-
-        engine = BlueStacksEngine.__new__(BlueStacksEngine)
-        engine.on_screen_nomad_attack = Mock(return_value="nomad")
-        result = BlueStacksEngine.on_screen_attack(engine, "nomad")
-        self.assertEqual(result, "nomad")
-        engine.on_screen_nomad_attack.assert_called_once_with("nomad")

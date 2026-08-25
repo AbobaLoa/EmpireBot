@@ -9,6 +9,8 @@ from typing import Any
 from e4kbot.paths import STATE_PATH
 from e4kbot.safety import MAX_COMMANDER_NUMBER, MAX_CONCURRENT_ATTACKS
 
+NOMAD_HITS_PER_CAMP = 11
+
 
 @dataclass
 class March:
@@ -62,10 +64,18 @@ class LiveState:
     session_attacks: int = 0
     session_gold: int = 0
     session_rubies: int = 0
+    session_by_mode: dict[str, int] = field(default_factory=dict)
+    skipped_modes: list[str] = field(default_factory=list)
+    active_mode: str = ""
+    target_hits: dict[str, int] = field(default_factory=dict)
+    samurai_remaining: dict[str, int] = field(default_factory=dict)
+    nomad_remaining: dict[str, int] = field(default_factory=dict)
+    nomad_farm_coords: list[int] | None = None
+    nomad_farm_point: list[float] | None = None
     nomad_farm: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        from e4kbot.control import CONTROL
+        from e4kbot.control import CONTROL, hotkey_label
 
         now = time.time()
         in_flight = [m for m in self.marches if m.return_at > now]
@@ -84,6 +94,7 @@ class LiveState:
             "paused": paused,
             "enabled": not paused,
             "hotkey": CONTROL.hotkey,
+            "hotkey_label": hotkey_label(CONTROL.hotkey),
             "dry_run": self.dry_run,
             "engine": self.engine,
             "account": self.account,
@@ -106,6 +117,14 @@ class LiveState:
             "session_attacks": int(self.session_attacks),
             "session_gold": int(self.session_gold),
             "session_rubies": int(self.session_rubies),
+            "session_by_mode": dict(self.session_by_mode),
+            "skipped_modes": list(self.skipped_modes),
+            "active_mode": self.active_mode,
+            "target_hits": dict(self.target_hits),
+            "samurai_remaining": dict(self.samurai_remaining),
+            "nomad_remaining": dict(self.nomad_remaining),
+            "nomad_farm_coords": list(self.nomad_farm_coords) if self.nomad_farm_coords else None,
+            "nomad_farm_point": list(self.nomad_farm_point) if self.nomad_farm_point else None,
             "nomad_farm": dict(self.nomad_farm or {}),
             "server_time": int(now),
         }
@@ -130,9 +149,47 @@ class StateStore:
             self.live.last_confirmed_one_way_sec = int(
                 raw.get("last_confirmed_one_way_sec") or 0
             )
+            self.live.last_coords = str(raw.get("last_coords") or "—")
+            self.live.last_screenshot = str(raw.get("last_screenshot") or "")
+            hits = raw.get("target_hits") or {}
+            self.live.target_hits = {
+                str(key): int(value) for key, value in hits.items() if int(value) > 0
+            }
+            remaining = raw.get("samurai_remaining") or {}
+            self.live.samurai_remaining = {
+                str(key): int(value) for key, value in remaining.items()
+            }
+            nomad_remaining = raw.get("nomad_remaining") or {}
+            self.live.nomad_remaining = {
+                str(key): int(value) for key, value in nomad_remaining.items()
+            }
+            farm = raw.get("nomad_farm_coords")
+            if isinstance(farm, (list, tuple)) and len(farm) == 2:
+                self.live.nomad_farm_coords = [int(farm[0]), int(farm[1])]
+            point = raw.get("nomad_farm_point")
+            if isinstance(point, (list, tuple)) and len(point) == 2:
+                self.live.nomad_farm_point = [float(point[0]), float(point[1])]
             nomad_raw = raw.get("nomad_farm")
             if isinstance(nomad_raw, dict):
                 self.live.nomad_farm = nomad_raw
+            self.live.session_attacks = int(raw.get("session_attacks") or 0)
+            self.live.session_gold = int(raw.get("session_gold") or 0)
+            self.live.session_rubies = int(raw.get("session_rubies") or 0)
+            self.live.session_by_mode = {
+                str(key): int(value)
+                for key, value in (raw.get("session_by_mode") or {}).items()
+            }
+            self.live.skipped_modes = [
+                str(value) for value in (raw.get("skipped_modes") or [])
+            ]
+            self.live.active_mode = str(raw.get("active_mode") or "")
+            self.live.history = list(raw.get("history") or [])
+            march_fields = set(March.__dataclass_fields__)
+            self.live.marches = [
+                March(**{key: value for key, value in item.items() if key in march_fields})
+                for item in (raw.get("marches_raw") or [])
+                if isinstance(item, dict)
+            ]
         except Exception:
             self.live.cooldowns = {}
 
@@ -181,6 +238,23 @@ class StateStore:
     ) -> March:
         now = time.time()
         one_way = max(1, int(one_way_sec))
+        if kind == "nomad":
+            snapped = self.canonicalize_nomad_coords((int(x), int(y)))
+            if snapped:
+                x, y = snapped
+        hit_key = f"{kind}:{int(x)}:{int(y)}"
+        hits = int(self.live.target_hits.get(hit_key) or 0) + 1
+        self.live.target_hits[hit_key] = hits
+        if kind in {"samurai", "nomad"}:
+            bucket = self.live.samurai_remaining if kind == "samurai" else self.live.nomad_remaining
+            budget = bucket.get(hit_key)
+            if budget is None:
+                budget = NOMAD_HITS_PER_CAMP if kind == "nomad" else 10
+            left = max(0, int(budget) - 1)
+            bucket[hit_key] = left
+            cooldown_until = now + 24 * 60 * 60 if left <= 0 else 0.0
+        else:
+            cooldown_until = now + one_way + 3 * 60 * 60
         march = March(
             commander_no=int(commander_no),
             lord_id=int(lord_id),
@@ -192,13 +266,15 @@ class StateStore:
             one_way_sec=one_way,
             arrive_at=now + one_way,
             return_at=now + one_way * 2,
-            cooldown_until=now + one_way + 3 * 60 * 60,
+            cooldown_until=cooldown_until,
             screenshot=screenshot,
             movement=movement,
             timer_source="outbound_x2",
         )
         self.live.marches.append(march)
         self.live.session_attacks += 1
+        mode_id = self.live.active_mode or kind
+        self.live.session_by_mode[mode_id] = int(self.live.session_by_mode.get(mode_id) or 0) + 1
         self.live.last_confirmed_one_way_sec = one_way
         target_key = self.target_key(kind, kingdom, x, y)
         self.live.cooldowns[target_key] = march.cooldown_until
@@ -206,9 +282,162 @@ class StateStore:
         self.live.last_coords = f"K{kingdom} ({x}, {y})"
         if screenshot:
             self.live.last_screenshot = screenshot
+        if kind == "nomad":
+            if self.camp_has_nomad_budget((int(x), int(y))):
+                self.live.nomad_farm_coords = [int(x), int(y)]
+            else:
+                farm = self.nomad_farm_xy()
+                if farm and abs(farm[0] - int(x)) <= 4 and abs(farm[1] - int(y)) <= 4:
+                    self.live.nomad_farm_coords = None
+                    self.live.nomad_farm_point = None
         self.prune()
         self.save()
         return march
+
+    def canonicalize_nomad_coords(
+        self, coords: tuple[int, int] | None
+    ) -> tuple[int, int] | None:
+        """Treat ±4 map jitter as the same nomad camp. Prefer the farm, then closest."""
+        if not coords:
+            return None
+        x0, y0 = int(coords[0]), int(coords[1])
+        farm = self.nomad_farm_xy()
+        if farm and abs(farm[0] - x0) <= 4 and abs(farm[1] - y0) <= 4:
+            return farm
+        ranked: list[tuple[int, int, int, int]] = []
+        for key, hits in (self.live.target_hits or {}).items():
+            parsed = self._parse_nomad_key(key)
+            if parsed is None or int(hits) <= 0:
+                continue
+            x, y = parsed
+            if abs(x - x0) <= 4 and abs(y - y0) <= 4:
+                ranked.append((abs(x - x0) + abs(y - y0), -int(hits), x, y))
+        if ranked:
+            ranked.sort()
+            return (ranked[0][2], ranked[0][3])
+        for key in self.live.nomad_remaining or {}:
+            parsed = self._parse_nomad_key(key)
+            if parsed is None:
+                continue
+            x, y = parsed
+            if abs(x - x0) <= 4 and abs(y - y0) <= 4:
+                return (x, y)
+        return (x0, y0)
+
+    @staticmethod
+    def _parse_nomad_key(key: str) -> tuple[int, int] | None:
+        parts = str(key).split(":")
+        if len(parts) != 3 or parts[0] != "nomad":
+            return None
+        try:
+            return (int(parts[1]), int(parts[2]))
+        except ValueError:
+            return None
+
+    def nomad_farm_xy(self) -> tuple[int, int] | None:
+        farm = self.live.nomad_farm_coords
+        if not isinstance(farm, (list, tuple)) or len(farm) != 2:
+            return None
+        return (int(farm[0]), int(farm[1]))
+
+    def nomad_farm_screen(self) -> tuple[float, float] | None:
+        point = self.live.nomad_farm_point
+        if not isinstance(point, (list, tuple)) or len(point) != 2:
+            return None
+        return (float(point[0]), float(point[1]))
+
+    def set_nomad_farm(
+        self,
+        coords: tuple[int, int] | None,
+        point: tuple[float, float] | None = None,
+    ) -> None:
+        if not coords:
+            return
+        snapped = self.canonicalize_nomad_coords(coords) or (int(coords[0]), int(coords[1]))
+        self.live.nomad_farm_coords = [int(snapped[0]), int(snapped[1])]
+        if (
+            point is not None
+            and not (abs(float(point[0]) - 0.50) < 0.02 and abs(float(point[1]) - 0.50) < 0.02)
+        ):
+            self.live.nomad_farm_point = [float(point[0]), float(point[1])]
+        self.save()
+
+    def clear_nomad_farm(self) -> None:
+        self.live.nomad_farm_coords = None
+        self.live.nomad_farm_point = None
+        self.save()
+
+    def target_hits(self, kind: str, coords: tuple[int, int] | None) -> int:
+        if not coords:
+            return 0
+        if kind == "nomad":
+            coords = self.canonicalize_nomad_coords(coords)
+            if not coords:
+                return 0
+        return int(self.live.target_hits.get(f"{kind}:{int(coords[0])}:{int(coords[1])}") or 0)
+
+    def samurai_remaining_for(self, coords: tuple[int, int] | None) -> int | None:
+        if not coords:
+            return None
+        key = f"samurai:{int(coords[0])}:{int(coords[1])}"
+        if key not in self.live.samurai_remaining:
+            return None
+        return int(self.live.samurai_remaining[key])
+
+    def set_samurai_remaining(self, coords: tuple[int, int] | None, remaining: int) -> None:
+        if not coords:
+            return
+        key = f"samurai:{int(coords[0])}:{int(coords[1])}"
+        self.live.samurai_remaining[key] = max(0, int(remaining))
+        self.save()
+
+    def camp_has_samurai_budget(self, coords: tuple[int, int] | None) -> bool:
+        remaining = self.samurai_remaining_for(coords)
+        if remaining is not None:
+            return remaining > 0
+        return self.target_hits("samurai", coords) < 10
+
+    def nomad_remaining_for(self, coords: tuple[int, int] | None) -> int | None:
+        coords = self.canonicalize_nomad_coords(coords)
+        if not coords:
+            return None
+        key = f"nomad:{int(coords[0])}:{int(coords[1])}"
+        if key not in self.live.nomad_remaining:
+            return None
+        return int(self.live.nomad_remaining[key])
+
+    def set_nomad_remaining(self, coords: tuple[int, int] | None, remaining: int) -> None:
+        coords = self.canonicalize_nomad_coords(coords)
+        if not coords:
+            return
+        key = f"nomad:{int(coords[0])}:{int(coords[1])}"
+        self.live.nomad_remaining[key] = max(0, int(remaining))
+        self.save()
+
+    def camp_has_nomad_budget(self, coords: tuple[int, int] | None) -> bool:
+        if self.target_hits("nomad", coords) >= NOMAD_HITS_PER_CAMP:
+            return False
+        remaining = self.nomad_remaining_for(coords)
+        if remaining is not None:
+            return remaining > 0
+        return True
+
+    def apply_nomad_ocr_remaining(self, coords: tuple[int, int] | None, remaining_from_ocr: int) -> int:
+        """Never raise remaining after hits started, never go past 11 - hits."""
+        if not coords:
+            return 0
+        hits = self.target_hits("nomad", coords)
+        cap = max(0, NOMAD_HITS_PER_CAMP - hits)
+        ocr = max(0, min(int(remaining_from_ocr), NOMAD_HITS_PER_CAMP))
+        current = self.nomad_remaining_for(coords)
+        if hits >= NOMAD_HITS_PER_CAMP:
+            chosen = 0
+        elif hits == 0 or current is None:
+            chosen = min(ocr, cap)
+        else:
+            chosen = min(int(current), ocr, cap)
+        self.set_nomad_remaining(coords, chosen)
+        return chosen
 
     @staticmethod
     def target_key(kind: str, kingdom: int, x: int, y: int) -> str:
@@ -231,6 +460,10 @@ class StateStore:
         y: int,
         now: float | None = None,
     ) -> bool:
+        if kind == "samurai":
+            return self.camp_has_samurai_budget((x, y))
+        if kind == "nomad":
+            return self.camp_has_nomad_budget((x, y))
         return self.target_cooldown_until(kind, kingdom, x, y) <= (now or time.time())
 
     def record_loot(self, gold: int = 0, rubies: int = 0) -> None:
@@ -248,6 +481,14 @@ class StateStore:
         self.live.session_attacks = 0
         self.live.session_gold = 0
         self.live.session_rubies = 0
+        self.live.session_by_mode = {}
+        self.live.skipped_modes = []
+        self.live.active_mode = ""
+
+    def skip_mode(self, mode_id: str) -> None:
+        if mode_id not in self.live.skipped_modes:
+            self.live.skipped_modes.append(mode_id)
+            self.save()
 
     def nomad_progress(self) -> Any:
         from e4kbot.nomad_farm import NomadProgress

@@ -14,6 +14,7 @@ from e4kbot.bluestacks import AdbClient, capture_game_image, save_shot
 from e4kbot.control import CONTROL
 from e4kbot.nomad_farm import NomadFarmSettings
 from e4kbot.paths import LAYOUTS_DIR, ROOT
+from e4kbot.runtime.live import emit
 from e4kbot.safety import (
     commander_number_ok,
     concurrent_ok,
@@ -26,31 +27,56 @@ from e4kbot.telegram_bot import TelegramReporter
 from e4kbot.vision import (
     choose_movement,
     crop_rel,
+    _no_commanders_red_closes,
+    find_empty_wave_warning_confirm,
     find_picker_cards,
     find_picker_confirm_button,
     find_picker_max_control,
     find_main_castle_marker,
-    find_nomad_candidates,
+    find_reconnect_button,
+    find_reward_confirm,
     find_robber_candidates,
+    find_samurai_candidates,
+    find_nomad_candidates,
     find_formation_attack_button,
+    find_red_cross_force,
     find_target_attack_button,
+    find_travel_seal_pair,
+    find_plaque_attack_button,
+    find_parchment_title_close,
     flank_fill_allowed,
+    is_connection_error_dialog,
     is_formation_screen,
     is_burning_candidate,
+    is_difficulty_dialog,
+    is_event_reward_popup,
+    is_green_hire_point,
+    is_hire_menu,
+    is_inbox_screen,
+    is_info_plaque,
+    is_loading_screen,
     is_map_screen,
+    is_no_commanders_parchment,
     is_offer_rail_point,
+    is_overview_plaque,
+    is_ruby_shop,
     is_special_offers_screen,
+    is_taxes_dialog,
     is_travel_dialog,
     movement_confirm_diagnostics,
+    no_commanders_diagnostics,
     ocr_text,
-    parse_camp_level,
+    ocr_text_ui,
     parse_count,
     parse_coordinate_pair,
     parse_ratio,
+    parse_samurai_camp_level,
     picker_confirm_diagnostics,
     popup_action,
     project_map_coordinate,
     read_camp_level_at_point,
+    remaining_attacks_from_level,
+    remaining_attacks_from_nomad_level,
     special_offers_close_point,
 )
 
@@ -66,6 +92,12 @@ class HuntTarget:
         if self.coords is not None:
             return ("xy", int(self.coords[0]), int(self.coords[1]))
         return ("sc", round(self.point[0], 2), round(self.point[1], 2))
+
+
+def _dummy_center(point: tuple[float, float] | None) -> bool:
+    if point is None:
+        return True
+    return abs(float(point[0]) - 0.50) < 0.02 and abs(float(point[1]) - 0.50) < 0.02
 
 
 def load_layout(name: str) -> dict[str, Any]:
@@ -132,7 +164,11 @@ class BlueStacksEngine:
         self._blocked_screen_targets: list[tuple[float, float]] = []
         self._last_picker_fill: tuple[int, int] | None = None
         self._hunt_queue: list[HuntTarget] = []
+        self._last_nomad_point: tuple[float, float] | None = None
+        self._last_nomad_level: int | None = None
+        self._nomad_recenter_next = False
         self._picker_stall_count = 0
+        self._no_commanders_seen = False
 
     _PICKER_STALL_REASONS = frozenset(
         {
@@ -141,6 +177,7 @@ class BlueStacksEngine:
             "unit_picker_fill_not_retained",
             "unit_picker_confirm_not_confident",
             "unit_picker_confirm_transition_failed",
+            "formation_units_empty",
         }
     )
 
@@ -161,6 +198,8 @@ class BlueStacksEngine:
         except Exception:
             return True
         if is_formation_screen(shot):
+            return True
+        if is_travel_dialog(shot):
             return True
         if find_picker_cards(shot) or find_picker_confirm_button(shot):
             return True
@@ -212,6 +251,8 @@ class BlueStacksEngine:
             )
             return False
         if not is_special_offers_screen(image):
+            if is_no_commanders_parchment(image) and ny < 0.55:
+                return True
             logger.warning(
                 "Блокирую тап на правом rail ({:.3f}, {:.3f}) — магазин/сундуки/оплату не открываю",
                 nx,
@@ -229,28 +270,237 @@ class BlueStacksEngine:
         return True
 
     def _dismiss_special_offers_if_open(self, image: Any | None = None) -> bool:
-        """If «спецпредложения» is open, close with the red X only — never buy/chest/%."""
+        """If «спецпредложения» is open, close with red X / Escape — never buy/view-offer."""
+        try:
+            shot = image if image is not None else self._image()
+        except Exception:
+            return False
+        if not is_special_offers_screen(shot):
+            return False
+        close_x, close_y = special_offers_close_point(shot)
+        # Title-bar X is ~ (0.93, 0.04); mid-dialog «don't show» X is near y≈0.57.
+        title_bar = close_y <= 0.18 and 0.78 <= close_x <= 0.97
+        mid_dialog = 0.18 < close_y <= 0.68 and close_x < 0.92
+        if (title_bar or mid_dialog) and not is_green_hire_point(close_x, close_y):
+            logger.info(
+                "Закрываю спецпредложения красным крестиком ({:.3f}, {:.3f})",
+                close_x,
+                close_y,
+            )
+            self._tap_forced(close_x, close_y)
+            CONTROL.sleep(0.35)
+        logger.info("Спецпредложение — Escape/Back, не магазин и не «Смотреть предложение»")
+        self.adb.key(4)
+        CONTROL.sleep(0.45)
+        return True
+
+    def _dismiss_connection_error_if_open(self, image: Any | None = None) -> bool:
+        """Tap «СОЕДИНИТЬ ПОВТОРНО» — never SUPPORT."""
+        try:
+            shot = image if image is not None else self._image()
+        except Exception:
+            return False
+        if self._plan_or_picker_open(shot) or is_formation_screen(shot) or is_travel_dialog(shot):
+            return False
+        if not is_connection_error_dialog(shot):
+            return False
+        point = find_reconnect_button(shot)
+        logger.info("Ошибка соединения — жму «Соединить повторно» ({:.3f}, {:.3f})", point[0], point[1])
+        self._tap_forced(*point)
+        CONTROL.sleep(1.0)
+        return True
+
+    def _dismiss_reward_popups(self, image: Any | None = None) -> bool:
+        """Click green claim checks until reward chain is gone. Never shop/hire."""
+        clicked = False
+        for _ in range(8):
+            try:
+                shot = image if image is not None else self._image()
+            except Exception:
+                break
+            image = None
+            explicit_event = is_event_reward_popup(shot)
+            if not explicit_event and (
+                self._plan_or_picker_open(shot)
+                or is_formation_screen(shot)
+                or is_travel_dialog(shot)
+            ):
+                break
+            if not explicit_event and is_special_offers_screen(shot):
+                if self._dismiss_special_offers_if_open(shot):
+                    clicked = True
+                    continue
+                break
+            if is_loading_screen(shot):
+                break
+            point = find_reward_confirm(shot)
+            if point is None:
+                break
+            title = ocr_text_ui(crop_rel(shot, [0.08, 0.14, 0.92, 0.30]), psm=6)
+            normalized_title = re.sub(r"[^a-zа-яё]", "", title.lower())
+            explicit_reward = explicit_event or any(
+                marker in normalized_title
+                for marker in (
+                    "наград",
+                    "reward",
+                    "event",
+                    "квест",
+                    "quest",
+                    "выполнен",
+                    "пайцз",
+                )
+            )
+            if is_green_hire_point(*point) and point[0] > 0.58 and not explicit_reward:
+                logger.warning("Пропускаю зелёную печать найма ({:.3f}, {:.3f})", point[0], point[1])
+                break
+            logger.info("Награда — жму зелёную галочку ({:.3f}, {:.3f})", point[0], point[1])
+            self._tap_forced(*point)
+            clicked = True
+            CONTROL.sleep(0.55)
+        return clicked
+
+    def _dismiss_ruby_shop_if_open(self, image: Any | None = None) -> bool:
+        """Close «Добавить рубины». Never tap a price, cart, or subscribe."""
+        try:
+            shot = image if image is not None else self._image()
+        except Exception:
+            return False
+        if not is_ruby_shop(shot):
+            return False
+        logger.info("Магазин рубинов — жму стрелку назад (0.070, 0.045), ничего не покупаю")
+        self._tap_forced(0.070, 0.045)
+        CONTROL.sleep(0.45)
+        latest = self._image()
+        if is_ruby_shop(latest):
+            logger.info("Магазин рубинов ещё открыт — Back/Escape")
+            self.adb.key(4)
+            CONTROL.sleep(0.45)
+        return True
+
+    def _dismiss_hire_menu_if_open(self, image: Any | None = None) -> bool:
+        """Close parchment «Нанять» with title X. Never ruby hire."""
         try:
             shot = image if image is not None else self._image()
         except Exception:
             return False
         if self._plan_or_picker_open(shot):
             return False
-        if not is_special_offers_screen(shot):
+        if not is_hire_menu(shot):
             return False
-        close_x, close_y = special_offers_close_point(shot)
+        close = find_parchment_title_close(shot) or (0.86, 0.06)
+        if close[1] > 0.14 or close[0] >= 0.92:
+            close = (0.86, 0.06)
+        logger.info("Закрываю меню найма крестиком ({:.3f}, {:.3f})", close[0], close[1])
+        self._tap_forced(*close)
+        CONTROL.sleep(0.4)
+        return True
+
+    def _dismiss_inbox_if_open(self, image: Any | None = None) -> bool:
+        """Close mail / «Удалить все» with Back. Never confirm delete, never shop."""
+        try:
+            shot = image if image is not None else self._image()
+        except Exception:
+            return False
+        if not is_inbox_screen(shot):
+            return False
+        logger.info("Почта открыта — закрываю Back, письма не удаляю")
+        self.adb.key(4)
+        CONTROL.sleep(0.45)
+        latest = self._image()
+        if is_inbox_screen(latest):
+            close = find_parchment_title_close(latest)
+            if close and close[0] < 0.90 and close[1] < 0.12:
+                self._tap_forced(*close)
+            else:
+                self.adb.key(4)
+            CONTROL.sleep(0.45)
+        return True
+
+    def _dismiss_blocking_menu_if_no_camps(self, image: Any | None = None) -> bool:
+        """Close hire/mail overlays when the map has grass but no camps. Never hire, never shop."""
+        try:
+            shot = image if image is not None else self._image()
+        except Exception:
+            return False
+        if self._plan_or_picker_open(shot):
+            return False
+        if is_travel_dialog(shot):
+            return False
+        if self._dismiss_overview_if_open(shot):
+            return True
+        if find_target_attack_button(shot) is not None:
+            return False
+        if find_samurai_candidates(shot) or find_nomad_candidates(shot):
+            return False
+        if self._dismiss_inbox_if_open(shot):
+            return True
+        close = find_parchment_title_close(shot)
+        if close and close[0] < 0.90 and close[1] < 0.12:
+            logger.info(
+                "Меню поверх карты без лагерей — закрываю крестик ({:.3f}, {:.3f})",
+                close[0],
+                close[1],
+            )
+            self._tap_forced(*close)
+            CONTROL.sleep(0.4)
+            return True
+        return False
+
+    def _dismiss_taxes_if_open(self, image: Any | None = None) -> bool:
+        """Close «Налоги» with the parchment X. Never bribe/+20% and never shop."""
+        try:
+            shot = image if image is not None else self._image()
+        except Exception:
+            return False
+        if self._plan_or_picker_open(shot):
+            return False
+        if not is_taxes_dialog(shot):
+            return False
+        close = find_parchment_title_close(shot) or (0.823, 0.038)
+        if close[1] > 0.12 or close[0] >= 0.90:
+            close = (0.823, 0.038)
+        logger.info("Закрываю налоги только крестиком ({:.3f}, {:.3f})", close[0], close[1])
+        self._tap_forced(*close)
+        CONTROL.sleep(0.4)
+        return True
+
+    def _dismiss_overview_if_open(self, image: Any | None = None) -> bool:
+        """Close encyclopedia «Обзор». Never tap «В закладки»."""
+        try:
+            shot = image if image is not None else self._image()
+        except Exception:
+            return False
+        if self._plan_or_picker_open(shot):
+            return False
+        if not is_overview_plaque(shot):
+            return False
+        close = find_parchment_title_close(shot) or (0.823, 0.038)
         logger.info(
-            "Закрываю спецпредложения только красным крестиком ({:.3f}, {:.3f})",
-            close_x,
-            close_y,
+            "Обзор лагеря — закрываю крестик ({:.3f}, {:.3f}), закладки не жму",
+            close[0],
+            close[1],
         )
-        self._tap_norm_exact(close_x, close_y)
-        CONTROL.sleep(0.35)
+        self._tap_forced(*close)
+        CONTROL.sleep(0.45)
         return True
 
     def _dismiss_blocking_overlay(self) -> bool:
         """Close a recognized blocker. Never tap offer-rail shop/chest buttons."""
+        if self._dismiss_connection_error_if_open():
+            return True
+        if self._dismiss_ruby_shop_if_open():
+            return True
         if self._dismiss_special_offers_if_open():
+            return True
+        if self._dismiss_overview_if_open():
+            return True
+        if self._dismiss_reward_popups():
+            return True
+        if self._dismiss_hire_menu_if_open():
+            return True
+        if self._dismiss_inbox_if_open():
+            return True
+        if self._dismiss_taxes_if_open():
             return True
         try:
             image = self._image()
@@ -281,17 +531,97 @@ class BlueStacksEngine:
         self.adb.tap(x, y, source_size=size)
         time.sleep(0.5)
 
+    def _tap_forced(self, nx: float, ny: float) -> None:
+        """Click a known in-plan control (formation X). Skips shop-rail guard."""
+        size = self._size()
+        x, y = _abs_point(size, [nx, ny])
+        self.adb.tap(x, y, source_size=size)
+        time.sleep(0.5)
+
+    def close_formation_plan(self) -> bool:
+        """Leave attack planning via the parchment X — used when a preset must not store units."""
+        image = self._image()
+        if not is_formation_screen(image):
+            return False
+        point = find_red_cross_force(image, title_bar_only=True, allow_right_chrome=True)
+        if point is None:
+            close = (self.layout.get("buttons") or {}).get("formation_close") or [0.94, 0.034]
+            point = (float(close[0]), float(close[1]))
+        logger.warning("Закрываю план атаки крестиком ({:.3f}, {:.3f})", point[0], point[1])
+        self._tap_forced(*point)
+        CONTROL.sleep(0.6)
+        return True
+
     @staticmethod
     def _positive_unit_fill(ratio: tuple[int, int] | None) -> bool:
         return bool(ratio and ratio[0] > 0 and ratio[1] > 0)
 
     def _picker_overlay_open(self, image: Any) -> bool:
-        """True when the unit picker overlay is visible (OCR or vision)."""
-        if self._read_ratio_from_image(image, "picker_units") is not None:
+        """True when the unit picker overlay is visible. Never the empty-wave warning."""
+        if find_picker_cards(image):
             return True
         if find_picker_confirm_button(image) is not None:
             return True
-        return bool(find_picker_cards(image))
+        if find_picker_max_control(image) is not None:
+            return True
+        return False
+
+    def _dismiss_empty_wave_warning(self) -> bool:
+        """Close «не назначив солдат» with its mid-dialog green check."""
+        try:
+            image = self._image()
+        except Exception:
+            return False
+        if is_no_commanders_parchment(image):
+            return False
+        point = find_empty_wave_warning_confirm(image)
+        if point is None:
+            return False
+        logger.warning(
+            "Закрываю предупреждение пустой волны ({:.3f}, {:.3f}) — солдат в волне нет",
+            point[0],
+            point[1],
+        )
+        self._tap_norm_exact(*point)
+        CONTROL.sleep(0.45)
+        return True
+
+    def _dismiss_no_commanders(self, image: Any | None = None) -> bool:
+        """If the hire-reserve parchment is open, read it and close with red X only."""
+        try:
+            shot = image if image is not None else self._image()
+        except Exception:
+            return False
+        diagnostic = no_commanders_diagnostics(shot)
+        if not diagnostic["valid"] or diagnostic["point"] is None:
+            return False
+        save_shot(shot, "no-commanders.png")
+        logger.warning(
+            "Надпись: {} → {}",
+            (diagnostic.get("text") or "").replace("\n", " ")[:180],
+            diagnostic.get("conclusion") or "нет свободных военачальников",
+        )
+        point = diagnostic["point"]
+        if is_green_hire_point(*point):
+            logger.error("Отказ: зелёная печать найма за рубины — не жму")
+            return False
+        if is_offer_rail_point(*point):
+            alt = [
+                (nx, ny)
+                for _score, nx, ny in _no_commanders_red_closes(shot)
+                if not is_offer_rail_point(nx, ny) and not is_green_hire_point(nx, ny)
+            ]
+            if alt:
+                point = alt[0]
+        logger.warning(
+            "Закрываю табличку наместников/военачальников красным крестиком ({:.3f}, {:.3f})",
+            point[0],
+            point[1],
+        )
+        self._tap_norm_exact(*point)
+        CONTROL.sleep(0.5)
+        self._no_commanders_seen = True
+        return True
 
     def _open_unit_picker(self, slot_key: str) -> tuple[Any | None, str]:
         """Tap the flank cell unless the picker is already open."""
@@ -443,18 +773,27 @@ class BlueStacksEngine:
             draw.line((x, y - 35, x, y + 35), fill=color, width=3)
         save_shot(annotated, "movement-confirm-before.png")
         logger.info("Movement confirm diagnostic: {}", diagnostic)
+        if self._dismiss_no_commanders(image):
+            return False, "no_commanders", None
         if not diagnostic["valid"] or point is None:
             return False, "movement_confirm_not_confident", None
         if not click:
             return True, "diagnostic_only", image
         self._tap_norm_exact(*point)
-        after = self._wait_for(is_map_screen, timeout=8)
-        if after is None or is_formation_screen(self._image()):
-            failed = self._image()
+        closed = self._wait_for(
+            lambda img: (not is_travel_dialog(img)) and (not is_formation_screen(img)),
+            timeout=10,
+            label="закрытие похода",
+        )
+        latest = closed if closed is not None else self._image()
+        if self._dismiss_no_commanders(latest):
+            return False, "no_commanders", None
+        if is_travel_dialog(latest) or is_formation_screen(latest):
+            failed = latest
             save_shot(failed, "movement-confirm-transition-failed.png")
             return False, "movement_confirm_transition_failed", None
-        save_shot(after, "movement-confirm-after.png")
-        return True, "confirmed", after
+        save_shot(latest, "movement-confirm-after.png")
+        return True, "confirmed", latest
 
     def _swipe_norm(
         self,
@@ -470,6 +809,38 @@ class BlueStacksEngine:
             source_size=(width, height),
         )
         CONTROL.sleep(0.6)
+
+    def scroll_tool_inventory(self, stride: float = 0.04, upward: bool = False) -> None:
+        """One inventory row, then caller screenshots. Never shop/search."""
+        size = self._size()
+        cx, cy = 0.40, 0.56
+        x, y = _abs_point(size, [cx, cy])
+        logger.info(
+            "Скролл орудий ({:.3f}, {:.3f}) stride={:.3f} {}",
+            cx,
+            cy,
+            float(stride),
+            "вверх" if upward else "вниз",
+        )
+        wheel = 120 if upward else -120
+        self.adb.wheel(x, y, delta=wheel, source_size=size)
+        width, height = size
+        span = max(0.03, min(0.05, float(stride)))
+        start_y = 0.62 if upward else 0.57
+        end_y = (start_y - span) if upward else min(0.70, start_y + span)
+        self.adb.swipe(
+            round(0.40 * width),
+            round(start_y * height),
+            round(0.40 * width),
+            round(end_y * height),
+            duration_ms=450,
+            source_size=size,
+        )
+        CONTROL.sleep(0.55)
+
+    def reset_tool_inventory_scroll(self, stride: float = 0.04) -> None:
+        for _ in range(5):
+            self.scroll_tool_inventory(stride=stride, upward=True)
 
     def _pan_map(self, view_dx: float, view_dy: float) -> None:
         """Move the kingdom-map view. Positive dx looks east; the drag is inverted."""
@@ -537,9 +908,31 @@ class BlueStacksEngine:
 
     def _is_blocked_screen_target(self, point: tuple[float, float]) -> bool:
         for bx, by in self._blocked_screen_targets:
-            if (point[0] - bx) ** 2 + (point[1] - by) ** 2 < 0.012**2:
+            if (point[0] - bx) ** 2 + (point[1] - by) ** 2 < 0.035**2:
                 return True
         return False
+
+    def _unblock_screen_target(self, point: tuple[float, float] | None) -> None:
+        if point is None:
+            return
+        blocked = getattr(self, "_blocked_screen_targets", None)
+        if not blocked:
+            return
+        self._blocked_screen_targets = [
+            (bx, by)
+            for bx, by in blocked
+            if (point[0] - bx) ** 2 + (point[1] - by) ** 2 >= 0.035**2
+        ]
+
+    def _block_screen_target(self, point: tuple[float, float]) -> None:
+        if self._is_blocked_screen_target(point):
+            return
+        self._blocked_screen_targets.append((float(point[0]), float(point[1])))
+        logger.info(
+            "Точка ({:.3f}, {:.3f}) без таблички — больше не жму",
+            point[0],
+            point[1],
+        )
 
     def _jump_to_coords(self, coords: tuple[int, int]) -> None:
         logger.warning(
@@ -570,8 +963,50 @@ class BlueStacksEngine:
             )
         return image
 
+    def wait_out_loading(self, timeout: float = 180.0) -> bool:
+        """True while the game is still connecting — never tap shop/search/rubies."""
+        try:
+            image = self._image()
+        except Exception:
+            return False
+        # Popups over the map are not «loading» — clear them first.
+        if self._dismiss_connection_error_if_open(image):
+            image = self._image()
+        if self._dismiss_special_offers_if_open(image):
+            image = self._image()
+        if self._dismiss_reward_popups(image):
+            image = self._image()
+        if self._dismiss_hire_menu_if_open(image):
+            image = self._image()
+        if not is_loading_screen(image) and not is_connection_error_dialog(image):
+            return False
+        logger.info("Игра грузит игровой сервер — жду карту, не жму магазин и поиск")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            CONTROL.sleep(2.0)
+            try:
+                image = self._image()
+            except Exception:
+                continue
+            if self._dismiss_connection_error_if_open(image):
+                continue
+            if self._dismiss_special_offers_if_open(image):
+                continue
+            if self._dismiss_reward_popups(image):
+                continue
+            if is_map_screen(image) and not is_loading_screen(image):
+                self._dismiss_reward_popups()
+                self._dismiss_special_offers_if_open()
+                logger.info("Карта мира появилась — продолжаю")
+                return False
+        logger.warning("Сервер всё ещё грузится — повторю цикл без кликов")
+        return True
+
     def _hunt_quota(self) -> int:
-        """How many unique robber targets to collect before attacking."""
+        """How many unique targets to collect before attacking."""
+        kind = str((self.config or {}).get("current_target_kind") or "")
+        if kind in {"samurai", "nomad"}:
+            return 4
         cfg = self.config or {}
         for key in ("max_commanders", "commanders", "army_slots", "max_waves"):
             value = cfg.get(key)
@@ -582,14 +1017,99 @@ class BlueStacksEngine:
     def _await_world_map(self, timeout: float = 6.0) -> Any | None:
         """Wait for the kingdom map without ESC/formation_close after a successful plan."""
         image = self._image()
-        if is_map_screen(image):
+        if is_map_screen(image) and (find_samurai_candidates(image) or find_nomad_candidates(image)):
             return image
+        if self._dismiss_inbox_if_open(image):
+            CONTROL.sleep(0.3)
+            image = self._image()
+            if is_map_screen(image) and (find_samurai_candidates(image) or find_nomad_candidates(image)):
+                return image
+        if self._dismiss_blocking_menu_if_no_camps(image):
+            CONTROL.sleep(0.3)
+            image = self._image()
+            if is_map_screen(image) and (find_samurai_candidates(image) or find_nomad_candidates(image)):
+                return image
+        if is_map_screen(image):
+            if self._dismiss_taxes_if_open(image) or self._dismiss_special_offers_if_open(image):
+                CONTROL.sleep(0.35)
+                image = self._image()
+            if is_map_screen(image) and (find_samurai_candidates(image) or find_nomad_candidates(image)):
+                return image
+            if is_map_screen(image) and not is_taxes_dialog(image):
+                return image
         logger.info("Жду карту без закрытия плана крестиком")
-        return self._wait_for(is_map_screen, timeout=timeout)
+        return self._wait_for(
+            lambda img: is_map_screen(img)
+            and not is_taxes_dialog(img)
+            and not is_special_offers_screen(img),
+            timeout=timeout,
+        )
 
-    def _list_eligible_targets(self, image: Any, kind: str) -> list[HuntTarget]:
-        threshold = float((self.config.get("vision") or {}).get("robber_threshold") or 0.65)
-        candidates = find_robber_candidates(image, threshold)
+    def _nomad_farm_settings(self) -> NomadFarmSettings:
+        return NomadFarmSettings.from_config(self.config)
+
+    def _nomad_target_level(self) -> int | None:
+        progress = self.store.nomad_progress()
+        return progress.current_level(self._nomad_farm_settings())
+
+    def prepare_nomad_level_cycle(self) -> int | None:
+        progress = self.store.nomad_progress()
+        settings = self._nomad_farm_settings()
+        if progress.is_complete(settings):
+            logger.info(
+                "Цикл кочевников {}–{} завершён — сброс прогресса уровней",
+                settings.start_level,
+                settings.end_level,
+            )
+            progress.reset()
+            self.store.save_nomad_progress(progress)
+        level = progress.current_level(settings)
+        if level is not None:
+            logger.info("Кочевники: {}", progress.status_line(settings))
+        return level
+
+    def advance_nomad_level_after_camp(self) -> None:
+        level = self._last_nomad_level
+        if level is None:
+            return
+        progress = self.store.nomad_progress()
+        settings = self._nomad_farm_settings()
+        progress.advance_after_camp(settings, int(level))
+        self.store.save_nomad_progress(progress)
+        self._last_nomad_level = None
+        logger.info(
+            "Лагерь {} выбит — следующий уровень: {}",
+            level,
+            progress.current_level(settings),
+        )
+
+    def _nomad_level_matches(self, image: Any, point: tuple[float, float]) -> bool:
+        target_level = self._nomad_target_level()
+        if target_level is None:
+            return False
+        map_level = read_camp_level_at_point(image, point)
+        if map_level is None:
+            return True
+        return int(map_level) == int(target_level)
+
+    def _list_eligible_targets(
+        self,
+        image: Any,
+        kind: str,
+        include_blocked: bool = False,
+    ) -> list[HuntTarget]:
+        if kind == "samurai":
+            threshold = float((self.config.get("vision") or {}).get("samurai_threshold") or 0.65)
+            candidates = find_samurai_candidates(image, threshold)
+            skip_burning = True
+        elif kind == "nomad":
+            threshold = float((self.config.get("vision") or {}).get("nomad_threshold") or 0.65)
+            candidates = find_nomad_candidates(image, threshold)
+            skip_burning = True
+        else:
+            threshold = float((self.config.get("vision") or {}).get("robber_threshold") or 0.65)
+            candidates = find_robber_candidates(image, threshold)
+            skip_burning = False
         if not candidates:
             return []
         main, viewport = self._read_map_coords(image)
@@ -600,11 +1120,13 @@ class BlueStacksEngine:
             eligible: list[tuple[float, float, float]] = []
             for candidate in candidates:
                 point = (candidate[0], candidate[1])
-                if is_burning_candidate(image, point):
+                if not skip_burning and is_burning_candidate(image, point):
                     continue
                 if is_offer_rail_point(point[0], point[1]):
                     continue
-                if self._is_blocked_screen_target(point):
+                if not include_blocked and self._is_blocked_screen_target(point):
+                    continue
+                if kind == "nomad" and not self._nomad_level_matches(image, point):
                     continue
                 eligible.append(candidate)
             if not eligible:
@@ -625,13 +1147,15 @@ class BlueStacksEngine:
         blocked = 0
         for candidate in candidates:
             point = (candidate[0], candidate[1])
-            if is_burning_candidate(image, point):
+            if not skip_burning and is_burning_candidate(image, point):
                 burning += 1
                 continue
             if is_offer_rail_point(point[0], point[1]):
                 continue
-            if self._is_blocked_screen_target(point):
+            if not include_blocked and self._is_blocked_screen_target(point):
                 blocked += 1
+                continue
+            if kind == "nomad" and not self._nomad_level_matches(image, point):
                 continue
             coords = project_map_coordinate(
                 point,
@@ -640,6 +1164,10 @@ class BlueStacksEngine:
                 (float(scale_raw[0]), float(scale_raw[1])),
             )
             stable = (round(coords[0]), round(coords[1]))
+            if kind == "nomad":
+                snapped = self.store.canonicalize_nomad_coords(stable)
+                if snapped:
+                    stable = snapped
             if not self.store.target_available(kind, kingdom, stable[0], stable[1]):
                 cooling += 1
                 continue
@@ -673,7 +1201,7 @@ class BlueStacksEngine:
         """Scan around the MAIN castle until N unique robbers are stored, then stop."""
         quota = self._hunt_quota()
         logger.info(
-            "Охота: сначала набираю до {} целей разбойников (лимит военачальников), потом атаки",
+            "Охота: сначала набираю до {} целей, потом атаки",
             quota,
         )
         self.store.live.mode = "search"
@@ -682,10 +1210,26 @@ class BlueStacksEngine:
         seen: set[tuple[Any, ...]] = set()
 
         def ingest(image: Any) -> bool:
-            if not is_map_screen(image):
+            if (
+                not is_map_screen(image)
+                or is_ruby_shop(image)
+                or is_special_offers_screen(image)
+                or is_overview_plaque(image)
+            ):
                 logger.info("Скан карты остановлен — экран больше не карта")
                 return True
             for target in self._list_eligible_targets(image, kind):
+                if kind == "nomad" and target.coords:
+                    snapped = self.store.canonicalize_nomad_coords(target.coords)
+                    if snapped:
+                        target = HuntTarget(target.point, snapped)
+                    if any(
+                        existing.coords
+                        and abs(existing.coords[0] - target.coords[0]) <= 4
+                        and abs(existing.coords[1] - target.coords[1]) <= 4
+                        for existing in found
+                    ):
+                        continue
                 ident = target.identity()
                 if ident in seen:
                     continue
@@ -697,14 +1241,42 @@ class BlueStacksEngine:
                     len(found),
                     quota,
                 )
+                if kind == "nomad" and len(found) == 1:
+                    self._last_nomad_point = target.point
+                    self._nomad_recenter_next = False
+                    if target.coords:
+                        self._selected_target_coords = target.coords
                 if len(found) >= quota:
                     return True
             return False
 
-        image = self._recenter_on_main_castle(self._image())
+        image = self._image()
+        if self._dismiss_blocking_overlay() or self._dismiss_reward_popups(image):
+            CONTROL.sleep(0.45)
+            image = self._image()
+        image = self._recenter_on_main_castle(image)
+        if not is_map_screen(image) and self._dismiss_blocking_overlay():
+            CONTROL.sleep(0.4)
+            image = self._recenter_on_main_castle(self._image())
         if ingest(image):
             logger.info("Пачка охоты готова: {} целей, полный скан больше не нужен", len(found))
             return found
+        if found:
+            logger.info(
+                "На экране у замка уже {} целей — бью их до скана остальной карты",
+                len(found),
+            )
+            return found
+        for attempt in range(2):
+            logger.info("У замка лагерей не видно — закрываю окна и центрирую ещё раз ({}/2)", attempt + 1)
+            self._dismiss_blocking_overlay()
+            CONTROL.sleep(0.4)
+            image = self._recenter_on_main_castle(self._image())
+            if ingest(image):
+                return found
+            if found:
+                logger.info("После повторного центра нашёл {} лагерей — карту не листаю", len(found))
+                return found
         for dx, dy in self._map_scan_offsets():
             logger.info("Скан карты: сдвиг ({:+.2f}, {:+.2f})", dx, dy)
             self._pan_map(dx, dy)
@@ -724,20 +1296,86 @@ class BlueStacksEngine:
         kind: str,
         target: HuntTarget,
     ) -> tuple[float, float] | None:
-        for item in self._list_eligible_targets(image, kind):
+        last = getattr(self, "_last_nomad_point", None)
+        items = self._list_eligible_targets(
+            image,
+            kind,
+            include_blocked=(kind == "nomad" and target.coords is not None),
+        )
+        if kind == "nomad" and target.coords is not None:
+            for item in items:
+                if is_burning_candidate(image, item.point):
+                    continue
+                if item.coords and (
+                    abs(item.coords[0] - target.coords[0]) <= 4
+                    and abs(item.coords[1] - target.coords[1]) <= 4
+                ):
+                    logger.info(
+                        "Тот же лагерь {} на экране ({:.3f}, {:.3f}) — очередь {}",
+                        item.coords,
+                        item.point[0],
+                        item.point[1],
+                        target.coords,
+                    )
+                    return item.point
+            # Coords missing on screen: only the last click of THIS camp, never a yurt near map center.
+            expected = last if last and not _dummy_center(last) else (
+                None if _dummy_center(target.point) else target.point
+            )
+            if expected is None:
+                return None
+            nearest: tuple[float, HuntTarget] | None = None
+            for item in items:
+                if is_burning_candidate(image, item.point):
+                    continue
+                dist2 = (item.point[0] - expected[0]) ** 2 + (item.point[1] - expected[1]) ** 2
+                if dist2 < 0.04**2 and (nearest is None or dist2 < nearest[0]):
+                    nearest = (dist2, item)
+            if nearest is not None:
+                logger.info(
+                    "Тот же лагерь {} по точке очереди ({:.3f}, {:.3f})",
+                    target.coords,
+                    nearest[1].point[0],
+                    nearest[1].point[1],
+                )
+                return nearest[1].point
+            return None
+        expected = target.point
+        screen_tol = 0.04
+        for item in items:
             if is_burning_candidate(image, item.point):
                 continue
             if target.coords and item.coords:
                 if (
-                    abs(item.coords[0] - target.coords[0]) <= 2
-                    and abs(item.coords[1] - target.coords[1]) <= 2
+                    abs(item.coords[0] - target.coords[0]) <= 4
+                    and abs(item.coords[1] - target.coords[1]) <= 4
                 ):
                     return item.point
-            dist2 = (item.point[0] - target.point[0]) ** 2 + (
-                item.point[1] - target.point[1]
+            dist2 = (item.point[0] - expected[0]) ** 2 + (
+                item.point[1] - expected[1]
             ) ** 2
-            if dist2 < 0.04**2:
+            if dist2 < screen_tol**2:
                 return item.point
+        if kind == "samurai":
+            nearest = None
+            for item in items:
+                if is_burning_candidate(image, item.point):
+                    continue
+                dist2 = (item.point[0] - target.point[0]) ** 2 + (
+                    item.point[1] - target.point[1]
+                ) ** 2
+                if nearest is None or dist2 < nearest[0]:
+                    nearest = (dist2, item)
+            if nearest is not None:
+                logger.info(
+                    "Лагерь на экране ({:.3f}, {:.3f}), dist={:.3f}",
+                    nearest[1].point[0],
+                    nearest[1].point[1],
+                    nearest[0] ** 0.5,
+                )
+                if nearest[1].coords:
+                    self._selected_target_coords = nearest[1].coords
+                return nearest[1].point
         return None
 
     def _focus_hunt_target(self, kind: str, target: HuntTarget) -> tuple[float, float] | None:
@@ -747,10 +1385,92 @@ class BlueStacksEngine:
             return None
         if self._dismiss_special_offers_if_open(image):
             image = self._await_world_map(timeout=4) or self._image()
+        self._selected_target_coords = target.coords
+        if kind == "nomad":
+            self._unblock_screen_target(target.point)
+            self._unblock_screen_target(getattr(self, "_last_nomad_point", None))
+            if target.point and not _dummy_center(target.point) and getattr(self, "_last_nomad_point", None) is None:
+                self._last_nomad_point = target.point
         visible = self._match_visible_target(image, kind, target)
         if visible:
-            self._selected_target_coords = target.coords
+            if not self._selected_target_coords:
+                self._selected_target_coords = target.coords
+            if kind == "nomad":
+                self._last_nomad_point = visible
+                logger.info(
+                    "Очередь лагеря {} — жму совпавшую юрту ({:.3f}, {:.3f})",
+                    target.coords,
+                    visible[0],
+                    visible[1],
+                )
             return visible
+        if kind == "nomad" and target.coords is not None:
+            queued = getattr(self, "_last_nomad_point", None)
+            if queued is None or _dummy_center(queued):
+                queued = None if _dummy_center(target.point) else target.point
+            if not getattr(self, "_nomad_recenter_next", False) and queued:
+                logger.info(
+                    "Жму очередь того же лагеря {} ({:.3f}, {:.3f}), чужой не беру",
+                    target.coords,
+                    queued[0],
+                    queued[1],
+                )
+                self._last_nomad_point = queued
+                return queued
+            logger.info("Лагерь {} не совпал на экране — центрирую замок, чужой не беру", target.coords)
+            self._nomad_recenter_next = False
+            image = self._recenter_on_main_castle(image)
+            visible = self._match_visible_target(image, kind, target)
+            if visible:
+                self._last_nomad_point = visible
+                logger.info(
+                    "После центра очередь {} — жму ту же юрту ({:.3f}, {:.3f})",
+                    target.coords,
+                    visible[0],
+                    visible[1],
+                )
+                return visible
+            if queued:
+                logger.info(
+                    "После центра жму очередь того же лагеря {} ({:.3f}, {:.3f}), чужой не беру",
+                    target.coords,
+                    queued[0],
+                    queued[1],
+                )
+                self._last_nomad_point = queued
+                return queued
+            logger.info("Лагерь {} не на экране — очередь не сбрасываю", target.coords)
+            return None
+        if kind == "samurai":
+            finder = find_samurai_candidates
+
+            def visible_camps(shot: Any) -> list[tuple[float, float, float]]:
+                return [
+                    camp
+                    for camp in finder(shot)
+                    if not self._is_blocked_screen_target((float(camp[0]), float(camp[1])))
+                ]
+
+            camps = visible_camps(image)
+            if not camps:
+                logger.info("Видимых лагерей нет — центрирую замок и смотрю ещё раз")
+                image = self._recenter_on_main_castle(image)
+                camps = visible_camps(image)
+            if camps:
+                point = (float(camps[0][0]), float(camps[0][1]))
+                logger.info(
+                    "Беру видимый лагерь без сверки координат ({:.3f}, {:.3f})",
+                    point[0],
+                    point[1],
+                )
+                return point
+            logger.info("Видимых лагерей нет — не панорамирую и не открываю поиск")
+        else:
+            recentered = self._recenter_on_main_castle(image)
+            visible = self._match_visible_target(recentered, kind, target)
+            if visible:
+                self._selected_target_coords = target.coords
+                return visible
         logger.info(
             "Цель {} не на экране — поиск/магазин не жму, пропускаю",
             target.coords or target.point,
@@ -784,189 +1504,6 @@ class BlueStacksEngine:
             CONTROL.sleep(0.15)
         logger.info("Скан карты: вокруг главного замка свободных разбойников нет")
         return None
-
-    def _nomad_settings(self) -> NomadFarmSettings:
-        return NomadFarmSettings.from_config(self.config)
-
-    def _nomad_threshold(self) -> float:
-        vision = self.config.get("vision") or {}
-        return float(vision.get("nomad_threshold") or vision.get("robber_threshold") or 0.65)
-
-    def _nomad_candidates(self, image: Any) -> list[tuple[float, float, float]]:
-        return find_nomad_candidates(image, self._nomad_threshold())
-
-    def _read_target_popup_level(self, image: Any) -> int | None:
-        region = self.layout.get("regions", {}).get("target_level")
-        if region:
-            return parse_camp_level(ocr_text(crop_rel(image, region), psm=7))
-        preview = self.layout.get("regions", {}).get("castle_preview")
-        if preview:
-            return parse_camp_level(ocr_text(crop_rel(image, preview), psm=6))
-        return None
-
-    def _nomad_level_on_map(self, image: Any, point: tuple[float, float]) -> int | None:
-        return read_camp_level_at_point(image, point)
-
-    def _list_nomad_targets_for_level(
-        self,
-        image: Any,
-        kind: str,
-        target_level: int,
-    ) -> list[HuntTarget]:
-        candidates = self._nomad_candidates(image)
-        if not candidates:
-            return []
-        main, viewport = self._read_map_coords(image)
-        vision = self.config.get("vision") or {}
-        anchor_raw = vision.get("map_anchor") or [0.50, 0.54]
-        scale_raw = vision.get("map_coordinate_scale") or [0.044, 0.044]
-        kingdom = int((self.config.get("baron_attacks") or {}).get("kingdom", 0))
-        found: list[HuntTarget] = []
-        for candidate in candidates:
-            point = (candidate[0], candidate[1])
-            if is_burning_candidate(image, point):
-                continue
-            if is_offer_rail_point(point[0], point[1]):
-                continue
-            if self._is_blocked_screen_target(point):
-                continue
-            level = self._nomad_level_on_map(image, point)
-            if level != int(target_level):
-                continue
-            coords: tuple[int, int] | None = None
-            if (
-                main is not None
-                and viewport is not None
-                and self._coords_plausible(main, viewport)
-            ):
-                projected = project_map_coordinate(
-                    point,
-                    viewport,
-                    (float(anchor_raw[0]), float(anchor_raw[1])),
-                    (float(scale_raw[0]), float(scale_raw[1])),
-                )
-                coords = (round(projected[0]), round(projected[1]))
-                if not self.store.target_available(kind, kingdom, coords[0], coords[1]):
-                    continue
-            found.append(HuntTarget(point, coords))
-        main_marker = find_main_castle_marker(image)
-        if main_marker:
-            found.sort(
-                key=lambda item: (item.point[0] - main_marker[0]) ** 2
-                + (item.point[1] - main_marker[1]) ** 2
-            )
-        elif main is not None:
-            found.sort(
-                key=lambda item: (
-                    (item.coords[0] - main[0]) ** 2 + (item.coords[1] - main[1]) ** 2
-                    if item.coords is not None
-                    else 10**9
-                )
-            )
-        return found
-
-    def _find_nomad_camp_point(self, kind: str, target_level: int) -> tuple[float, float] | None:
-        logger.info(
-            "Ищу лагерь кочевников уровня {} ({}–{})",
-            target_level,
-            self._nomad_settings().start_level,
-            self._nomad_settings().end_level,
-        )
-        self.store.live.mode = "search"
-        self.store.save()
-        image = self._recenter_on_main_castle(self._image())
-        if not is_map_screen(image):
-            return None
-        targets = self._list_nomad_targets_for_level(image, kind, target_level)
-        if targets:
-            chosen = targets[0]
-            if chosen.coords is not None:
-                self._selected_target_coords = chosen.coords
-            return chosen.point
-        for dx, dy in self._map_scan_offsets():
-            logger.info("Скан кочевников ур.{}: сдвиг ({:+.2f}, {:+.2f})", target_level, dx, dy)
-            self._pan_map(dx, dy)
-            CONTROL.sleep(0.25)
-            image = self._image()
-            if not is_map_screen(image):
-                return None
-            targets = self._list_nomad_targets_for_level(image, kind, target_level)
-            if targets:
-                chosen = targets[0]
-                if chosen.coords is not None:
-                    self._selected_target_coords = chosen.coords
-                return chosen.point
-            self._pan_map(-dx, -dy)
-            CONTROL.sleep(0.15)
-        logger.info("На карте нет лагеря кочевников уровня {}", target_level)
-        return None
-
-    def _open_nomad_formation(self, point: tuple[float, float], kind: str, target_level: int) -> bool:
-        if not self._open_formation(point, kind):
-            return False
-        popup = self._image()
-        popup_level = self._read_target_popup_level(popup)
-        if popup_level is not None and popup_level != int(target_level):
-            logger.warning(
-                "Открыт лагерь уровня {}, нужен {} — закрываю и пропускаю",
-                popup_level,
-                target_level,
-            )
-            self.tap_rel("map")
-            return False
-        return True
-
-    def on_screen_nomad_attack(self, kind: str) -> str:
-        settings = self._nomad_settings()
-        progress = self.store.nomad_progress()
-        if progress.is_complete(settings):
-            logger.info(
-                "Цикл кочевников {}–{} завершён ({} лагерей × до {} атак) — сброс",
-                settings.start_level,
-                settings.end_level,
-                settings.camp_count,
-                settings.max_attacks_per_camp,
-            )
-            progress.reset()
-            self.store.save_nomad_progress(progress)
-        target_level = progress.current_level(settings)
-        if target_level is None:
-            return "no_targets"
-        logger.info("Кочевники: {}", progress.status_line(settings))
-        current = self._image()
-        if self._plan_or_picker_open(current):
-            return self._execute_formation_attack(kind, (0.50, 0.50))
-        self._dismiss_special_offers_if_open(current)
-        point = self._find_nomad_camp_point(kind, target_level)
-        if point is None:
-            return "no_targets"
-        opened = False
-        attempts = min(
-            int((self.config.get("vision") or {}).get("popup_retries") or 4) + 1,
-            3,
-        )
-        for _ in range(max(1, attempts)):
-            if self._open_nomad_formation(point, kind, target_level):
-                opened = True
-                break
-            self._blocked_screen_targets.append(point)
-            blocked = self._image()
-            if self._plan_or_picker_open(blocked):
-                opened = True
-                break
-            if self._dismiss_special_offers_if_open(blocked):
-                time.sleep(0.8)
-                point = self._find_nomad_camp_point(kind, target_level) or point
-                continue
-            action = popup_action(blocked)
-            if action:
-                self._tap_norm(*action)
-            time.sleep(0.8)
-            point = self._find_nomad_camp_point(kind, target_level) or point
-        if not opened:
-            logger.warning("Не открылся лагерь кочевников уровня {}", target_level)
-            return "no_targets"
-        return self._execute_formation_attack(kind, point)
 
     def dismiss_popups(self) -> None:
         if self._dismiss_blocking_overlay():
@@ -1117,35 +1654,223 @@ class BlueStacksEngine:
             logger.info("Планирование уже открыто — не закрываю и не жму карту")
             return True
         self._tap_norm(*point)
-        popup = self._wait_for(lambda image: find_target_attack_button(image) is not None, timeout=5)
-        if popup is None:
-            blocked = self._image()
-            if self._plan_or_picker_open(blocked):
+        if kind in {"samurai", "nomad"}:
+            plaque_ready = lambda image: (
+                is_info_plaque(image)
+                or find_plaque_attack_button(image) is not None
+                or find_target_attack_button(image) is not None
+                or is_overview_plaque(image)
+                or is_travel_dialog(image)
+                or is_difficulty_dialog(image)
+                or is_formation_screen(image)
+            )
+            popup = self._wait_for(plaque_ready, timeout=3, label="табличка лагеря")
+            if popup is None:
+                lower = (float(point[0]), min(0.80, float(point[1]) + 0.04))
+                logger.info("Табличка не вышла — жму чуть ниже лагеря ({:.3f}, {:.3f})", lower[0], lower[1])
+                self._tap_norm(*lower)
+                popup = self._wait_for(plaque_ready, timeout=5, label="табличка после повторного клика")
+            if popup is not None and self._plan_or_picker_open(popup):
                 return True
-            action = popup_action(blocked)
-            if action:
-                logger.info("Цель перекрыта окном; закрываю его перед повтором")
-                self._tap_norm(*action)
-            return False
+            if popup is not None and is_overview_plaque(popup):
+                logger.info("Открылся обзор лагеря, не Нападение — закрываю")
+                self._dismiss_overview_if_open(popup)
+                return False
+            if popup is None or (
+                not is_info_plaque(popup)
+                and find_plaque_attack_button(popup) is None
+                and find_target_attack_button(popup) is None
+                and not is_difficulty_dialog(popup)
+                and not is_formation_screen(popup)
+                and not is_overview_plaque(popup)
+                and not is_travel_dialog(popup)
+                and find_travel_seal_pair(popup) is None
+            ):
+                blocked = self._image()
+                if (
+                    self._plan_or_picker_open(blocked)
+                    or is_travel_dialog(blocked)
+                    or find_travel_seal_pair(blocked) is not None
+                ):
+                    logger.info("После клика открыт поход/план — лагерь не блокирую")
+                    return True
+                if kind != "nomad":
+                    self._block_screen_target(point)
+                action = popup_action(blocked)
+                if action:
+                    logger.info("Цель перекрыта окном; закрываю его перед повтором")
+                    self._tap_norm(*action)
+                return False
+        else:
+            popup = self._wait_for(lambda image: find_target_attack_button(image) is not None, timeout=5)
+            if popup is None:
+                blocked = self._image()
+                if self._plan_or_picker_open(blocked):
+                    return True
+                action = popup_action(blocked)
+                if action:
+                    logger.info("Цель перекрыта окном; закрываю его перед повтором")
+                    self._tap_norm(*action)
+                return False
         x_region = self.layout.get("regions", {}).get("viewport_x")
         y_region = self.layout.get("regions", {}).get("viewport_y")
         target_x = parse_count(ocr_text(crop_rel(popup, x_region), psm=6)) if x_region else None
         target_y = parse_count(ocr_text(crop_rel(popup, y_region), psm=6)) if y_region else None
         if target_x is None or target_y is None:
-            return False
-        self._selected_target_coords = (target_x, target_y)
-        kingdom = int((self.config.get("baron_attacks") or {}).get("kingdom", 0))
-        if not self.store.target_available(kind, kingdom, target_x, target_y):
-            logger.info(f"Цель {target_x}:{target_y} ещё на локальной перезарядке")
-            self.tap_rel("map")
-            return False
-        attack_point = find_target_attack_button(popup)
+            logger.warning(
+                "Координаты цели с таблички не прочитались — оставляю координаты охоты {}",
+                self._selected_target_coords,
+            )
+        else:
+            if kind == "nomad" and self._selected_target_coords:
+                logger.info(
+                    "Табличка дала ({}, {}) — оставляю очередь лагеря {}",
+                    target_x,
+                    target_y,
+                    self._selected_target_coords,
+                )
+            elif (
+                kind in {"samurai", "nomad"}
+                and self._selected_target_coords
+                and abs(target_x - self._selected_target_coords[0])
+                + abs(target_y - self._selected_target_coords[1])
+                > 8
+            ):
+                logger.warning(
+                    "Табличка дала ({}, {}) — оставляю охоту {}",
+                    target_x,
+                    target_y,
+                    self._selected_target_coords,
+                )
+            else:
+                self._selected_target_coords = (target_x, target_y)
+            kingdom = int((self.config.get("baron_attacks") or {}).get("kingdom", 0))
+            plaque = self._selected_target_coords or (target_x, target_y)
+            if not self.store.target_available(kind, kingdom, plaque[0], plaque[1]):
+                logger.info(f"Цель {plaque[0]}:{plaque[1]} ещё на локальной перезарядке")
+                self.tap_rel("map")
+                return False
+        if kind in {"samurai", "nomad"}:
+            title = ocr_text_ui(crop_rel(popup, [0.18, 0.14, 0.82, 0.32]), psm=6)
+            body = ocr_text_ui(crop_rel(popup, [0.18, 0.20, 0.82, 0.55]), psm=6)
+            blob = f"{title} {body}"
+            level = parse_samurai_camp_level(blob)
+            logger.info("OCR уровня лагеря: {} / {}", level, blob[:80])
+            try:
+                coords = self._selected_target_coords or (0, 0)
+                save_shot(popup, f"{kind}_level_{coords[0]}_{coords[1]}.png")
+            except Exception:
+                pass
+            if level is not None and self._selected_target_coords:
+                if kind == "nomad":
+                    self._last_nomad_level = int(level)
+                    target_level = self._nomad_target_level()
+                    if target_level is not None and int(level) != int(target_level):
+                        logger.warning(
+                            "Лагерь уровня {}, нужен {} — закрываю и ищу другой",
+                            level,
+                            target_level,
+                        )
+                        self.tap_rel("map")
+                        return False
+                    remaining = remaining_attacks_from_nomad_level(level)
+                    remaining = self.store.apply_nomad_ocr_remaining(
+                        self._selected_target_coords, remaining
+                    )
+                else:
+                    remaining = remaining_attacks_from_level(level)
+                    self.store.set_samurai_remaining(self._selected_target_coords, remaining)
+                if remaining is not None and remaining <= 0:
+                    logger.info("Лагерь {} без атак — закрываю табличку", self._selected_target_coords)
+                    self.tap_rel("map")
+                    return False
+        attack_point = None
+        if kind in {"samurai", "nomad"}:
+            if is_info_plaque(popup):
+                attack_point = find_plaque_attack_button(popup)
+                if attack_point is None:
+                    attack_point = (0.50, 0.60)
+                    logger.info("На пергаменте нет золотой кнопки — жму Нападение по центру таблички")
+                else:
+                    logger.info("Нападение на табличке ({:.3f}, {:.3f})", attack_point[0], attack_point[1])
+            else:
+                attack_point = find_target_attack_button(popup, near=point)
+                if attack_point is None:
+                    logger.info("Нет таблички и нет радиала Напасть рядом с лагерем — лагерь не выкидываю")
+                    if kind != "nomad":
+                        self._block_screen_target(point)
+                    return False
+                logger.info(
+                    "Радиал Напасть ({:.3f}, {:.3f}) — не Обзор и не шпионаж",
+                    attack_point[0],
+                    attack_point[1],
+                )
+        else:
+            attack_point = find_target_attack_button(popup)
         if attack_point is None:
             return False
         self._tap_norm(*attack_point)
-        time.sleep(1.0)
+        time.sleep(0.8)
+        if kind in {"samurai", "nomad"}:
+            opened = self._wait_for(
+                lambda img: is_difficulty_dialog(img)
+                or is_formation_screen(img)
+                or is_no_commanders_parchment(img)
+                or is_travel_dialog(img),
+                timeout=10,
+                label="сложность или план лагеря",
+            )
+            shot = opened if opened is not None else self._image()
+            if self._dismiss_no_commanders(shot):
+                return False
+            if is_difficulty_dialog(shot):
+                logger.info("Окно «выберите сложность» — не жду план, отдам модулю")
+                return True
+            if is_formation_screen(shot) or is_travel_dialog(shot):
+                return True
+            fresh = self._image()
+            retry = (
+                find_plaque_attack_button(fresh)
+                if is_info_plaque(fresh)
+                else find_target_attack_button(fresh, near=point)
+            )
+            if retry is not None:
+                logger.info("План не открылся — ещё раз жму Нападение ({:.3f}, {:.3f})", retry[0], retry[1])
+                self._tap_norm(*retry)
+                opened = self._wait_for(
+                    lambda img: is_difficulty_dialog(img)
+                    or is_formation_screen(img)
+                    or is_no_commanders_parchment(img)
+                    or is_travel_dialog(img),
+                    timeout=10,
+                    label="повтор таблички лагеря",
+                )
+                shot = opened if opened is not None else self._image()
+                if self._dismiss_no_commanders(shot):
+                    return False
+                if is_difficulty_dialog(shot) or is_formation_screen(shot) or is_travel_dialog(shot):
+                    return True
+            if is_travel_dialog(self._image()):
+                logger.info("После Напасть открыт диалог похода — план отдаю модулю")
+                return True
+            logger.warning(
+                "Табличка лагеря есть, план не открылся — слепую точку start_attack_confirm не жму"
+            )
+            return False
         self.tap_rel("start_attack_confirm")
-        return self._wait_for(is_formation_screen, timeout=10) is not None
+        opened = self._wait_for(
+            lambda img: is_formation_screen(img)
+            or is_no_commanders_parchment(img)
+            or (kind in {"samurai", "nomad"} and is_difficulty_dialog(img)),
+            timeout=10,
+            label="формирование",
+        )
+        shot = opened if opened is not None else self._image()
+        if self._dismiss_no_commanders(shot):
+            return False
+        if kind in {"samurai", "nomad"} and is_difficulty_dialog(shot):
+            return True
+        return opened is not None and is_formation_screen(self._image())
 
     def _read_ratio(self, key: str) -> tuple[int, int] | None:
         return parse_ratio(self.read_region(key))
@@ -1212,11 +1937,11 @@ class BlueStacksEngine:
             cap = self._last_picker_fill[1]
         if cap <= 0:
             cap = 10
-        cur = ratio[0] if ratio and ratio[0] > 0 else cap
+        cur = ratio[0] if ratio and ratio[0] > 0 else 0
         if before and before[0] > cur:
             cur = before[0]
-        if cur < cap:
-            cur = cap
+        if self._last_picker_fill and self._last_picker_fill[0] > cur:
+            cur = self._last_picker_fill[0]
         return cur, cap
 
     def _vision_fill_picker_fallback(self) -> bool:
@@ -1234,6 +1959,9 @@ class BlueStacksEngine:
                 self._tap_norm_exact(float(layout[0]), float(layout[1]))
         CONTROL.sleep(0.5)
         cur, cap = self._assume_picker_capacity(self._image(), self._last_picker_fill)
+        if cur <= 0:
+            logger.warning("Пикер: fallback MAX не дал заполнения")
+            return False
         self._last_picker_fill = (cur, cap)
         logger.info("Пикер: overlay виден — считаю {}/{} и иду к галочке", cur, cap)
         return True
@@ -1271,19 +1999,20 @@ class BlueStacksEngine:
                         or ratio[0] > before[0]
                         or ratio[1] != before[1]
                     )
-                    if progressed or find_picker_confirm_button(shot) is not None:
+                    if progressed:
                         self._last_picker_fill = ratio
                         logger.info("Пикер после MAX: {}/{}", ratio[0], ratio[1])
                         return True
             if self._picker_confirm_point(shot) is not None:
                 cur, cap = self._assume_picker_capacity(shot, before)
-                self._last_picker_fill = (cur, cap)
-                logger.info(
-                    "Пикер: галочка видна после MAX — считаю {}/{}",
-                    cur,
-                    cap,
-                )
-                return True
+                if cur > 0:
+                    self._last_picker_fill = (cur, cap)
+                    logger.info(
+                        "Пикер: галочка видна после MAX — считаю {}/{}",
+                        cur,
+                        cap,
+                    )
+                    return True
             if time.time() >= next_heartbeat:
                 logger.info("Пикер: жду MAX… ({:.0f}s)", time.time() - started)
                 next_heartbeat = time.time() + 2.0
@@ -1293,14 +2022,18 @@ class BlueStacksEngine:
         return bool(latest and latest[0] >= latest[1] > 0)
 
     def _fill_picker_to_capacity(self) -> bool:
-        """Cell already open: MAX, then wait until current==capacity (Юниты 10/10)."""
+        """Select a unit row if empty, then MAX until current==capacity."""
+        if not self._positive_unit_fill(self._last_picker_fill):
+            self._select_best_picker_card()
         max_attempts = int((self.config.get("vision") or {}).get("picker_max_attempts") or 3)
         wait_seconds = self._vision_seconds("picker_fill_timeout_seconds", 10)
         for attempt in range(max(1, max_attempts)):
             if self._dump_picker_max():
                 return True
+            if not self._positive_unit_fill(self._last_picker_fill):
+                self._select_best_picker_card()
             if attempt + 1 < max_attempts:
-                logger.info("MAX без 10/10 — повтор {}/{}", attempt + 2, max_attempts)
+                logger.info("MAX без заполнения — повтор {}/{}", attempt + 2, max_attempts)
                 CONTROL.sleep(0.35)
         if self._vision_fill_picker_fallback():
             return True
@@ -1317,13 +2050,11 @@ class BlueStacksEngine:
                 self._last_picker_fill = ratio
                 logger.info("Пикер заполнен {}/{}", ratio[0], ratio[1])
                 return True
-            if self._picker_confirm_point(shot) is not None:
-                cur, cap = self._assume_picker_capacity(shot, self._last_picker_fill)
-                self._last_picker_fill = (cur, cap)
-                logger.info("Пикер: жду 10/10, но галочка видна — {}/{}", cur, cap)
-                return True
             if self._positive_unit_fill(ratio):
                 self._last_picker_fill = ratio
+                if self._picker_confirm_point(shot) is not None:
+                    logger.info("Пикер: есть солдаты {}/{} и галочка", ratio[0], ratio[1])
+                    return True
             if time.time() >= next_heartbeat:
                 logger.info("Пикер: жду 10/10… ({:.0f}s)", time.time() - started)
                 next_heartbeat = time.time() + 2.0
@@ -1338,6 +2069,7 @@ class BlueStacksEngine:
         # Do not skip confirm because leftover OCR still looks like 10/10.
         last_reason = ""
         for sequence_attempt in range(2):
+            self._dismiss_empty_wave_warning()
             if sequence_attempt:
                 logger.warning("Пикер: повтор полной последовательности 2/2")
                 slot = self.layout.get("buttons", {}).get("unit_slot")
@@ -1380,18 +2112,22 @@ class BlueStacksEngine:
             units = self._read_ratio_from_image(formation, "formation_units")
             if units and units[0] == units[1] and units[1] > 0:
                 break
-            if (
-                self._last_picker_fill
-                and self._last_picker_fill[0] >= self._last_picker_fill[1] > 0
-            ):
+            if units is None and self._positive_unit_fill(self._last_picker_fill):
                 break
         observed = self._last_picker_fill
         final_units = self._read_ratio_from_image(formation, "formation_units")
-        if self._positive_unit_fill(observed) and (
-            not final_units or final_units[0] <= 0
-        ):
+        if final_units is not None and final_units[0] <= 0:
+            save_shot(formation, "formation-units-empty.png")
+            logger.warning(
+                "Формирование {}/{} после пикера {} — Нападение не жму",
+                final_units[0],
+                final_units[1],
+                observed,
+            )
+            return False, "formation_units_empty"
+        if self._positive_unit_fill(observed) and not final_units:
             logger.info(
-                "Пикер закрылся после заполнения {}/{}; продолжаю к Нападению",
+                "OCR формирования пуст после {}/{}; беру заполнение пикера",
                 observed[0],
                 observed[1],
             )
@@ -1467,12 +2203,14 @@ class BlueStacksEngine:
         return "search_disabled"
 
     def on_screen_attack(self, kind: str) -> str:
-        if kind == "nomad":
-            return self.on_screen_nomad_attack(kind)
         if getattr(self, "_hunt_queue", None) is None:
             self._hunt_queue = []
         if getattr(self, "_blocked_screen_targets", None) is None:
             self._blocked_screen_targets = []
+        current = self._image()
+        if self._dismiss_no_commanders(current):
+            return "no_commanders"
+        self._dismiss_empty_wave_warning()
         current = self._image()
         if self._plan_or_picker_open(current):
             logger.info(
@@ -1515,6 +2253,8 @@ class BlueStacksEngine:
                 if self._open_formation(point, kind):
                     opened = True
                     break
+                if self._no_commanders_seen:
+                    return "no_commanders"
                 self._blocked_screen_targets.append(point)
                 blocked = self._image()
                 if self._plan_or_picker_open(blocked):
@@ -1547,6 +2287,7 @@ class BlueStacksEngine:
         self.tap_rel("formation_attack")
 
     def _execute_formation_attack(self, kind: str, point: tuple[float, float]) -> str:
+        self._dismiss_empty_wave_warning()
         self._last_picker_fill = None
         ok, reason = self._prepare_single_center_wave()
         if not ok:
@@ -1583,11 +2324,18 @@ class BlueStacksEngine:
         self._picker_stall_count = 0
         self._tap_formation_attack()
         travel = self._wait_for(
-            is_travel_dialog,
+            lambda img: is_travel_dialog(img) or is_no_commanders_parchment(img),
             timeout=self._vision_seconds("travel_dialog_timeout_seconds", 15),
             label="диалог похода",
         )
+        if travel is not None and self._dismiss_no_commanders(travel):
+            return "no_commanders"
         if travel is None:
+            if self._dismiss_empty_wave_warning():
+                logger.warning("Нападение отклонено: волна пустая")
+                return "unsafe_formation"
+            if self._dismiss_no_commanders():
+                return "no_commanders"
             logger.warning("Нет диалога похода — план не закрываю крестиком")
             return "travel_dialog_not_found"
         movement, feathers = self._movement_option(travel)
@@ -1668,6 +2416,8 @@ class BlueStacksEngine:
             return kind
         wait_for_send_slot(self.store, self.config)
         confirmed, reason, _ = self.diagnose_movement_confirm(click=True)
+        if reason == "no_commanders":
+            return "no_commanders"
         if not confirmed:
             self.store.live.last_error = reason
             self.store.save()
@@ -1697,32 +2447,30 @@ class BlueStacksEngine:
             dry_run=False,
         )
         mark_successful_send(self.store, self.config)
-        if kind == "nomad":
-            settings = self._nomad_settings()
-            progress = self.store.nomad_progress()
-            target_level = progress.current_level(settings)
-            if target_level is not None:
-                finished_camp = progress.record_success(settings, target_level)
-                self.store.save_nomad_progress(progress)
-                if finished_camp:
-                    logger.info(
-                        "Лагерь {}: {} атак — переход к следующему уровню",
-                        target_level,
-                        settings.max_attacks_per_camp,
-                    )
-                elif progress.is_complete(settings):
-                    logger.info(
-                        "Фарм кочевников {}–{} завершён",
-                        settings.start_level,
-                        settings.end_level,
-                    )
-                else:
-                    logger.info("Кочевники: {}", progress.status_line(settings))
         self.store.save()
+        emit(
+            "attack.sent",
+            mode=self.store.live.active_mode or kind,
+            kind=kind,
+            kingdom=kid,
+            x=x,
+            y=y,
+            one_way=one_way,
+            movement=movement,
+            commander=commander_no,
+            screenshot=str(shot_path) if shot_path else "",
+        )
         return kind
 
     def run_cycle(self) -> str:
         kind = str(self.config.get("current_target_kind") or "baron")
+        emit(
+            "attack.cycle.start",
+            mode=self.store.live.active_mode or kind,
+            kind=kind,
+            style=str(self.config.get("attack_style") or "on_screen"),
+            dry_run=bool(self.config.get("dry_run", True)),
+        )
         style = str(self.config.get("attack_style") or "on_screen")
         if style == "search_coords":
             targets = load_targets()
@@ -1741,10 +2489,19 @@ class BlueStacksEngine:
             return f"client:{sent}"
 
         if not concurrent_ok(len(self.store.in_flight()), self.config)[0]:
+            emit("attack.cycle.end", result="wait_return", kind=kind)
             return "wait_return"
         result = self.on_screen_attack(kind)
         if result == "stop":
+            emit("attack.cycle.end", result="stop", kind=kind, error=self.store.live.stopped_reason)
             return "stop"
         if result != kind:
+            emit(
+                "attack.cycle.end",
+                result=result,
+                kind=kind,
+                error=self.store.live.last_error,
+            )
             return result
+        emit("attack.cycle.end", result="client:1", kind=kind)
         return f"client:1"

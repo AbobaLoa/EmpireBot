@@ -5,6 +5,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from e4kbot.modes.catalog import default_campaign_queue
 from e4kbot.paths import CONFIG_PATH, DEFAULT_LEGACY_BOT
 
 E4K_SERVERS: dict[str, tuple[str, str]] = {
@@ -48,6 +49,11 @@ DEFAULTS: dict[str, Any] = {
         "nomads": True,
         "shogun": True,
         "prefer_events": True,
+    },
+    "campaign": {
+        "enabled": True,
+        "fill_without_waiting_returns": True,
+        "queue": default_campaign_queue(),
     },
     "baron_attacks": {
         "kingdom": 0,
@@ -98,9 +104,11 @@ DEFAULTS: dict[str, Any] = {
         "minimum_flank_fill": 0.70,
         "map_scan_span": [0.30, 0.24],
         "map_scan_rings": 2,
+        "samurai_threshold": 0.65,
+        "nomad_threshold": 0.65,
     },
     "control": {
-        "hotkey": "N",
+        "hotkey": "NUM0",
         "always_on_top": True,
         "start_paused": True,
     },
@@ -113,6 +121,8 @@ DEFAULTS: dict[str, Any] = {
         "miniapp_host": "127.0.0.1",
         "miniapp_port": 8766,
         "public_webapp_url": "",
+        "thread_samurai": None,
+        "thread_nomad": None,
     },
     "accounts": [],
 }

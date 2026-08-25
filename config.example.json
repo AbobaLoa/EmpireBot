@@ -58,17 +58,37 @@
     "picker_max_actions": 4,
     "minimum_flank_fill": 0.7
   },
-  "control": {
-    "hotkey": "N",
-    "always_on_top": true,
-    "start_paused": true
-  },
+    "control": {
+        "hotkey": "NUM0",
+        "always_on_top": true,
+        "start_paused": true
+    },
+    "campaign": {
+        "enabled": true,
+        "fill_without_waiting_returns": true,
+        "queue": [
+            {"mode": "robber_barons", "count": 20, "enabled": true},
+            {"mode": "storm_forts", "count": 10, "enabled": false},
+            {"mode": "barbarian_towers", "count": 10, "enabled": false},
+            {"mode": "barbarian_fortresses", "count": 5, "enabled": false},
+            {"mode": "desert_towers", "count": 10, "enabled": false},
+            {"mode": "desert_fortresses", "count": 5, "enabled": false},
+            {"mode": "cultist_towers", "count": 15, "enabled": false},
+            {"mode": "dragons", "count": 5, "enabled": false},
+            {"mode": "nomad_camps", "count": 44, "enabled": false},
+            {"mode": "samurai_camps", "count": 44, "enabled": false},
+            {"mode": "bloodcrows", "count": 6, "enabled": false},
+            {"mode": "alien_castles", "count": 6, "enabled": false}
+        ]
+    },
     "telegram": {
         "enabled": true,
         "bot_token": "PUT_E4KMOBILE_BOT_TOKEN_HERE",
         "chat_id": "-100...",
         "message_thread_id": 5,
         "thread_baron": 5,
+        "thread_samurai": 0,
+        "thread_nomad": 0,
         "miniapp_host": "127.0.0.1",
         "miniapp_port": 8766,
         "public_webapp_url": ""

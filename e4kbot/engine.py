@@ -5,10 +5,13 @@ from typing import Any
 
 from loguru import logger
 
+from e4kbot.attacks.registry import get_attack_module
 from e4kbot.bluestacks import AdbClient, diagnose_targeting, probe_bluestacks
 from e4kbot.client import BlueStacksEngine
-from e4kbot.control import CONTROL, BotPaused
+from e4kbot.control import CONTROL, BotPaused, hotkey_label
 from e4kbot.protocol import ProtocolEngine
+from e4kbot.runtime.live import emit, emit_state
+from e4kbot.runtime.scheduler import pick_next_step, snapshot
 from e4kbot.safety import wait_active_hours
 from e4kbot.state import StateStore
 from e4kbot.telegram_bot import TelegramReporter
@@ -27,6 +30,14 @@ FAST_RETRY_RESULTS = {
     "travel_dialog_not_found",
     "march_time_not_read",
     "feather_count_not_read",
+    "campaign_complete",
+    "map_loading",
+    "retry_samurai_tools",
+    "retry_nomad_tools",
+    "autoselect_failed",
+    "samurai_complete",
+    "nomad_complete",
+    "waiting_camp_template",
 }
 
 
@@ -46,7 +57,8 @@ class AttackBot:
         CONTROL.on_change(self._on_control_change)
 
     def start(self) -> None:
-        self.store.reset_session_stats()
+        if not bool(self.config.get("resume_session_stats")):
+            self.store.reset_session_stats()
         self.store.live.running = True
         self.store.live.dry_run = bool(self.config.get("dry_run", True))
         self.store.live.engine = str(self.config.get("engine") or "bluestacks")
@@ -59,7 +71,7 @@ class AttackBot:
         except Exception:
             logger.exception("ADB не подключился на старте — продолжаю, жду ВКЛ")
         diagnose_targeting(self.config, self.adb)
-        logger.info("Бот готов. ВКЛ / клавиша {} запускает атаки", CONTROL.hotkey)
+        logger.info("Бот готов. ВКЛ / клавиша {} запускает атаки", hotkey_label(CONTROL.hotkey))
         try:
             self._loop()
         except BotPaused:
@@ -89,7 +101,7 @@ class AttackBot:
                     self.store.live.mode = "paused"
                     self.store.live.paused = True
                     self.store.save()
-                    logger.info("На паузе — жми {} или кнопку ВКЛ", CONTROL.hotkey)
+                    logger.info("На паузе — жми {} или кнопку ВКЛ", hotkey_label(CONTROL.hotkey))
                     CONTROL.wait_until_enabled()
                     if self.stop or CONTROL.stop:
                         break
@@ -147,12 +159,7 @@ class AttackBot:
                 self.store.live.mode = "attack"
                 self.store.live.paused = False
                 self.store.save()
-                if self.protocol:
-                    result = self.protocol.run_cycle()
-                elif self.client:
-                    result = self.client.run_cycle()
-                else:
-                    result = "idle"
+                result = self._run_scheduled_cycle()
             except BotPaused:
                 self.store.live.mode = "paused"
                 self.store.live.paused = True
@@ -199,6 +206,9 @@ class AttackBot:
             if result == "no_commanders":
                 self.handle_no_commanders_result()
                 continue
+            if str(result).startswith("stub:"):
+                emit("cycle.stub_skip", result=result)
+                continue
             if str(result) in FAST_RETRY_RESULTS or str(result).startswith("movement_"):
                 try:
                     CONTROL.sleep(0.4)
@@ -210,6 +220,67 @@ class AttackBot:
         self.store.live.mode = "stopped"
         self.store.save()
 
+    def _run_scheduled_cycle(self) -> str:
+        campaign = self.config.get("campaign") or {}
+        if campaign.get("enabled", True):
+            step = pick_next_step(self.config, self.store)
+            emit(
+                "cycle.next",
+                campaign=snapshot(self.config, self.store),
+                in_flight=len(self.store.in_flight()),
+            )
+            if step is None:
+                emit("campaign.complete", level="INFO")
+                logger.info("Кампания по квотам закрыта — жду возвраты/новые квоты")
+                emit_state(self.store.live.to_dict())
+                return "campaign_complete"
+            self.store.live.active_mode = step.mode_id
+            self.config["current_target_kind"] = step.spec.target_kind
+            emit(
+                "mode.select",
+                mode=step.mode_id,
+                official_name=step.spec.official_name,
+                remaining=step.remaining,
+                status=step.spec.status,
+            )
+            if step.spec.status == "stub":
+                emit(
+                    "mode.stub",
+                    level="WARNING",
+                    mode=step.mode_id,
+                    official_name=step.spec.official_name,
+                    reason="not_implemented",
+                )
+                logger.warning(
+                    "Режим «{}» ({}) — заглушка, реализация позже",
+                    step.spec.title_ru,
+                    step.spec.official_name,
+                )
+                self.store.skip_mode(step.mode_id)
+                emit_state(self.store.live.to_dict())
+                return f"stub:{step.mode_id}"
+        if self.protocol:
+            result = self.protocol.run_cycle()
+        elif self.client:
+            if self.client.wait_out_loading():
+                result = "map_loading"
+            else:
+                mode_id = self.store.live.active_mode
+                if not mode_id:
+                    kind = str(self.config.get("current_target_kind") or "baron")
+                    mode_id = {
+                        "samurai": "samurai_camps",
+                        "nomad": "nomad_camps",
+                        "baron": "robber_barons",
+                    }.get(kind, kind)
+                result = get_attack_module(mode_id).run_cycle(self.client)
+        else:
+            emit("cycle.idle", level="WARNING")
+            result = "idle"
+        emit("cycle.result", result=result, mode=self.store.live.active_mode)
+        emit_state(self.store.live.to_dict())
+        return result
+
     def _announce(self) -> None:
         engine_name = self.store.live.engine
         self.telegram.report_status(
@@ -218,7 +289,8 @@ class AttackBot:
             f"Режим: {engine_name} / {self.config.get('attack_style') or 'on_screen'}\n"
             f"DRY-RUN: {self.store.live.dry_run}\n"
             "Каденс: 8–10 сек от прошлой успешной отправки. "
-            "Бароны до таблички «нет военачальников», потом красный крестик и ожидание возврата"
+            "Бароны до таблички «нет свободных военачальников/наместников», "
+            "потом красный крестик (не нанимать за рубины) и ожидание возврата"
         )
 
     def _ensure_engines(self) -> bool:
@@ -264,7 +336,7 @@ class AttackBot:
 
     def report_no_commanders_summary(self) -> None:
         self._send_session_summary(
-            "Нет свободных военачальников — закрыл красным крестиком, жду возврат"
+            "Нет свободных военачальников/наместников — закрыл красным крестиком, жду возврат"
         )
 
     def handle_no_commanders_result(self) -> None:
@@ -283,9 +355,13 @@ class AttackBot:
                 wait_until - time.time(),
             )
             return
-        logger.info("Нет военачальников и никто не в пути — пауза до ВКЛ")
-        self._armed_for_report = False
-        CONTROL.disable()
+        fallback = time.time() + 12 * 60
+        self.store.live.next_attack_at = fallback
+        self.store.live.mode = "wait_commanders"
+        self.store.save()
+        logger.info(
+            "Нет свободных наместников, локального таймера нет — жду 12 мин и продолжу"
+        )
 
     def _send_session_summary(self, reason: str) -> None:
         summary = self.store.session_summary()
