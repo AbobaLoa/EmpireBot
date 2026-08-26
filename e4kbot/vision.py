@@ -25,6 +25,12 @@ TARGET_ATTACK_TEMPLATE = ROOT / "assets" / "target_attack.png"
 PICKER_CONFIRM_TEMPLATE = ROOT / "assets" / "picker_confirm.png"
 NO_COMMANDERS_TEMPLATE = ROOT / "assets" / "no_commanders.png"
 TOOL_BONUS_TEMPLATE = ROOT / "assets" / "tool_bonus_plus.png"
+CASTLE_HOME_SEXTANT_TEMPLATE = ROOT / "assets" / "castle_home_sextant.png"
+NAV_STAR_TEMPLATE = ROOT / "assets" / "nav_star_icon.png"
+NAV_CHOOSE_PLACE_TEMPLATE = ROOT / "assets" / "nav_choose_place_icon.png"
+WORLD_NAV_SEXTANT_TEMPLATE = ROOT / "assets" / "world_nav_sextant.png"
+WORLD_LIST_TEMPLATE = ROOT / "assets" / "world_list.png"
+QUIT_GAME_DIALOG_TEMPLATE = ROOT / "assets" / "quit_game_dialog.png"
 PRESET_BUTTON_TEMPLATE = ROOT / "assets" / "preset_button.png"
 APPLY_PRESET_ALL_TEMPLATE = ROOT / "assets" / "apply_preset_all.png"
 PRESETS_DIALOG_TEMPLATE = ROOT / "assets" / "presets_dialog.png"
@@ -131,6 +137,11 @@ def is_offer_rail_point(nx: float, ny: float | None = None) -> bool:
     return True
 
 
+def is_ruby_plus_hud_point(nx: float, ny: float) -> bool:
+    """Top-right gold/ruby/+ buy-rubies HUD. Never click this on the map."""
+    return float(nx) >= 0.78 and float(ny) <= 0.11
+
+
 def _normalize_ui_text(text: str) -> str:
     return text.lower().replace("ё", "е").replace("-", "").replace(" ", "")
 
@@ -140,6 +151,8 @@ def is_special_offers_screen(
     recognized_text: str | None = None,
 ) -> bool:
     """True only when the «спецпредложения» title is present — never formation/map chrome."""
+    if recognized_text is None and is_map_screen(image):
+        return False
     if recognized_text is None:
         top = ocr_text_ui(crop_rel(image, [0.05, 0.0, 0.95, 0.28]), psm=6)
         mid = ocr_text_ui(crop_rel(image, [0.12, 0.28, 0.88, 0.62]), psm=6)
@@ -155,7 +168,11 @@ def is_special_offers_screen(
 
 
 def _looks_like_special_offers_overlay(image: Image.Image) -> bool:
-    """Legacy layout hint; must not be used alone — formation has the same title-bar X."""
+    """Shop overlay, not a grassy map, quit dialog, or ruby HUD."""
+    if is_map_screen(image):
+        return False
+    if _quit_dialog_box(image) is not None:
+        return False
     bgr = _reference_bgr(image)
     hsv = cv2.cvtColor(bgr[180:1180, 70:800], cv2.COLOR_BGR2HSV)
     green = cv2.inRange(hsv, (30, 45, 35), (95, 255, 255))
@@ -218,6 +235,8 @@ def find_parchment_title_close(image: Image.Image) -> tuple[float, float] | None
         nx = (centers[index][0] + x1) / REFERENCE_SIZE[0]
         ny = (centers[index][1] + y1) / REFERENCE_SIZE[1]
         if nx >= 0.88 or nx < 0.78 or ny > 0.09:
+            continue
+        if is_ruby_plus_hud_point(nx, ny):
             continue
         if best is None or area > best[0]:
             best = (int(area), nx, ny)
@@ -382,6 +401,295 @@ def _validated_navigation_panel(
     )
 
 
+def find_navigation_button(image: Image.Image) -> tuple[float, float] | None:
+    """Bottom-left gold 8-point star «Навигация». Never ruby/+, never «В замок»."""
+    matched = find_template_center(
+        image,
+        NAV_STAR_TEMPLATE,
+        threshold=0.40,
+        x_min=0.08,
+        x_max=0.24,
+        y_min=0.88,
+        y_max=0.99,
+        scales=(0.55, 0.7, 0.85, 1.0, 1.2, 1.45, 1.8, 2.2),
+    )
+    if (
+        matched is not None
+        and 0.08 <= matched[0] <= 0.24
+        and matched[1] >= 0.88
+        and not is_ruby_plus_hud_point(*matched)
+    ):
+        return matched
+    rgb = np.asarray(image.convert("RGB"))
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    height, width = hsv.shape[:2]
+    y0, x0, x1 = int(0.88 * height), int(0.08 * width), int(0.26 * width)
+    roi = hsv[y0:height, x0:x1]
+    gold = cv2.inRange(roi, (12, 80, 90), (40, 255, 255))
+    count, _, stats, centers = cv2.connectedComponentsWithStats(gold)
+    best: tuple[int, float, float] | None = None
+    for index in range(1, count):
+        bw = int(stats[index][2])
+        bh = int(stats[index][3])
+        area = int(stats[index][4])
+        if area < 400 or area > 5000:
+            continue
+        ratio = bw / max(1, bh)
+        if not (0.7 <= ratio <= 1.5):
+            continue
+        nx = (float(centers[index][0]) + x0) / width
+        ny = (float(centers[index][1]) + y0) / height
+        if nx < 0.08 or nx > 0.24 or ny < 0.90 or ny > 0.98 or is_ruby_plus_hud_point(nx, ny):
+            continue
+        if best is None or area > best[0]:
+            best = (area, nx, ny)
+    if best is None:
+        return None
+    return (best[1], best[2])
+
+
+def find_world_list_sextants(image: Image.Image) -> list[tuple[float, float]]:
+    """LEFT green-circle wooden sextants on beige parchment. Never map grass or the right castle."""
+    rgb = np.asarray(image.convert("RGB"))
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    height, width = hsv.shape[:2]
+    x1 = int(0.28 * width)
+    y0, y1 = int(0.06 * height), int(0.82 * height)
+    roi = hsv[y0:y1, 0:x1]
+    green = cv2.inRange(roi, (35, 60, 50), (95, 255, 220))
+    beige = cv2.inRange(roi, (8, 8, 120), (40, 120, 255))
+    count, _, stats, centers = cv2.connectedComponentsWithStats(green)
+    raw: list[tuple[int, float, float]] = []
+    for index in range(1, count):
+        bx, by, bw, bh, area = (int(v) for v in stats[index])
+        if area < 90 or area > 2200:
+            continue
+        ratio = bw / max(1, bh)
+        if not (0.55 <= ratio <= 1.7):
+            continue
+        pad = 10
+        patch = beige[
+            max(0, by - pad) : min(beige.shape[0], by + bh + pad),
+            max(0, bx - pad) : min(beige.shape[1], bx + bw + pad),
+        ]
+        if patch.size == 0 or float(np.count_nonzero(patch)) / patch.size < 0.18:
+            continue
+        nx = float(centers[index][0]) / width
+        ny = (float(centers[index][1]) + y0) / height
+        if nx >= 0.26 or ny < 0.07 or ny > 0.78:
+            continue
+        raw.append((area, nx, ny))
+    raw.sort(key=lambda item: item[2])
+    clustered: list[tuple[float, float]] = []
+    for _area, nx, ny in raw:
+        if clustered and abs(ny - clustered[-1][1]) < 0.04:
+            prev = clustered[-1]
+            clustered[-1] = ((prev[0] + nx) / 2, (prev[1] + ny) / 2)
+            continue
+        clustered.append((nx, ny))
+    if len(clustered) >= 3:
+        xs = [p[0] for p in clustered]
+        if max(xs) - min(xs) > 0.08:
+            median_x = sorted(xs)[len(xs) // 2]
+            clustered = [p for p in clustered if abs(p[0] - median_x) <= 0.05]
+    return clustered
+
+
+def _navigation_ocr_blob(image: Image.Image) -> str:
+    return _ocr_compact(ocr_text_ui(crop_rel(image, [0.04, 0.08, 0.72, 0.72]), psm=6))
+
+
+def _navigation_ocr_confirms_list(blob: str) -> bool:
+    if not blob:
+        return False
+    coord_hits = len(re.findall(r"x\d{2,4}y\d{2,4}", blob))
+    markers = (
+        "великаяимпер",
+        "vimnep",
+        "vmnep",
+        "ледник",
+        "beynoxonog",
+        "beyhoxonog",
+        "пылающ",
+        "песк",
+        "necku",
+        "вершин",
+        "orhehh",
+        "benukan",
+        "vmnep",
+        "testboot",
+    )
+    name_hits = sum(1 for token in markers if token in blob)
+    return coord_hits >= 1 or name_hits >= 1
+
+
+def is_choose_place_screen(image: Image.Image) -> bool:
+    """Owned-places parchment titled «Выбери место» — not the three-button popup and not the map."""
+    title = _ocr_compact(ocr_text_ui(crop_rel(image, [0.10, 0.00, 0.90, 0.16]), psm=6))
+    return any(
+        token in title
+        for token in ("выберимест", "vyberimest", "selectplace", "bbi6epu", "pi6epu")
+    )
+
+
+def is_world_list_open(image: Image.Image) -> bool:
+    """True only for the Навигация parchment, never the grassy kingdom map."""
+    if is_choose_place_screen(image):
+        return True
+    sextants = find_world_list_sextants(image)
+    if len(sextants) >= 4:
+        xs = [p[0] for p in sextants]
+        if max(xs) - min(xs) <= 0.08:
+            return True
+    blob = _navigation_ocr_blob(image)
+    if len(sextants) >= 1 and _navigation_ocr_confirms_list(blob):
+        return True
+    return False
+
+
+def is_place_list_exhausted(image: Image.Image) -> bool:
+    """True when parchment below the last owned-place row is empty beige."""
+    if not is_world_list_open(image) and not is_choose_place_screen(image):
+        return False
+    points = find_world_list_sextants(image)
+    if not points:
+        return False
+    last_y = max(p[1] for p in points)
+    if last_y >= 0.52:
+        return False
+    rgb = np.asarray(image.convert("RGB"))
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    height, width = hsv.shape[:2]
+    y0 = int(min(0.70, last_y + 0.10) * height)
+    y1 = int(0.72 * height)
+    x0, x1 = int(0.16 * width), int(0.84 * width)
+    if y1 - y0 < 24:
+        return True
+    roi = hsv[y0:y1, x0:x1]
+    beige = cv2.inRange(roi, (8, 5, 130), (45, 90, 255))
+    return float(np.count_nonzero(beige)) / max(1, beige.size) >= 0.70
+
+
+_SELECT_PLACE_TOKENS = (
+    "выберимест",
+    "vyberimest",
+    "selectplace",
+        "bbi6epu",
+        "bbiepu",
+        "pi6epu",
+        "mecto",
+)
+# Live geometry on 900x1600: Карта y≈0.638, Выбери место y≈0.738, В замок y≈0.844.
+SELECT_PLACE_FALLBACK = (0.184, 0.738)
+KARTA_Y_MAX = 0.68
+TO_CASTLE_Y_MIN = 0.81
+
+
+def is_select_place_point(nx: float, ny: float) -> bool:
+    """True only for the middle submenu row. Never Карта, В замок, or ruby/+."""
+    if is_ruby_plus_hud_point(nx, ny) or nx >= 0.40:
+        return False
+    return KARTA_Y_MAX <= ny <= TO_CASTLE_Y_MIN
+
+
+def find_select_place_button(image: Image.Image) -> tuple[float, float] | None:
+    """Middle Навигация item «Выбери место». Never «Карта» (top) or «В замок» (bottom)."""
+    matched = find_template_center(
+        image,
+        NAV_CHOOSE_PLACE_TEMPLATE,
+        threshold=0.52,
+        x_min=0.0,
+        x_max=0.36,
+        y_min=0.66,
+        y_max=0.81,
+        scales=(0.7, 0.9, 1.1, 1.4, 1.8, 2.2, 2.6, 3.2),
+    )
+    if matched is not None and is_select_place_point(*matched):
+        return matched
+    blob = _ocr_compact(ocr_text_ui(crop_rel(image, [0.00, 0.52, 0.42, 0.92]), psm=6))
+    place_ocr = any(token in blob for token in _SELECT_PLACE_TOKENS)
+    karta = "kapta" in blob or "karta" in blob or "карта" in blob
+    to_castle = "взамок" in blob or "vzamok" in blob
+    if place_ocr or (karta and to_castle):
+        return SELECT_PLACE_FALLBACK
+    return None
+
+
+def is_navigation_submenu(image: Image.Image) -> bool:
+    """The three-item popup after tapping Навигация (Карта / Выбери место / В замок)."""
+    if find_select_place_button(image) is not None:
+        return True
+    blob = _ocr_compact(ocr_text_ui(crop_rel(image, [0.00, 0.52, 0.42, 0.92]), psm=6))
+    place = any(token in blob for token in _SELECT_PLACE_TOKENS)
+    karta = "kapta" in blob or "karta" in blob or "карта" in blob
+    to_castle = "взамок" in blob or "vzamok" in blob
+    return place and (karta or to_castle)
+
+
+def parse_navigation_rows(image: Image.Image) -> list[dict[str, Any]]:
+    """Each owned-place row: LEFT sextant click point + OCR world/castle/coords."""
+    from e4kbot.worlds import match_world_id
+
+    points = find_world_list_sextants(image)
+    rows: list[dict[str, Any]] = []
+    if not points:
+        blob = ocr_text_ui(crop_rel(image, [0.06, 0.08, 0.92, 0.82]), psm=6)
+        return [
+            {
+                "world_id": match_world_id(blob),
+                "sextant": None,
+                "blob": blob,
+                "coords": parse_coordinate_pair(blob),
+            }
+        ]
+    height_span = 0.12
+    if len(points) >= 2:
+        height_span = max(0.10, min(0.16, abs(points[1][1] - points[0][1]) / 2 + 0.04))
+    for nx, ny in points:
+        region = [
+            0.12,
+            max(0.10, ny - height_span),
+            0.92,
+            min(0.78, ny + height_span),
+        ]
+        blob = ocr_text_ui(crop_rel(image, region), psm=6)
+        if not _ocr_compact(blob):
+            blob = ocr_text_ui(
+                crop_rel(image, [0.06, max(0.08, ny - 0.18), 0.94, min(0.80, ny + 0.12)]),
+                psm=6,
+            )
+        rows.append(
+            {
+                "world_id": match_world_id(blob),
+                "sextant": (float(nx), float(ny)),
+                "blob": blob,
+                "coords": parse_coordinate_pair(blob),
+            }
+        )
+    if not any(row.get("world_id") for row in rows):
+        full = ocr_text_ui(crop_rel(image, [0.06, 0.10, 0.94, 0.72]), psm=6)
+        world_id = match_world_id(full)
+        if world_id and rows:
+            rows[0]["world_id"] = world_id
+            rows[0]["blob"] = full or rows[0].get("blob")
+            rows[0]["coords"] = parse_coordinate_pair(full) or rows[0].get("coords")
+    return rows
+
+
+def find_add_wave_control(image: Image.Image) -> tuple[float, float] | None:
+    """Plus / second-wave header on the attack plan. Center flank stays selected separately."""
+    wave = formation_wave_diagnostics(image)
+    headers = wave.get("headers") or []
+    if len(headers) >= 2:
+        _x, y, x2, y2 = headers[1]
+        return ((x2 + _x) / 2, (y + y2) / 2)
+    header = wave.get("first_header")
+    if header is None:
+        return None
+    x1, y1, x2, y2 = header
+    return (min(0.92, x2 - 0.06), (y1 + y2) / 2)
+
+
 def parse_ratio(text: str) -> tuple[int, int] | None:
     match = re.search(r"(\d+)\s*/\s*(\d+)", text)
     if not match:
@@ -448,10 +756,16 @@ def _reference_bgr(image: Image.Image) -> np.ndarray:
 
 
 def is_map_screen(image: Image.Image) -> bool:
+    """Kingdom map including snow / sand / lava / islands — not parchment dialogs."""
     bgr = _reference_bgr(image)
     hsv = cv2.cvtColor(bgr[140:1420, 0:900], cv2.COLOR_BGR2HSV)
     green = cv2.inRange(hsv, (30, 45, 35), (95, 255, 255))
-    return float(np.count_nonzero(green)) / green.size > 0.28
+    snow = cv2.inRange(hsv, (0, 0, 150), (180, 45, 255))
+    sand = cv2.inRange(hsv, (8, 50, 70), (38, 255, 255))
+    lava = cv2.inRange(hsv, (0, 50, 25), (25, 255, 160))
+    water = cv2.inRange(hsv, (85, 40, 35), (130, 255, 220))
+    terrain = cv2.bitwise_or(green, cv2.bitwise_or(snow, cv2.bitwise_or(sand, cv2.bitwise_or(lava, water))))
+    return float(np.count_nonzero(terrain)) / terrain.size > 0.22
 
 
 def is_inbox_screen(image: Image.Image) -> bool:
@@ -479,15 +793,13 @@ def is_formation_screen(image: Image.Image) -> bool:
     if is_special_offers_screen(image):
         return False
     wave = formation_wave_diagnostics(image)
+    if not wave.get("first_header"):
+        return False
     bgr = _reference_bgr(image)
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     brown = cv2.inRange(hsv[0:940], (3, 45, 20), (30, 255, 180))
     brown_ratio = float(np.count_nonzero(brown)) / brown.size
-    if wave.get("first_header") and brown_ratio > 0.12:
-        return True
-    yellow = cv2.inRange(hsv[980:1210], (15, 80, 105), (45, 255, 255))
-    full_width_band_rows = int(np.count_nonzero(np.mean(yellow > 0, axis=1) > 0.75))
-    return brown_ratio > 0.18 and full_width_band_rows >= 25
+    return brown_ratio > 0.12
 
 
 def _seal_blobs(
@@ -660,8 +972,11 @@ def find_red_cross_force(
         if not allow_right_chrome and cx >= OFFER_RAIL_X * REFERENCE_SIZE[0]:
             continue
         # Resource-bar / plus-ruby HUD, not a modal close X.
-        if cy < 0.10 * REFERENCE_SIZE[1] and cx < 0.88 * REFERENCE_SIZE[0]:
-            continue
+        if cy < 0.12 * REFERENCE_SIZE[1]:
+            if cx < 0.78 * REFERENCE_SIZE[0]:
+                continue
+            if not allow_right_chrome:
+                continue
         # Prefer parchment-top-right ribbon, then large lower-left decline seal.
         top_right = cx > 0.55 * REFERENCE_SIZE[0] and cy < 0.48 * REFERENCE_SIZE[1]
         lower_left_seal = (
@@ -712,6 +1027,11 @@ _NONE_FREE_TOKENS = (
     "cbogoqh",
     "cboooqh",
     "свободных",
+    "большенет",
+    "нетбольше",
+    "bolshenet",
+    "bolwenet",
+    "netbolshe",
 )
 _HIRE_RESERVE_TOKENS = (
     "нанятьрезерв",
@@ -725,8 +1045,9 @@ _HIRE_RESERVE_TOKENS = (
 
 
 def _no_commanders_text_hit(text: str) -> bool:
-    """True for «нет свободных военачальников/наместников» hire parchment.
+    """True for the in-game inscription that there are no free commanders.
 
+    Matches «нет свободных военачальников/наместников» and «военачальников больше нет».
     Tesseract often emits Latin lookalikes: HeT CBOGOQHbIX BOCHANANbHMKOB.
     """
     blob = _ocr_compact(text)
@@ -894,7 +1215,6 @@ def no_commanders_diagnostics(
         0.0 if recognized_text is not None else _no_commanders_unique_template_score(image)
     )
     diagnostic["template_score"] = template_score
-    strong_template = template_score >= 0.55
     if recognized_text is not None:
         text = recognized_text
     elif template_score < 0.48:
@@ -903,7 +1223,7 @@ def no_commanders_diagnostics(
         text = _parchment_ocr(image)
     diagnostic["text"] = text
     text_hit = _no_commanders_text_hit(text)
-    if not (text_hit or strong_template):
+    if not text_hit:
         return diagnostic
     if find_target_attack_button(image) is not None and not text_hit:
         return diagnostic
@@ -1202,11 +1522,16 @@ def formation_wave_diagnostics(image: Image.Image) -> dict[str, Any]:
         "expanded": False,
         "collapsed": False,
         "first_header": None,
+        "headers": [],
         "content_bounds": None,
         "expand_point": None,
     }
     if not bands:
         return diagnostic
+    diagnostic["headers"] = [
+        (x / 900, y / 1600, (x + width) / 900, (y + height) / 1600)
+        for y, x, width, height, _ in bands
+    ]
     y, x, width, height, _ = bands[0]
     diagnostic["first_header"] = (x / 900, y / 1600, (x + width) / 900, (y + height) / 1600)
     next_y = bands[1][0] if len(bands) > 1 else min(1500, y + 360)
@@ -1382,6 +1707,41 @@ def find_plaque_attack_button(image: Image.Image) -> tuple[float, float] | None:
         ny = (float(cy) + top) / REFERENCE_SIZE[1]
         if nx < 0.38 or nx >= OFFER_RAIL_X or ny < 0.48 or ny > 0.68:
             continue
+        candidate = (int(area), nx, ny)
+        if best is None or candidate[0] > best[0]:
+            best = candidate
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
+def find_world_parchment_attack_button(image: Image.Image) -> tuple[float, float] | None:
+    """World-tower «Нападение» is lower-right (~0.765, 0.625), not a gold header."""
+    found = find_plaque_attack_button(image)
+    if found is not None and found[0] >= 0.62 and found[1] >= 0.58:
+        return found
+    bgr = _reference_bgr(image)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    top = int(0.58 * REFERENCE_SIZE[1])
+    bottom = int(0.70 * REFERENCE_SIZE[1])
+    left = int(0.62 * REFERENCE_SIZE[0])
+    right = int(min(OFFER_RAIL_X, 0.82) * REFERENCE_SIZE[0])
+    band = hsv[top:bottom, left:right]
+    if band.size == 0:
+        return None
+    gold = cv2.inRange(band, (14, 70, 90), (48, 255, 255))
+    count, _, stats, centers = cv2.connectedComponentsWithStats(gold)
+    best: tuple[int, float, float] | None = None
+    for index in range(1, count):
+        _x, _y, width, height, area = stats[index]
+        if area < 400:
+            continue
+        ratio = width / max(1, height)
+        if not (1.2 < ratio < 9.0):
+            continue
+        cx, cy = centers[index]
+        nx = (float(cx) + left) / REFERENCE_SIZE[0]
+        ny = (float(cy) + top) / REFERENCE_SIZE[1]
         candidate = (int(area), nx, ny)
         if best is None or candidate[0] > best[0]:
             best = candidate
@@ -1716,6 +2076,212 @@ def find_reconnect_button(image: Image.Image) -> tuple[float, float]:
         return (0.72, 0.55)
     _, x, y, width, height = best
     return ((x + width * 0.78) / REFERENCE_SIZE[0], (y + height * 0.78) / REFERENCE_SIZE[1])
+
+
+_QUIT_GAME_MARKERS = (
+    "покинутьигр",
+    "покинутьигру",
+    "хочешьпокинуть",
+    "действительнохочешьпокинуть",
+    "leavegame",
+    "quitgame",
+    "покинуть",
+)
+
+
+def _quit_dialog_box(image: Image.Image) -> tuple[int, int, int, int] | None:
+    """Gray «Внимание!» quit box in reference pixels (x, y, w, h)."""
+    bgr = _reference_bgr(image)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (0, 0, 35), (180, 50, 140))
+    count, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+    best: tuple[int, int, int, int, int] | None = None
+    for index in range(1, count):
+        x, y, width, height, area = (int(v) for v in stats[index])
+        if area < 22000 or width < 240 or height < 90:
+            continue
+        if width > 0.92 * REFERENCE_SIZE[0] or height > 0.42 * REFERENCE_SIZE[1]:
+            continue
+        cx, cy = x + width / 2, y + height / 2
+        if not (
+            0.22 * REFERENCE_SIZE[0] < cx < 0.78 * REFERENCE_SIZE[0]
+            and 0.18 * REFERENCE_SIZE[1] < cy < 0.72 * REFERENCE_SIZE[1]
+        ):
+            continue
+        if best is None or area > best[0]:
+            best = (area, x, y, width, height)
+    if best is None:
+        return None
+    _, x, y, width, height = best
+    return (x, y, width, height)
+
+
+def _quit_cyan_buttons(
+    image: Image.Image,
+    box: tuple[int, int, int, int] | None,
+) -> list[tuple[float, float]]:
+    """Cyan НЕТ/ДА labels inside the quit box, left-to-right."""
+    bgr = _reference_bgr(image)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    if box is None:
+        x0, y0, x1, y1 = 0, int(0.28 * REFERENCE_SIZE[1]), REFERENCE_SIZE[0], int(0.72 * REFERENCE_SIZE[1])
+    else:
+        x, y, width, height = box
+        x0 = x + int(0.45 * width)
+        y0 = y + int(0.55 * height)
+        x1 = x + width
+        y1 = y + height
+    roi = hsv[y0:y1, x0:x1]
+    if roi.size == 0:
+        return []
+    cyan = cv2.inRange(roi, (70, 40, 90), (110, 255, 255))
+    count, _, stats, centers = cv2.connectedComponentsWithStats(cyan)
+    found: list[tuple[float, float, int]] = []
+    for index in range(1, count):
+        area = int(stats[index][4])
+        if area < 20:
+            continue
+        nx = (float(centers[index][0]) + x0) / REFERENCE_SIZE[0]
+        ny = (float(centers[index][1]) + y0) / REFERENCE_SIZE[1]
+        found.append((nx, ny, area))
+    found.sort(key=lambda item: item[0])
+    # Merge blobs that belong to the same word.
+    merged: list[tuple[float, float]] = []
+    for nx, ny, _area in found:
+        if merged and abs(nx - merged[-1][0]) < 0.06:
+            continue
+        merged.append((nx, ny))
+    return merged
+
+
+def is_quit_game_dialog(image: Image.Image) -> bool:
+    """Map overlay «Внимание! / Действительно хочешь покинуть игру?»."""
+    box = _quit_dialog_box(image)
+    if box is None:
+        return False
+    if is_travel_dialog(image):
+        return False
+    buttons = _quit_cyan_buttons(image, box)
+    if len(buttons) >= 2:
+        return True
+    text = _ocr_compact(ocr_text_ui(crop_rel(image, [0.10, 0.22, 0.90, 0.62]), psm=6))
+    return any(token in text for token in _QUIT_GAME_MARKERS)
+
+
+def find_quit_dialog_no_button(image: Image.Image) -> tuple[float, float]:
+    """Click НЕТ only — never the right-hand ДА."""
+    box = _quit_dialog_box(image)
+    buttons = _quit_cyan_buttons(image, box)
+    if buttons:
+        return buttons[0]
+    if box is not None:
+        x, y, width, height = box
+        return (
+            (x + width * 0.74) / REFERENCE_SIZE[0],
+            (y + height * 0.81) / REFERENCE_SIZE[1],
+        )
+    return (0.62, 0.52)
+
+
+def find_castle_name_hud_point(image: Image.Image) -> tuple[float, float] | None:
+    """Top-center parchment with castle name + X:/Y:. Never the ruby/+ HUD."""
+    bgr = _reference_bgr(image)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    y0, y1 = 0, int(0.08 * REFERENCE_SIZE[1])
+    x0, x1 = int(0.28 * REFERENCE_SIZE[0]), int(0.76 * REFERENCE_SIZE[0])
+    roi = hsv[y0:y1, x0:x1]
+    parchment = cv2.bitwise_or(
+        cv2.inRange(roi, (8, 12, 130), (40, 110, 255)),
+        cv2.inRange(roi, (0, 0, 170), (40, 40, 255)),
+    )
+    count, _, stats, centers = cv2.connectedComponentsWithStats(parchment)
+    best: tuple[int, float, float] | None = None
+    for index in range(1, count):
+        area = int(stats[index][4])
+        if area < 400:
+            continue
+        nx = (float(centers[index][0]) + x0) / REFERENCE_SIZE[0]
+        ny = (float(centers[index][1]) + y0) / REFERENCE_SIZE[1]
+        if is_ruby_plus_hud_point(nx, ny) or nx >= 0.74:
+            continue
+        if best is None or area > best[0]:
+            best = (area, nx, ny)
+    if best is None:
+        return None
+    return (best[1], best[2])
+
+
+def is_castle_home_banner(image: Image.Image) -> bool:
+    """Expanded castle-name plaque with world name and the left home control."""
+    matched = find_template_point(
+        image,
+        CASTLE_HOME_SEXTANT_TEMPLATE,
+        threshold=0.52,
+    )
+    if matched is not None and matched[0] < 0.50 and matched[1] < 0.22:
+        return True
+    top = _ocr_compact(ocr_text_ui(crop_rel(image, [0.18, 0.02, 0.82, 0.22]), psm=6))
+    markers = (
+        "великаяимпер",
+        "velikayaimper",
+        "greatempire",
+        "вечнохолодн",
+        "вечнохолдн",
+        "ледник",
+        "everwinter",
+        "пылающ",
+        "пески",
+        "burningsand",
+        "огненн",
+        "вершин",
+        "firepeak",
+        "остров",
+        "ураган",
+        "stormisland",
+        "vimnep",
+        "beynoxonog",
+        "orhehh",
+    )
+    return any(token in top for token in markers)
+
+
+def find_home_sextant_button(image: Image.Image) -> tuple[float, float] | None:
+    """LEFT green wooden home control. Never the right white castle icon."""
+    matched = find_template_point(
+        image,
+        CASTLE_HOME_SEXTANT_TEMPLATE,
+        threshold=0.52,
+    )
+    if matched is not None:
+        nx, ny, _score = matched
+        if nx < 0.50 and ny < 0.28 and not is_ruby_plus_hud_point(nx, ny):
+            return (float(nx), float(ny))
+    bgr = _reference_bgr(image)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    y0, y1 = int(0.02 * REFERENCE_SIZE[1]), int(0.24 * REFERENCE_SIZE[1])
+    x0, x1 = int(0.08 * REFERENCE_SIZE[0]), int(0.48 * REFERENCE_SIZE[0])
+    roi = hsv[y0:y1, x0:x1]
+    green = cv2.inRange(roi, (35, 50, 40), (95, 255, 220))
+    count, _, stats, centers = cv2.connectedComponentsWithStats(green)
+    best: tuple[int, float, float] | None = None
+    for index in range(1, count):
+        width = int(stats[index][2])
+        height = int(stats[index][3])
+        area = int(stats[index][4])
+        if area < 180 or area > 18000:
+            continue
+        ratio = width / max(1, height)
+        if not (0.55 <= ratio <= 1.85):
+            continue
+        nx = (float(centers[index][0]) + x0) / REFERENCE_SIZE[0]
+        ny = (float(centers[index][1]) + y0) / REFERENCE_SIZE[1]
+        if nx >= 0.50 or is_ruby_plus_hud_point(nx, ny):
+            continue
+        if best is None or area > best[0]:
+            best = (area, nx, ny)
+    if best is None:
+        return None
+    return (best[1], best[2])
 
 
 def is_hire_menu(image: Image.Image) -> bool:

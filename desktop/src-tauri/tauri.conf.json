@@ -10,11 +10,12 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "EmpireBot Live",
-        "width": 1380,
-        "height": 920,
-        "minWidth": 1100,
-        "minHeight": 720
+        "label": "main",
+        "title": "EmpireBot",
+        "width": 1280,
+        "height": 860,
+        "minWidth": 980,
+        "minHeight": 680
       }
     ],
     "security": {

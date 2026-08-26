@@ -177,7 +177,7 @@ class AdbClient:
         self.shell(f"input text {safe}")
 
     def key(self, keycode: int) -> None:
-        """Send an Android keyevent; fall back to focused-window Escape when ADB shell is dead."""
+        """Send an Android keyevent. Never HWND Escape — that opens quit on the map."""
         if self.serial:
             proc = self._run(
                 ["-s", self.serial, "shell", "input", "keyevent", str(int(keycode))],
@@ -185,9 +185,13 @@ class AdbClient:
             )
             if proc.returncode == 0:
                 return
-            logger.debug("ADB keyevent failed ({}) — пробую окно BlueStacks", proc.stderr.strip())
-        if int(keycode) == 4:
-            press_escape_on_game(self.config)
+            logger.warning(
+                "ADB keyevent {} не прошёл ({}) — Escape в окно не шлю (это выход из игры)",
+                keycode,
+                (proc.stderr or "").strip(),
+            )
+            return
+        logger.warning("Нет ADB serial — Escape в окно не шлю (это выход из игры)")
 
     def swipe(
         self,

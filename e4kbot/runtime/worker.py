@@ -13,7 +13,7 @@ from e4kbot.engine import AttackBot
 from e4kbot.modes.catalog import catalog_payload
 from e4kbot.paths import ROOT, ensure_dirs
 from e4kbot.runtime.live import emit, emit_ready, emit_state, install_worker_sink
-from e4kbot.runtime.scheduler import snapshot
+from e4kbot.runtime.scheduler import apply_campaign_queue, snapshot
 from e4kbot.state import StateStore
 from e4kbot.telegram_bot import TelegramReporter
 
@@ -75,10 +75,9 @@ class Worker:
             return {"ok": True, "dry_run": value}
         if cmd == "set_campaign":
             queue = command.get("queue") or []
-            campaign = self.config.setdefault("campaign", {})
-            campaign["queue"] = queue
+            apply_campaign_queue(self.config, queue if isinstance(queue, list) else None)
             save_config(self.config)
-            emit("config.campaign", queue=queue)
+            emit("config.campaign", queue=self.config.get("campaign", {}).get("queue"))
             return {"ok": True, "campaign": snapshot(self.config, self.store)}
         if cmd == "status":
             return self.status()

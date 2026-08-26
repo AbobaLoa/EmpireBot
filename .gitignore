@@ -13,3 +13,5 @@ tessdata/
 desktop/node_modules/
 desktop/src-tauri/target/
 desktop/dist/
+webui/node_modules/
+webui/dist/

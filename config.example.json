@@ -49,11 +49,12 @@
     "map_anchor": [0.50, 0.54],
     "map_coordinate_scale": [0.044, 0.044],
     "picker_timeout_seconds": 15,
-    "picker_max_actions": 4,
+    "picker_max_actions": 1,
     "minimum_flank_fill": 0.7
   },
     "control": {
         "hotkey": "NUM0",
+        "start_hotkey": "NUM1",
         "always_on_top": true,
         "start_paused": true
     },
@@ -61,18 +62,18 @@
         "enabled": true,
         "fill_without_waiting_returns": true,
         "queue": [
-            {"mode": "robber_barons", "count": 20, "enabled": true},
-            {"mode": "storm_forts", "count": 10, "enabled": false},
-            {"mode": "barbarian_towers", "count": 10, "enabled": false},
-            {"mode": "barbarian_fortresses", "count": 5, "enabled": false},
-            {"mode": "desert_towers", "count": 10, "enabled": false},
-            {"mode": "desert_fortresses", "count": 5, "enabled": false},
-            {"mode": "cultist_towers", "count": 15, "enabled": false},
-            {"mode": "dragons", "count": 5, "enabled": false},
             {"mode": "nomad_camps", "count": 44, "enabled": false},
             {"mode": "samurai_camps", "count": 44, "enabled": false},
-            {"mode": "bloodcrows", "count": 6, "enabled": false},
-            {"mode": "alien_castles", "count": 6, "enabled": false}
+            {"mode": "storm_forts", "count": 5, "enabled": false},
+            {"mode": "robber_barons", "count": 5, "enabled": true},
+            {"mode": "barbarian_towers", "count": 5, "enabled": false},
+            {"mode": "desert_towers", "count": 5, "enabled": false},
+            {"mode": "cultist_towers", "count": 5, "enabled": false},
+            {"mode": "alien_castles", "count": 6, "enabled": false},
+            {"mode": "barbarian_fortresses", "count": 5, "enabled": false},
+            {"mode": "desert_fortresses", "count": 5, "enabled": false},
+            {"mode": "dragons", "count": 5, "enabled": false},
+            {"mode": "bloodcrows", "count": 6, "enabled": false}
         ]
     },
     "telegram": {

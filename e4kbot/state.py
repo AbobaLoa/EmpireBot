@@ -67,11 +67,16 @@ class LiveState:
     session_by_mode: dict[str, int] = field(default_factory=dict)
     skipped_modes: list[str] = field(default_factory=list)
     active_mode: str = ""
+    pinned_mode: str = ""
     target_hits: dict[str, int] = field(default_factory=dict)
     samurai_remaining: dict[str, int] = field(default_factory=dict)
     nomad_remaining: dict[str, int] = field(default_factory=dict)
     nomad_farm_coords: list[int] | None = None
     nomad_farm_point: list[float] | None = None
+    last_action: str = ""
+    unopened_worlds: list[str] = field(default_factory=list)
+    attack_report: str = ""
+    current_world: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         from e4kbot.control import CONTROL, hotkey_label
@@ -88,12 +93,27 @@ class LiveState:
             if until > now
         }
         paused = not CONTROL.is_enabled()
+        if paused:
+            status_label = "пауза"
+        elif self.running:
+            status_label = "работает"
+        else:
+            status_label = "ожидание"
         return {
             "running": self.running,
             "paused": paused,
             "enabled": not paused,
+            "status_label": status_label,
+            "last_action": self.last_action or self.last_coords or "—",
+            "unopened_worlds": list(self.unopened_worlds),
+            "attack_report": self.attack_report,
+            "current_world": self.current_world,
             "hotkey": CONTROL.hotkey,
             "hotkey_label": hotkey_label(CONTROL.hotkey),
+            "start_hotkey": CONTROL.start_hotkey,
+            "start_hotkey_label": hotkey_label(CONTROL.start_hotkey),
+            "pause_hotkey": CONTROL.hotkey,
+            "pause_hotkey_label": hotkey_label(CONTROL.hotkey),
             "dry_run": self.dry_run,
             "engine": self.engine,
             "account": self.account,
@@ -119,6 +139,7 @@ class LiveState:
             "session_by_mode": dict(self.session_by_mode),
             "skipped_modes": list(self.skipped_modes),
             "active_mode": self.active_mode,
+            "pinned_mode": self.pinned_mode,
             "target_hits": dict(self.target_hits),
             "samurai_remaining": dict(self.samurai_remaining),
             "nomad_remaining": dict(self.nomad_remaining),
@@ -178,6 +199,12 @@ class StateStore:
                 str(value) for value in (raw.get("skipped_modes") or [])
             ]
             self.live.active_mode = str(raw.get("active_mode") or "")
+            self.live.pinned_mode = str(raw.get("pinned_mode") or "")
+            self.live.unopened_worlds = [
+                str(value) for value in (raw.get("unopened_worlds") or [])
+            ]
+            self.live.attack_report = str(raw.get("attack_report") or "")
+            self.live.current_world = str(raw.get("current_world") or "")
             self.live.history = list(raw.get("history") or [])
             march_fields = set(March.__dataclass_fields__)
             self.live.marches = [
@@ -479,11 +506,14 @@ class StateStore:
         self.live.session_by_mode = {}
         self.live.skipped_modes = []
         self.live.active_mode = ""
+        self.live.pinned_mode = ""
 
     def skip_mode(self, mode_id: str) -> None:
         if mode_id not in self.live.skipped_modes:
             self.live.skipped_modes.append(mode_id)
-            self.save()
+        if self.live.pinned_mode == mode_id:
+            self.live.pinned_mode = ""
+        self.save()
 
     def update_return_timer(
         self,

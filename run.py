@@ -110,7 +110,9 @@ def cmd_run(max_cycles: int = 0, no_panel: bool = False) -> None:
     bot_thread = threading.Thread(target=_run_bot_thread, args=(bot,), name="e4k-bot", daemon=True)
     bot_thread.start()
     logger.info(
-        "Панель: кнопка вкл/выкл. Горячая клавиша {} выключает бота сразу и отпускает мышь.",
+        "Панель FastAPI+React: http://127.0.0.1:{} · старт {} · пауза {}",
+        int(tg_cfg.get("miniapp_port") or 8766),
+        hotkey_label(CONTROL.start_hotkey),
         hotkey_label(CONTROL.hotkey),
     )
     try:
@@ -174,7 +176,12 @@ def main() -> None:
     parser.add_argument(
         "--no-panel",
         action="store_true",
-        help="Run without the desktop control window",
+        help="Run without the optional Tk window (default). React panel is at http://127.0.0.1:8766",
+    )
+    parser.add_argument(
+        "--tk-panel",
+        action="store_true",
+        help="Also open the legacy Tk window. Primary UI is still FastAPI+React.",
     )
     args = parser.parse_args()
     if args.command == "calibrate":
@@ -186,7 +193,7 @@ def main() -> None:
 
         worker_main()
     else:
-        cmd_run(max_cycles=args.max_cycles, no_panel=args.no_panel)
+        cmd_run(max_cycles=args.max_cycles, no_panel=not args.tk_panel)
 
 
 if __name__ == "__main__":

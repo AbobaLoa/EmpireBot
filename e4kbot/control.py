@@ -7,14 +7,19 @@ from typing import Any, Callable
 
 from loguru import logger
 
+from e4kbot.modes.catalog import catalog_grouped, catalog_payload
+
 
 class BotPaused(Exception):
     """Raised when a click/wait must abort because the operator paused the bot."""
 
 
 DEFAULT_HOTKEY = "NUM0"
+DEFAULT_START_HOTKEY = "NUM1"
 VK_NUMPAD0 = 0x60
+VK_NUMPAD1 = 0x61
 VK_INSERT = 0x2D
+VK_END = 0x23
 VK_NUMLOCK = 0x90
 _KEY_DOWN = 0x8000
 
@@ -26,27 +31,56 @@ _NUMPAD0_ALIASES = {
     "KP0",
     "KPINSERT",
 }
+_NUMPAD1_ALIASES = {
+    "NUM1",
+    "NUMPAD1",
+    "NUMPADEND",
+    "NUMEND",
+    "KP1",
+    "KPEND",
+}
 
 
-def normalize_hotkey(raw: str | None) -> str:
-    text = str(raw or DEFAULT_HOTKEY).strip().upper()
+def normalize_hotkey(raw: str | None, default: str = DEFAULT_HOTKEY) -> str:
+    text = str(raw or default).strip().upper()
     compact = text.replace(" ", "").replace("-", "").replace("_", "")
     if compact in _NUMPAD0_ALIASES:
         return DEFAULT_HOTKEY
+    if compact in _NUMPAD1_ALIASES:
+        return DEFAULT_START_HOTKEY
     if compact.startswith("F") and compact[1:].isdigit():
         number = int(compact[1:])
         if 1 <= number <= 12:
             return f"F{number}"
     if len(text) == 1 and ("A" <= text <= "Z" or "0" <= text <= "9"):
         return text
-    return DEFAULT_HOTKEY
+    return default
+
+
+def normalize_start_hotkey(raw: str | None) -> str:
+    key = normalize_hotkey(raw, default=DEFAULT_START_HOTKEY)
+    if key == DEFAULT_HOTKEY:
+        return DEFAULT_START_HOTKEY
+    return key
 
 
 def hotkey_label(hotkey: str | None = None) -> str:
-    key = normalize_hotkey(hotkey)
-    if key == DEFAULT_HOTKEY:
+    key = str(hotkey or DEFAULT_HOTKEY).strip().upper()
+    compact = key.replace(" ", "").replace("-", "").replace("_", "")
+    if compact in _NUMPAD0_ALIASES or key == DEFAULT_HOTKEY:
         return "Num0"
-    return key
+    if compact in _NUMPAD1_ALIASES or key == DEFAULT_START_HOTKEY:
+        return "Num1"
+    normalized = normalize_hotkey(hotkey)
+    if normalized == DEFAULT_HOTKEY:
+        return "Num0"
+    if normalized == DEFAULT_START_HOTKEY:
+        return "Num1"
+    return normalized
+
+
+def _numlock_on(user32: Any) -> bool:
+    return bool(user32.GetKeyState(VK_NUMLOCK) & 1)
 
 
 def _pause_key_down(user32: Any, hotkey: str) -> bool:
@@ -55,8 +89,23 @@ def _pause_key_down(user32: Any, hotkey: str) -> bool:
     if key == DEFAULT_HOTKEY:
         if user32.GetAsyncKeyState(VK_NUMPAD0) & _KEY_DOWN:
             return True
-        numlock_on = bool(user32.GetKeyState(VK_NUMLOCK) & 1)
-        if not numlock_on and user32.GetAsyncKeyState(VK_INSERT) & _KEY_DOWN:
+        if not _numlock_on(user32) and user32.GetAsyncKeyState(VK_INSERT) & _KEY_DOWN:
+            return True
+        return False
+    if key.startswith("F") and key[1:].isdigit():
+        vk = 0x70 + int(key[1:]) - 1
+    else:
+        vk = ord(key)
+    return bool(user32.GetAsyncKeyState(vk) & _KEY_DOWN)
+
+
+def _start_key_down(user32: Any, hotkey: str) -> bool:
+    """True while the start bind is held. NUM1 works with NumLock on or off."""
+    key = normalize_start_hotkey(hotkey)
+    if key == DEFAULT_START_HOTKEY:
+        if user32.GetAsyncKeyState(VK_NUMPAD1) & _KEY_DOWN:
+            return True
+        if not _numlock_on(user32) and user32.GetAsyncKeyState(VK_END) & _KEY_DOWN:
             return True
         return False
     if key.startswith("F") and key[1:].isdigit():
@@ -73,6 +122,7 @@ class ControlBus:
         self._lock = threading.Lock()
         self.stop = False
         self.hotkey = DEFAULT_HOTKEY
+        self.start_hotkey = DEFAULT_START_HOTKEY
         self.always_on_top = True
         self._listeners: list[Callable[[], None]] = []
         self._hotkey_thread: threading.Thread | None = None
@@ -81,9 +131,12 @@ class ControlBus:
         self._hotkey_error = ""
 
     def configure(self, config: dict[str, Any], *, startup: bool = False) -> None:
-        """Apply hotkey/topmost. start_paused only pauses at process start, never later."""
+        """Apply hotkeys/topmost. start_paused only pauses at process start, never later."""
         control = config.get("control") or {}
         self.hotkey = normalize_hotkey(str(control.get("hotkey") or DEFAULT_HOTKEY))
+        self.start_hotkey = normalize_start_hotkey(
+            str(control.get("start_hotkey") or DEFAULT_START_HOTKEY)
+        )
         self.always_on_top = bool(control.get("always_on_top", True))
         if not startup:
             return
@@ -101,6 +154,10 @@ class ControlBus:
             "paused": not self.is_enabled(),
             "hotkey": self.hotkey,
             "hotkey_label": hotkey_label(self.hotkey),
+            "start_hotkey": self.start_hotkey,
+            "start_hotkey_label": hotkey_label(self.start_hotkey),
+            "pause_hotkey": self.hotkey,
+            "pause_hotkey_label": hotkey_label(self.hotkey),
             "always_on_top": self.always_on_top,
             "stop": self.stop,
         }
@@ -121,14 +178,14 @@ class ControlBus:
         changed = not self._enabled.is_set()
         self._enabled.set()
         if changed:
-            logger.info("Бот ВКЛ — клики разрешены")
+            logger.info("Бот ВКЛ — клики разрешены (старт {})", hotkey_label(self.start_hotkey))
             self._notify()
 
     def disable(self) -> None:
         changed = self._enabled.is_set()
         self._enabled.clear()
         if changed:
-            logger.info("Бот ВЫКЛ — мышь свободна (клавиша {})", hotkey_label(self.hotkey))
+            logger.info("Бот ВЫКЛ — мышь свободна (пауза {})", hotkey_label(self.hotkey))
             self._notify()
 
     def toggle(self) -> None:
@@ -170,6 +227,13 @@ class ControlBus:
         self._notify()
         return self.hotkey
 
+    def set_start_hotkey(self, hotkey: str) -> str:
+        self.start_hotkey = normalize_start_hotkey(hotkey)
+        self.restart_hotkey()
+        logger.info("Горячая клавиша старта: {}", hotkey_label(self.start_hotkey))
+        self._notify()
+        return self.start_hotkey
+
     def restart_hotkey(self) -> None:
         self.stop_hotkey()
         self._hotkey_stop.clear()
@@ -199,16 +263,22 @@ class ControlBus:
         user32.GetKeyState.argtypes = [ctypes.c_int]
         user32.GetKeyState.restype = ctypes.c_short
         self._hotkey_ready.set()
-        if normalize_hotkey(self.hotkey) == DEFAULT_HOTKEY:
-            logger.info("Глобальный хоткей Num0 — вкл/выкл бота (цифровая 0, с NumLock и без)")
-        else:
-            logger.info("Глобальный хоткей {} — вкл/выкл бота", hotkey_label(self.hotkey))
-        was_down = False
+        logger.info(
+            "Глобальные хоткеи: старт {} (цифровая 1), пауза {} (цифровая 0). NumLock не важен, раскладка не важна.",
+            hotkey_label(self.start_hotkey),
+            hotkey_label(self.hotkey),
+        )
+        was_pause = False
+        was_start = False
         while not self._hotkey_stop.is_set() and not self.stop:
-            down = _pause_key_down(user32, self.hotkey)
-            if down and not was_down:
-                self.toggle()
-            was_down = down
+            pause_down = _pause_key_down(user32, self.hotkey)
+            start_down = _start_key_down(user32, self.start_hotkey)
+            if pause_down and not was_pause:
+                self.disable()
+            elif start_down and not was_start:
+                self.enable()
+            was_pause = pause_down
+            was_start = start_down
             time.sleep(0.02)
 
 
@@ -216,11 +286,18 @@ CONTROL = ControlBus()
 
 
 def public_settings(config: dict[str, Any]) -> dict[str, Any]:
+    from e4kbot.runtime.scheduler import campaign_queue, enabled_mode_ids, sync_legacy_modes
+
     delays = config.get("attack_delay_seconds") or [8, 10]
     cycles = config.get("cycle_pause_seconds") or [0, 0]
     baron = config.get("baron_attacks") or {}
-    modes = config.get("modes") or {}
     control = config.get("control") or {}
+    sync_legacy_modes(config)
+    modes = config.get("modes") or {}
+    queue = campaign_queue(config)
+    enabled = enabled_mode_ids(config)
+    pause_key = normalize_hotkey(str(control.get("hotkey") or CONTROL.hotkey))
+    start_key = normalize_start_hotkey(str(control.get("start_hotkey") or CONTROL.start_hotkey))
     return {
         "current_target_kind": str(config.get("current_target_kind") or "baron"),
         "dry_run": bool(config.get("dry_run")),
@@ -232,67 +309,74 @@ def public_settings(config: dict[str, Any]) -> dict[str, Any]:
         "cycle_pause_max": int(cycles[1]),
         "use_feathers": bool(baron.get("use_feathers", True)),
         "gold_fallback_when_no_feathers": bool(baron.get("gold_fallback_when_no_feathers", True)),
-        "barons": bool(modes.get("barons", True)),
-        "nomads": bool(modes.get("nomads", True)),
-        "shogun": bool(modes.get("shogun", True)),
-        "hotkey": normalize_hotkey(str(control.get("hotkey") or CONTROL.hotkey)),
-        "hotkey_label": hotkey_label(str(control.get("hotkey") or CONTROL.hotkey)),
+        "barons": bool(modes.get("barons", False)),
+        "nomads": bool(modes.get("nomads", False)),
+        "shogun": bool(modes.get("shogun", False)),
+        "hotkey": pause_key,
+        "hotkey_label": hotkey_label(pause_key),
+        "start_hotkey": start_key,
+        "start_hotkey_label": hotkey_label(start_key),
+        "pause_hotkey": pause_key,
+        "pause_hotkey_label": hotkey_label(pause_key),
         "always_on_top": bool(control.get("always_on_top", True)),
-        "start_paused": bool(control.get("start_paused", False)),
+        "start_paused": bool(control.get("start_paused", True)),
         "input": str((config.get("bluestacks") or {}).get("input") or "mouse"),
+        "campaign": queue,
+        "enabled_modes": enabled,
+        "catalog": catalog_payload(),
+        "worlds": catalog_grouped(),
     }
 
 
 def apply_public_settings(config: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+    from e4kbot.runtime.scheduler import apply_campaign_queue, sync_legacy_modes
+
     kind = str(updates.get("current_target_kind") or config.get("current_target_kind") or "baron")
     if kind == "shogun":
         kind = "samurai"
-    if kind not in {"baron", "nomad", "samurai"}:
-        kind = "baron"
     config["current_target_kind"] = kind
-    mode_by_kind = {
-        "baron": ("robber_barons", 20),
-        "nomad": ("nomad_camps", 44),
-        "samurai": ("samurai_camps", 44),
-    }
-    mode_id, quota = mode_by_kind[kind]
-    campaign = dict(config.get("campaign") or {})
-    queue = list(campaign.get("queue") or [])
-    found = False
-    for item in queue:
-        enabled = str(item.get("mode") or "") == mode_id
-        item["enabled"] = enabled
-        if enabled:
-            item["count"] = int(item.get("count") or quota)
-            found = True
-    if not found:
-        queue.append({"mode": mode_id, "count": quota, "enabled": True})
-    campaign["queue"] = queue
-    campaign["enabled"] = True
-    config["campaign"] = campaign
+    if "campaign" in updates or "enabled_modes" in updates:
+        queue = updates.get("campaign")
+        flags = updates.get("enabled_modes")
+        if isinstance(queue, dict):
+            queue = queue.get("queue") or queue.get("steps")
+        apply_campaign_queue(
+            config,
+            queue if isinstance(queue, list) else None,
+            flags if isinstance(flags, dict) else None,
+        )
+    else:
+        legacy_flags = {}
+        if "barons" in updates:
+            legacy_flags["robber_barons"] = bool(updates["barons"])
+        if "nomads" in updates:
+            legacy_flags["nomad_camps"] = bool(updates["nomads"])
+        if "shogun" in updates:
+            legacy_flags["samurai_camps"] = bool(updates["shogun"])
+        if legacy_flags:
+            apply_campaign_queue(config, enabled_modes=legacy_flags)
+        else:
+            sync_legacy_modes(config)
     if "dry_run" in updates:
         config["dry_run"] = bool(updates["dry_run"])
     if "max_concurrent_attacks" in updates:
         config["max_concurrent_attacks"] = max(1, min(30, int(updates["max_concurrent_attacks"])))
     if "max_commander_number" in updates:
         config["max_commander_number"] = max(1, min(30, int(updates["max_commander_number"])))
-    delay_min = int(updates.get("attack_delay_min", (config.get("attack_delay_seconds") or [8, 10])[0]))
-    delay_max = int(updates.get("attack_delay_max", (config.get("attack_delay_seconds") or [8, 10])[1]))
-    config["attack_delay_seconds"] = [max(1, min(delay_min, delay_max)), max(1, max(delay_min, delay_max))]
-    pause_min = int(updates.get("cycle_pause_min", (config.get("cycle_pause_seconds") or [0, 0])[0]))
-    pause_max = int(updates.get("cycle_pause_max", (config.get("cycle_pause_seconds") or [0, 0])[1]))
-    config["cycle_pause_seconds"] = [max(1, min(pause_min, pause_max)), max(1, max(pause_min, pause_max))]
+    if "attack_delay_min" in updates or "attack_delay_max" in updates:
+        delay_min = int(updates.get("attack_delay_min", (config.get("attack_delay_seconds") or [8, 10])[0]))
+        delay_max = int(updates.get("attack_delay_max", (config.get("attack_delay_seconds") or [8, 10])[1]))
+        config["attack_delay_seconds"] = [max(1, min(delay_min, delay_max)), max(1, max(delay_min, delay_max))]
+    if "cycle_pause_min" in updates or "cycle_pause_max" in updates:
+        pause_min = int(updates.get("cycle_pause_min", (config.get("cycle_pause_seconds") or [0, 0])[0]))
+        pause_max = int(updates.get("cycle_pause_max", (config.get("cycle_pause_seconds") or [0, 0])[1]))
+        config["cycle_pause_seconds"] = [max(0, min(pause_min, pause_max)), max(0, max(pause_min, pause_max))]
     baron = dict(config.get("baron_attacks") or {})
     if "use_feathers" in updates:
         baron["use_feathers"] = bool(updates["use_feathers"])
     if "gold_fallback_when_no_feathers" in updates:
         baron["gold_fallback_when_no_feathers"] = bool(updates["gold_fallback_when_no_feathers"])
     config["baron_attacks"] = baron
-    modes = dict(config.get("modes") or {})
-    for key in ("barons", "nomads", "shogun"):
-        if key in updates:
-            modes[key] = bool(updates[key])
-    config["modes"] = modes
     bluestacks = dict(config.get("bluestacks") or {})
     if updates.get("input") in {"mouse", "adb"}:
         bluestacks["input"] = updates["input"]
@@ -301,11 +385,15 @@ def apply_public_settings(config: dict[str, Any], updates: dict[str, Any]) -> di
     if "hotkey" in updates:
         control["hotkey"] = normalize_hotkey(str(updates["hotkey"]))
         CONTROL.set_hotkey(control["hotkey"])
+    if "start_hotkey" in updates:
+        control["start_hotkey"] = normalize_start_hotkey(str(updates["start_hotkey"]))
+        CONTROL.set_start_hotkey(control["start_hotkey"])
     if "always_on_top" in updates:
         control["always_on_top"] = bool(updates["always_on_top"])
         CONTROL.always_on_top = control["always_on_top"]
     if "start_paused" in updates:
         control["start_paused"] = bool(updates["start_paused"])
+    control.setdefault("hotkey", CONTROL.hotkey)
+    control.setdefault("start_hotkey", CONTROL.start_hotkey)
     config["control"] = control
-    # Never call CONTROL.configure() here: start_paused is startup-only.
     return public_settings(config)

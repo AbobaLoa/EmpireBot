@@ -41,6 +41,10 @@
     "travel_confirm": [0.77, 0.815],
     "movement_confirm": [0.77, 0.815],
     "travel_cancel": [0.23, 0.815],
+    "castle_name_hud": [0.52, 0.028],
+    "home_sextant": [0.32, 0.145],
+    "quit_dialog_no": [0.62, 0.52],
+    "navigation": [0.20, 0.937],
     "attack": [0.495, 0.391],
     "send": [0.77, 0.815],
     "close": [0.94, 0.034]

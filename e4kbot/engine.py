@@ -7,11 +7,18 @@ from loguru import logger
 
 from e4kbot.attacks.registry import get_attack_module
 from e4kbot.bluestacks import AdbClient, diagnose_targeting, probe_bluestacks
+from e4kbot.campaign_checkpoint import (
+    apply_on_enable,
+    apply_on_start,
+    mark_paused,
+    restore_into_client,
+    write_checkpoint,
+)
 from e4kbot.client import BlueStacksEngine
 from e4kbot.control import CONTROL, BotPaused, hotkey_label
 from e4kbot.protocol import ProtocolEngine
 from e4kbot.runtime.live import emit, emit_state
-from e4kbot.runtime.scheduler import pick_next_step, snapshot
+from e4kbot.runtime.scheduler import pick_next_step, snapshot, steps
 from e4kbot.safety import wait_active_hours
 from e4kbot.state import StateStore
 from e4kbot.telegram_bot import TelegramReporter
@@ -38,6 +45,10 @@ FAST_RETRY_RESULTS = {
     "samurai_complete",
     "nomad_complete",
     "waiting_camp_template",
+    "world_unopened",
+    "world_skip_empty",
+    "world_switch_failed",
+    "nav_not_found",
 }
 
 
@@ -57,8 +68,9 @@ class AttackBot:
         CONTROL.on_change(self._on_control_change)
 
     def start(self) -> None:
-        if not bool(self.config.get("resume_session_stats")):
-            self.store.reset_session_stats()
+        decision = apply_on_start(self.store, self.client, config=self.config)
+        if decision == "restart" and bool(self.config.get("resume_session_stats")):
+            logger.info("resume_session_stats в конфиге, но чекпоинт старше 10 мин — всё равно старт с Великой империи")
         self.store.live.running = True
         self.store.live.dry_run = bool(self.config.get("dry_run", True))
         self.store.live.engine = str(self.config.get("engine") or "bluestacks")
@@ -71,7 +83,11 @@ class AttackBot:
         except Exception:
             logger.exception("ADB не подключился на старте — продолжаю, жду ВКЛ")
         diagnose_targeting(self.config, self.adb)
-        logger.info("Бот готов. ВКЛ / клавиша {} запускает атаки", hotkey_label(CONTROL.hotkey))
+        logger.info(
+            "Бот готов. Старт {} включает выбранные задачи, пауза {} отпускает мышь",
+            hotkey_label(CONTROL.start_hotkey),
+            hotkey_label(CONTROL.hotkey),
+        )
         try:
             self._loop()
         except BotPaused:
@@ -88,6 +104,11 @@ class AttackBot:
                 except Exception:
                     logger.exception("Повторный цикл тоже упал")
         finally:
+            if self._armed_for_report:
+                try:
+                    mark_paused(self.store, self.client)
+                except Exception:
+                    logger.exception("Не удалось записать чекпоинт паузы при выходе")
             self.store.live.running = False
             self.store.live.mode = "stopped"
             self.store.save()
@@ -101,7 +122,10 @@ class AttackBot:
                     self.store.live.mode = "paused"
                     self.store.live.paused = True
                     self.store.save()
-                    logger.info("На паузе — жми {} или кнопку ВКЛ", hotkey_label(CONTROL.hotkey))
+                    logger.info(
+                        "На паузе — жми {} чтобы стартовать выбранные задачи",
+                        hotkey_label(CONTROL.start_hotkey),
+                    )
                     CONTROL.wait_until_enabled()
                     if self.stop or CONTROL.stop:
                         break
@@ -109,7 +133,7 @@ class AttackBot:
                     self.store.live.paused = False
                     self.store.live.mode = "attack"
                     self.store.save()
-                    logger.info("ВКЛ — сразу ищу цели")
+                    logger.info("ВКЛ — проверяю экран и продолжаю с чекпоинта или с Великой империи")
                     continue
 
                 wait_active_hours(self.config)
@@ -144,23 +168,13 @@ class AttackBot:
                     logger.info(f"Жду возврат военачальника {wait_for:.0f}с")
                     CONTROL.sleep(min(wait_for, 15))
                     continue
-                in_flight = self.store.in_flight()
-                cap = int(self.config.get("max_concurrent_attacks") or 30)
-                if len(in_flight) >= cap:
-                    nearest = min(m.return_at for m in in_flight)
-                    wait_for = max(1.0, nearest - time.time())
-                    self.store.live.mode = "wait_commanders"
-                    self.store.live.next_attack_at = nearest
-                    self.store.save()
-                    logger.info(f"Лимит {cap} атак в пути, ждём возврат {wait_for:.0f}с")
-                    CONTROL.sleep(min(wait_for, 15))
-                    continue
-
                 self.store.live.mode = "attack"
                 self.store.live.paused = False
                 self.store.save()
                 result = self._run_scheduled_cycle()
+                write_checkpoint(self.store, self.client)
             except BotPaused:
+                mark_paused(self.store, self.client)
                 self.store.live.mode = "paused"
                 self.store.live.paused = True
                 self.store.save()
@@ -224,6 +238,23 @@ class AttackBot:
         campaign = self.config.get("campaign") or {}
         if campaign.get("enabled", True):
             step = pick_next_step(self.config, self.store)
+            pinned_id = str(self.store.live.active_mode or "")
+            if step is not None and self.client is not None and pinned_id:
+                try:
+                    assembling = bool(self.client._plan_or_picker_open())
+                except Exception:
+                    assembling = False
+                if assembling:
+                    hold = next(
+                        (
+                            item
+                            for item in steps(self.config, self.store)
+                            if item.mode_id == pinned_id and item.enabled and not item.done
+                        ),
+                        None,
+                    )
+                    if hold is not None:
+                        step = hold
             emit(
                 "cycle.next",
                 campaign=snapshot(self.config, self.store),
@@ -231,11 +262,16 @@ class AttackBot:
             )
             if step is None:
                 emit("campaign.complete", level="INFO")
-                logger.info("Кампания по квотам закрыта — жду возвраты/новые квоты")
+                self.store.live.last_action = "нет включённых задач"
+                logger.info("Нет включённых задач — включи тумблеры и нажми {}", hotkey_label(CONTROL.start_hotkey))
                 emit_state(self.store.live.to_dict())
                 return "campaign_complete"
             self.store.live.active_mode = step.mode_id
+            self.store.live.last_action = f"{step.spec.title_ru} · поиск"
             self.config["current_target_kind"] = step.spec.target_kind
+            tier = int(step.spec.campaign_priority or 0)
+            if tier:
+                logger.info("Очередь: P{} {} (выключенные тумблеры пропускаю)", tier, step.spec.title_ru)
             emit(
                 "mode.select",
                 mode=step.mode_id,
@@ -272,12 +308,19 @@ class AttackBot:
                         "samurai": "samurai_camps",
                         "nomad": "nomad_camps",
                         "baron": "robber_barons",
+                        "barbarian_tower": "barbarian_towers",
+                        "desert_tower": "desert_towers",
+                        "cultist_tower": "cultist_towers",
+                        "storm_fort": "storm_forts",
                     }.get(kind, kind)
                 result = get_attack_module(mode_id).run_cycle(self.client)
         else:
             emit("cycle.idle", level="WARNING")
             result = "idle"
         emit("cycle.result", result=result, mode=self.store.live.active_mode)
+        coords = self.store.live.last_coords or "—"
+        mode_label = self.store.live.active_mode or "idle"
+        self.store.live.last_action = f"{mode_label} · {result} · {coords}"
         emit_state(self.store.live.to_dict())
         return result
 
@@ -289,8 +332,9 @@ class AttackBot:
             f"Режим: {engine_name} / {self.config.get('attack_style') or 'on_screen'}\n"
             f"DRY-RUN: {self.store.live.dry_run}\n"
             "Каденс: 8–10 сек от прошлой успешной отправки. "
-            "Бароны до таблички «нет свободных военачальников/наместников», "
-            "потом красный крестик (не нанимать за рубины) и ожидание возврата"
+            "Новые атаки пока не появится надпись «нет свободных военачальников», "
+            "потом красный крестик (не нанимать за рубины) и ожидание возврата. "
+            "Квота мира не останавливает бота — только Num0 / выкл."
         )
 
     def _ensure_engines(self) -> bool:
@@ -307,6 +351,18 @@ class AttackBot:
             return False
         if not self.client:
             self.client = BlueStacksEngine(self.config, self.store, self.telegram, self.adb)
+            from e4kbot.campaign_checkpoint import load_checkpoint, should_resume
+
+            payload = load_checkpoint()
+            if should_resume(payload):
+                restore_into_client(self.client, payload)
+            elif getattr(self.store.live, "active_mode", "") in {
+                "robber_barons",
+                "nomad_camps",
+                "samurai_camps",
+                "alien_castles",
+            }:
+                self.client._need_ge_home = True
         return True
 
     def _ensure_bluestacks(self) -> bool:
@@ -321,12 +377,15 @@ class AttackBot:
         return False
 
     def _on_control_change(self) -> None:
+        client = getattr(self, "client", None)
         if CONTROL.is_enabled():
             self._armed_for_report = True
+            apply_on_enable(self.store, client, config=getattr(self, "config", None))
             return
         if self.stop or not self._armed_for_report:
             return
         self._armed_for_report = False
+        mark_paused(self.store, client)
         self.report_user_stop_summary()
 
     def report_user_stop_summary(self) -> None:

@@ -94,7 +94,7 @@ DEFAULTS: dict[str, Any] = {
         "map_anchor": [0.50, 0.54],
         "map_coordinate_scale": [0.044, 0.044],
         "picker_timeout_seconds": 15,
-        "picker_max_actions": 4,
+        "picker_max_actions": 1,
         "minimum_flank_fill": 0.70,
         "map_scan_span": [0.30, 0.24],
         "map_scan_rings": 2,
@@ -103,6 +103,7 @@ DEFAULTS: dict[str, Any] = {
     },
     "control": {
         "hotkey": "NUM0",
+        "start_hotkey": "NUM1",
         "always_on_top": True,
         "start_paused": True,
     },

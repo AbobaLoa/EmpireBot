@@ -15,14 +15,14 @@ from e4kbot.control import CONTROL
 from e4kbot.paths import LAYOUTS_DIR, ROOT
 from e4kbot.runtime.live import emit
 from e4kbot.safety import (
-    commander_number_ok,
-    concurrent_ok,
     mark_successful_send,
     tap_jitter,
     wait_for_send_slot,
 )
 from e4kbot.state import StateStore
 from e4kbot.telegram_bot import TelegramReporter
+from e4kbot.world_switch import WorldSwitchMixin
+from e4kbot.worlds import is_world_npc_kind, world_hunt_hits_are_cluster
 from e4kbot.vision import (
     choose_movement,
     crop_rel,
@@ -42,9 +42,15 @@ from e4kbot.vision import (
     find_target_attack_button,
     find_travel_seal_pair,
     find_plaque_attack_button,
+    find_world_parchment_attack_button,
     find_parchment_title_close,
+    find_castle_name_hud_point,
+    find_home_sextant_button,
+    find_quit_dialog_no_button,
+    is_castle_home_banner,
     flank_fill_allowed,
     is_connection_error_dialog,
+    is_quit_game_dialog,
     is_formation_screen,
     is_burning_candidate,
     is_difficulty_dialog,
@@ -58,6 +64,7 @@ from e4kbot.vision import (
     is_no_commanders_parchment,
     is_offer_rail_point,
     is_overview_plaque,
+    is_ruby_plus_hud_point,
     is_ruby_shop,
     is_special_offers_screen,
     is_taxes_dialog,
@@ -144,7 +151,7 @@ def parse_march_seconds(text: str) -> int | None:
     return None
 
 
-class BlueStacksEngine:
+class BlueStacksEngine(WorldSwitchMixin):
     def __init__(
         self,
         config: dict[str, Any],
@@ -166,6 +173,11 @@ class BlueStacksEngine:
         self._nomad_recenter_next = False
         self._picker_stall_count = 0
         self._no_commanders_seen = False
+        self._world_scan = None
+        self._switched_world_id: str | None = None
+        self._need_ge_home = False
+        self._world_recenter_tries = 0
+        self._unopened_tries: dict[str, int] = {}
 
     _PICKER_STALL_REASONS = frozenset(
         {
@@ -229,8 +241,31 @@ class BlueStacksEngine:
             return
         self._tap_norm(nx, ny)
 
+    def _ruby_hud_close_allowed(self, nx: float, ny: float) -> bool:
+        """Title-bar X of special offers may sit near ruby HUD; map ruby/+ must never be tapped."""
+        if not is_ruby_plus_hud_point(nx, ny):
+            return True
+        try:
+            image = self._image()
+        except Exception:
+            logger.warning("Не жму рубины/+ ({:.3f}, {:.3f}) — нет скрина", nx, ny)
+            return False
+        if is_quit_game_dialog(image) or is_map_screen(image):
+            logger.warning("Не жму рубины/+ HUD ({:.3f}, {:.3f})", nx, ny)
+            return False
+        if not is_special_offers_screen(image):
+            logger.warning("Не жму рубины/+ HUD ({:.3f}, {:.3f})", nx, ny)
+            return False
+        close_x, close_y = special_offers_close_point(image)
+        if abs(nx - close_x) <= 0.06 and abs(ny - close_y) <= 0.10:
+            return True
+        logger.warning("Не жму рубины/+ HUD ({:.3f}, {:.3f})", nx, ny)
+        return False
+
     def _rail_guard_allows(self, nx: float, ny: float) -> bool:
         """Block the special-offers rail unless this is that overlay's red X or the footer."""
+        if not self._ruby_hud_close_allowed(nx, ny):
+            return False
         if ny >= 0.90:
             return True
         if not is_offer_rail_point(nx, ny):
@@ -286,9 +321,7 @@ class BlueStacksEngine:
             )
             self._tap_forced(close_x, close_y)
             CONTROL.sleep(0.35)
-        logger.info("Спецпредложение — Escape/Back, не магазин и не «Смотреть предложение»")
-        self.adb.key(4)
-        CONTROL.sleep(0.45)
+        logger.info("Спецпредложения — Escape/Back на карте не жму")
         return True
 
     def _dismiss_connection_error_if_open(self, image: Any | None = None) -> bool:
@@ -305,6 +338,23 @@ class BlueStacksEngine:
         logger.info("Ошибка соединения — жму «Соединить повторно» ({:.3f}, {:.3f})", point[0], point[1])
         self._tap_forced(*point)
         CONTROL.sleep(1.0)
+        return True
+
+    def _dismiss_quit_game_if_open(self, image: Any | None = None) -> bool:
+        """If «покинуть игру» is on screen, click НЕТ only — never ДА."""
+        try:
+            shot = image if image is not None else self._image()
+        except Exception:
+            return False
+        if not is_quit_game_dialog(shot):
+            return False
+        point = find_quit_dialog_no_button(shot)
+        if point[0] > 0.78:
+            logger.warning("НЕТ слева, не жму правую ДА ({:.3f}, {:.3f})", point[0], point[1])
+            point = (min(point[0], 0.68), point[1])
+        logger.info("Выход из игры — жму НЕТ ({:.3f}, {:.3f}), ДА не трогаю", point[0], point[1])
+        self._tap_forced(*point)
+        CONTROL.sleep(0.45)
         return True
 
     def _dismiss_reward_popups(self, image: Any | None = None) -> bool:
@@ -369,8 +419,8 @@ class BlueStacksEngine:
         CONTROL.sleep(0.45)
         latest = self._image()
         if is_ruby_shop(latest):
-            logger.info("Магазин рубинов ещё открыт — Back/Escape")
-            self.adb.key(4)
+            logger.info("Магазин рубинов ещё открыт — ещё раз стрелка, Escape на карте не жму")
+            self._tap_forced(0.070, 0.045)
             CONTROL.sleep(0.45)
         return True
 
@@ -400,17 +450,18 @@ class BlueStacksEngine:
             return False
         if not is_inbox_screen(shot):
             return False
-        logger.info("Почта открыта — закрываю Back, письма не удаляю")
-        self.adb.key(4)
-        CONTROL.sleep(0.45)
-        latest = self._image()
-        if is_inbox_screen(latest):
-            close = find_parchment_title_close(latest)
-            if close and close[0] < 0.90 and close[1] < 0.12:
-                self._tap_forced(*close)
-            else:
-                self.adb.key(4)
+        close = find_parchment_title_close(shot)
+        if close and close[0] < 0.90 and close[1] < 0.12:
+            logger.info("Почта открыта — закрываю крестик ({:.3f}, {:.3f})", close[0], close[1])
+            self._tap_forced(*close)
             CONTROL.sleep(0.45)
+        latest = self._image()
+        if is_inbox_screen(latest) and not is_map_screen(latest):
+            logger.info("Почта ещё открыта — ADB Back, Escape в окно не шлю")
+            self.adb.key(4)
+            CONTROL.sleep(0.45)
+        elif is_inbox_screen(latest) and is_map_screen(latest):
+            logger.info("Почта на карте без крестика — Back не жму, чтобы не выйти из игры")
         return True
 
     def _dismiss_blocking_menu_if_no_camps(self, image: Any | None = None) -> bool:
@@ -427,12 +478,16 @@ class BlueStacksEngine:
             return True
         if find_target_attack_button(shot) is not None:
             return False
-        if find_samurai_candidates(shot) or find_nomad_candidates(shot):
+        if (
+            find_samurai_candidates(shot)
+            or find_nomad_candidates(shot)
+            or find_robber_candidates(shot)
+        ):
             return False
         if self._dismiss_inbox_if_open(shot):
             return True
         close = find_parchment_title_close(shot)
-        if close and close[0] < 0.90 and close[1] < 0.12:
+        if close and close[0] < 0.90 and close[1] < 0.12 and not is_ruby_plus_hud_point(*close):
             logger.info(
                 "Меню поверх карты без лагерей — закрываю крестик ({:.3f}, {:.3f})",
                 close[0],
@@ -454,8 +509,11 @@ class BlueStacksEngine:
         if not is_taxes_dialog(shot):
             return False
         close = find_parchment_title_close(shot) or (0.823, 0.038)
-        if close[1] > 0.12 or close[0] >= 0.90:
+        if close[1] > 0.12 or close[0] >= 0.90 or is_ruby_plus_hud_point(*close):
             close = (0.823, 0.038)
+        if is_ruby_plus_hud_point(*close):
+            logger.warning("Налоги: крестик совпал с рубинами/+ — не жму")
+            return False
         logger.info("Закрываю налоги только крестиком ({:.3f}, {:.3f})", close[0], close[1])
         self._tap_forced(*close)
         CONTROL.sleep(0.4)
@@ -483,6 +541,8 @@ class BlueStacksEngine:
 
     def _dismiss_blocking_overlay(self) -> bool:
         """Close a recognized blocker. Never tap offer-rail shop/chest buttons."""
+        if self._dismiss_quit_game_if_open():
+            return True
         if self._dismiss_connection_error_if_open():
             return True
         if self._dismiss_ruby_shop_if_open():
@@ -529,7 +589,9 @@ class BlueStacksEngine:
         time.sleep(0.5)
 
     def _tap_forced(self, nx: float, ny: float) -> None:
-        """Click a known in-plan control (formation X). Skips shop-rail guard."""
+        """Click a known overlay control. Still never the map ruby/+ HUD."""
+        if not self._ruby_hud_close_allowed(nx, ny):
+            return
         size = self._size()
         x, y = _abs_point(size, [nx, ny])
         self.adb.tap(x, y, source_size=size)
@@ -545,6 +607,14 @@ class BlueStacksEngine:
             close = (self.layout.get("buttons") or {}).get("formation_close") or [0.94, 0.034]
             point = (float(close[0]), float(close[1]))
         logger.warning("Закрываю план атаки крестиком ({:.3f}, {:.3f})", point[0], point[1])
+        if is_ruby_plus_hud_point(*point):
+            parchment = find_parchment_title_close(image)
+            if parchment and not is_ruby_plus_hud_point(*parchment):
+                point = parchment
+                logger.warning("Крестик плана совпал с рубинами/+ — жму пергамент ({:.3f}, {:.3f})", point[0], point[1])
+            else:
+                logger.warning("Крестик плана совпал с рубинами/+ — не жму")
+                return False
         self._tap_forced(*point)
         CONTROL.sleep(0.6)
         return True
@@ -712,7 +782,11 @@ class BlueStacksEngine:
         )
         self._tap_norm_exact(*point)
         after = self._wait_for(
-            self._is_plain_formation,
+            lambda img: self._is_plain_formation(img)
+            or (
+                self._positive_unit_fill(observed_fill)
+                and find_formation_attack_button(img) is not None
+            ),
             timeout=self._vision_seconds("picker_confirm_timeout_seconds", 8),
             label="закрытие пикера",
         )
@@ -741,6 +815,35 @@ class BlueStacksEngine:
                 return True, "confirmed", latest
             save_shot(latest, "unit-picker-confirm-fill-not-retained.png")
             return False, "unit_picker_fill_not_retained", None
+        if self._positive_unit_fill(observed_fill):
+            if find_formation_attack_button(latest) is not None:
+                logger.info(
+                    "После галочки видна кнопка Нападение — пикер подтверждён, другого солдата не беру"
+                )
+                save_shot(latest, "unit-picker-confirm-after.png")
+                return True, "confirmed", latest
+            if leftover and leftover[1] > 0 and leftover[0] >= leftover[1]:
+                extra = self._picker_confirm_point(latest)
+                if extra is not None:
+                    logger.info(
+                        "После галочки пикер всё ещё {}/{} — повторно жму OK, карту солдата не меняю",
+                        leftover[0],
+                        leftover[1],
+                    )
+                    self._tap_norm_exact(*extra)
+                    after2 = self._wait_for(
+                        self._is_plain_formation,
+                        timeout=5,
+                        label="повтор галочки пикера",
+                    )
+                    latest = after2 if after2 is not None else self._image()
+                logger.info(
+                    "Пикер {}/{} после OK — считаю подтверждённым, другого солдата не выбираю",
+                    leftover[0],
+                    leftover[1],
+                )
+                save_shot(latest, "unit-picker-confirm-after.png")
+                return True, "confirmed", latest
         save_shot(latest, "unit-picker-confirm-transition-failed.png")
         return False, "unit_picker_confirm_transition_failed", None
 
@@ -940,6 +1043,8 @@ class BlueStacksEngine:
 
     def _recenter_on_main_castle(self, image: Any) -> Any:
         """Keep the hunt anchored on the account's MAIN castle, not the last target."""
+        if self._dismiss_quit_game_if_open(image):
+            image = self._image()
         main, viewport = self._read_map_coords(image)
         marker = find_main_castle_marker(image)
         if marker and 0.32 < marker[0] < 0.68 and 0.38 < marker[1] < 0.72:
@@ -967,6 +1072,8 @@ class BlueStacksEngine:
         except Exception:
             return False
         # Popups over the map are not «loading» — clear them first.
+        if self._dismiss_quit_game_if_open(image):
+            image = self._image()
         if self._dismiss_connection_error_if_open(image):
             image = self._image()
         if self._dismiss_special_offers_if_open(image):
@@ -1000,37 +1107,53 @@ class BlueStacksEngine:
         return True
 
     def _hunt_quota(self) -> int:
-        """How many unique targets to collect before attacking."""
+        """How many unique map marks to collect before attacking — not a commander cap."""
         kind = str((self.config or {}).get("current_target_kind") or "")
         if kind in {"samurai", "nomad"}:
             return 4
-        cfg = self.config or {}
-        for key in ("max_commanders", "commanders", "army_slots", "max_waves"):
-            value = cfg.get(key)
-            if value not in (None, "", 0):
-                return max(1, min(30, int(value)))
+        if is_world_npc_kind(kind):
+            return 5
         return DEFAULT_HUNT_BATCH
 
     def _await_world_map(self, timeout: float = 6.0) -> Any | None:
         """Wait for the kingdom map without ESC/formation_close after a successful plan."""
         image = self._image()
-        if is_map_screen(image) and (find_samurai_candidates(image) or find_nomad_candidates(image)):
+        if self._dismiss_quit_game_if_open(image):
+            CONTROL.sleep(0.3)
+            image = self._image()
+        if is_map_screen(image) and (
+            find_samurai_candidates(image)
+            or find_nomad_candidates(image)
+            or find_robber_candidates(image)
+        ):
             return image
         if self._dismiss_inbox_if_open(image):
             CONTROL.sleep(0.3)
             image = self._image()
-            if is_map_screen(image) and (find_samurai_candidates(image) or find_nomad_candidates(image)):
+            if is_map_screen(image) and (
+                find_samurai_candidates(image)
+                or find_nomad_candidates(image)
+                or find_robber_candidates(image)
+            ):
                 return image
         if self._dismiss_blocking_menu_if_no_camps(image):
             CONTROL.sleep(0.3)
             image = self._image()
-            if is_map_screen(image) and (find_samurai_candidates(image) or find_nomad_candidates(image)):
+            if is_map_screen(image) and (
+                find_samurai_candidates(image)
+                or find_nomad_candidates(image)
+                or find_robber_candidates(image)
+            ):
                 return image
         if is_map_screen(image):
             if self._dismiss_taxes_if_open(image) or self._dismiss_special_offers_if_open(image):
                 CONTROL.sleep(0.35)
                 image = self._image()
-            if is_map_screen(image) and (find_samurai_candidates(image) or find_nomad_candidates(image)):
+            if is_map_screen(image) and (
+                find_samurai_candidates(image)
+                or find_nomad_candidates(image)
+                or find_robber_candidates(image)
+            ):
                 return image
             if is_map_screen(image) and not is_taxes_dialog(image):
                 return image
@@ -1041,6 +1164,92 @@ class BlueStacksEngine:
             and not is_special_offers_screen(img),
             timeout=timeout,
         )
+
+    def _world_map_npc_point(self, point: tuple[float, float]) -> bool:
+        """Reject HUD / nav chrome that robber-template matching treats as towers."""
+        nx, ny = float(point[0]), float(point[1])
+        if ny > 0.70 or ny < 0.16:
+            return False
+        if nx < 0.12 or nx > 0.88:
+            return False
+        if is_ruby_plus_hud_point(nx, ny):
+            return False
+        return True
+
+    def _spread_world_hunt_targets(self, targets: list[HuntTarget]) -> list[HuntTarget]:
+        picked: list[HuntTarget] = []
+        for target in targets:
+            if any(
+                (target.point[0] - other.point[0]) ** 2
+                + (target.point[1] - other.point[1]) ** 2
+                < 0.05**2
+                for other in picked
+            ):
+                continue
+            picked.append(target)
+        picked.sort(
+            key=lambda item: (item.point[0] - 0.50) ** 2 + (item.point[1] - 0.54) ** 2,
+            reverse=True,
+        )
+        return picked
+
+    def _probe_world_npc_target(self, kind: str, target: HuntTarget) -> bool:
+        """Tap a map mark; keep it only if the plaque is this world's tower/fort."""
+        point = target.point
+        if not self._world_map_npc_point(point) or self._is_blocked_screen_target(point):
+            return False
+        logger.info("Пробую метку мира ({:.3f}, {:.3f})", point[0], point[1])
+        self._tap_norm(*point)
+        CONTROL.sleep(0.55)
+        image = self._image()
+        if is_travel_dialog(image) or self._picker_overlay_open(image):
+            logger.info("Проба мира открыла план — беру эту цель")
+            return True
+        if (
+            is_formation_screen(image)
+            and find_world_parchment_attack_button(image) is None
+            and not is_info_plaque(image)
+        ):
+            logger.info("Проба мира открыла план — беру эту цель")
+            return True
+        if is_overview_plaque(image):
+            logger.info("Проба мира: Обзор, не башня")
+            self._dismiss_overview_if_open(image)
+            self._block_screen_target(point)
+            return False
+        has_plaque = (
+            is_info_plaque(image)
+            or find_plaque_attack_button(image) is not None
+            or find_target_attack_button(image) is not None
+        )
+        if not has_plaque:
+            logger.info("Проба мира: таблички нет")
+            self._block_screen_target(point)
+            return False
+        if not self._world_target_title_ok(image, kind):
+            logger.info("Проба мира: не башня этого мира — закрываю")
+            self._dismiss_wrong_world_target(image)
+            self._block_screen_target(point)
+            return False
+        logger.info("Проба мира: табличка башни/форта совпала")
+        return True
+
+    def _pick_probed_world_target(self, kind: str, targets: list[HuntTarget]) -> HuntTarget | None:
+        if not targets:
+            return None
+        spread = self._spread_world_hunt_targets(targets)
+        if world_hunt_hits_are_cluster([item.point for item in spread], None):
+            logger.info(
+                "На экране {} меток одним комком — пробую одну, не всю пачку замков",
+                len(targets),
+            )
+            spread = spread[:1]
+        else:
+            spread = spread[:3]
+        for item in spread:
+            if self._probe_world_npc_target(kind, item):
+                return item
+        return None
 
     def _list_eligible_targets(
         self,
@@ -1059,7 +1268,8 @@ class BlueStacksEngine:
         else:
             threshold = float((self.config.get("vision") or {}).get("robber_threshold") or 0.65)
             candidates = find_robber_candidates(image, threshold)
-            skip_burning = False
+            # Snow/sand/lava false-triggers the baron "burning" filter.
+            skip_burning = is_world_npc_kind(kind)
         if not candidates:
             return []
         main, viewport = self._read_map_coords(image)
@@ -1073,6 +1283,8 @@ class BlueStacksEngine:
                 if not skip_burning and is_burning_candidate(image, point):
                     continue
                 if is_offer_rail_point(point[0], point[1]):
+                    continue
+                if is_world_npc_kind(kind) and not self._world_map_npc_point(point):
                     continue
                 if not include_blocked and self._is_blocked_screen_target(point):
                     continue
@@ -1099,6 +1311,8 @@ class BlueStacksEngine:
                 burning += 1
                 continue
             if is_offer_rail_point(point[0], point[1]):
+                continue
+            if is_world_npc_kind(kind) and not self._world_map_npc_point(point):
                 continue
             if not include_blocked and self._is_blocked_screen_target(point):
                 blocked += 1
@@ -1200,34 +1414,62 @@ class BlueStacksEngine:
         if self._dismiss_blocking_overlay() or self._dismiss_reward_popups(image):
             CONTROL.sleep(0.45)
             image = self._image()
-        image = self._recenter_on_main_castle(image)
-        if not is_map_screen(image) and self._dismiss_blocking_overlay():
-            CONTROL.sleep(0.4)
-            image = self._recenter_on_main_castle(self._image())
-        if ingest(image):
+        if not is_world_npc_kind(kind):
+            image = self._recenter_on_main_castle(image)
+            if not is_map_screen(image) and self._dismiss_blocking_overlay():
+                CONTROL.sleep(0.4)
+                image = self._recenter_on_main_castle(self._image())
+        if is_world_npc_kind(kind):
+            probed = self._pick_probed_world_target(
+                kind, self._list_eligible_targets(image, kind)
+            )
+            if probed is not None:
+                logger.info("Пачка охоты: проверенная башня/форт, скан дальше не нужен")
+                return [probed]
+        elif ingest(image):
             logger.info("Пачка охоты готова: {} целей, полный скан больше не нужен", len(found))
             return found
-        if found:
+        if found and not is_world_npc_kind(kind):
             logger.info(
-                "На экране у замка уже {} целей — бью их до скана остальной карты",
+                "На экране уже {} целей — бью их до скана остальной карты",
                 len(found),
             )
             return found
-        for attempt in range(2):
-            logger.info("У замка лагерей не видно — закрываю окна и центрирую ещё раз ({}/2)", attempt + 1)
-            self._dismiss_blocking_overlay()
-            CONTROL.sleep(0.4)
-            image = self._recenter_on_main_castle(self._image())
-            if ingest(image):
-                return found
-            if found:
-                logger.info("После повторного центра нашёл {} лагерей — карту не листаю", len(found))
-                return found
+        if not is_world_npc_kind(kind):
+            for attempt in range(2):
+                logger.info(
+                    "У замка лагерей не видно — закрываю окна и центрирую ещё раз ({}/2)",
+                    attempt + 1,
+                )
+                self._dismiss_blocking_overlay()
+                CONTROL.sleep(0.4)
+                image = self._recenter_on_main_castle(self._image())
+                if ingest(image):
+                    return found
+                if found:
+                    logger.info(
+                        "После повторного центра нашёл {} лагерей — карту не листаю",
+                        len(found),
+                    )
+                    return found
         for dx, dy in self._map_scan_offsets():
             logger.info("Скан карты: сдвиг ({:+.2f}, {:+.2f})", dx, dy)
             self._pan_map(dx, dy)
             CONTROL.sleep(0.25)
             image = self._image()
+            if is_world_npc_kind(kind):
+                self._blocked_screen_targets.clear()
+                probed = self._pick_probed_world_target(
+                    kind, self._list_eligible_targets(image, kind)
+                )
+                if probed is not None:
+                    logger.info(
+                        "Оставляю сдвиг карты, бью проверенную цель мира без возврата к замку GE"
+                    )
+                    return [probed]
+                self._pan_map(-dx, -dy)
+                CONTROL.sleep(0.15)
+                continue
             stop = ingest(image)
             self._pan_map(-dx, -dy)
             CONTROL.sleep(0.15)
@@ -1411,6 +1653,15 @@ class BlueStacksEngine:
                 )
                 return point
             logger.info("Видимых лагерей нет — не панорамирую и не открываю поиск")
+        elif is_world_npc_kind(kind):
+            point = target.point
+            if point and self._world_map_npc_point(point):
+                logger.info(
+                    "Жму цель мира ({:.3f}, {:.3f}) без центра главного замка GE",
+                    point[0],
+                    point[1],
+                )
+                return point
         else:
             recentered = self._recenter_on_main_castle(image)
             visible = self._match_visible_target(recentered, kind, target)
@@ -1596,10 +1847,29 @@ class BlueStacksEngine:
 
     def _open_formation(self, point: tuple[float, float], kind: str) -> bool:
         already = self._image()
-        if self._plan_or_picker_open(already):
+        if self._picker_overlay_open(already) or is_travel_dialog(already):
             logger.info("Планирование уже открыто — не закрываю и не жму карту")
             return True
-        self._tap_norm(*point)
+        world_attack = (
+            find_world_parchment_attack_button(already) if is_world_npc_kind(kind) else None
+        )
+        if (
+            self._plan_or_picker_open(already)
+            and world_attack is None
+            and not (is_world_npc_kind(kind) and is_info_plaque(already))
+        ):
+            logger.info("Планирование уже открыто — не закрываю и не жму карту")
+            return True
+        plaque_already = is_world_npc_kind(kind) and (
+            find_plaque_attack_button(already) is not None
+            or find_target_attack_button(already) is not None
+            or is_info_plaque(already)
+        )
+        if plaque_already:
+            logger.info("Табличка мира уже открыта — не жму метку повторно")
+            popup = already
+        else:
+            self._tap_norm(*point)
         if kind in {"samurai", "nomad"}:
             plaque_ready = lambda image: (
                 is_info_plaque(image)
@@ -1648,15 +1918,39 @@ class BlueStacksEngine:
                     self._tap_norm(*action)
                 return False
         else:
-            popup = self._wait_for(lambda image: find_target_attack_button(image) is not None, timeout=5)
+            popup = self._wait_for(
+                lambda image: (
+                    find_target_attack_button(image) is not None
+                    or find_plaque_attack_button(image) is not None
+                    or is_info_plaque(image)
+                    or is_formation_screen(image)
+                    or is_travel_dialog(image)
+                ),
+                timeout=5,
+                label="табличка мира",
+            )
             if popup is None:
                 blocked = self._image()
-                if self._plan_or_picker_open(blocked):
+                if self._plan_or_picker_open(blocked) and not is_info_plaque(blocked):
                     return True
                 action = popup_action(blocked)
                 if action:
                     logger.info("Цель перекрыта окном; закрываю его перед повтором")
                     self._tap_norm(*action)
+                return False
+            if self._plan_or_picker_open(popup) and not (
+                is_world_npc_kind(kind)
+                and (
+                    is_info_plaque(popup)
+                    or find_world_parchment_attack_button(popup) is not None
+                )
+            ):
+                return True
+        if is_world_npc_kind(kind) and popup is not None:
+            if not self._world_target_title_ok(popup, kind):
+                logger.info("Имя цели не совпало с башней/фортом этого мира — закрываю табличку")
+                self._dismiss_wrong_world_target(popup)
+                self._block_screen_target(point)
                 return False
         x_region = self.layout.get("regions", {}).get("viewport_x")
         y_region = self.layout.get("regions", {}).get("viewport_y")
@@ -1743,10 +2037,11 @@ class BlueStacksEngine:
                 )
         else:
             attack_point = find_target_attack_button(popup)
-        if attack_point is None:
-            return False
-        self._tap_norm(*attack_point)
-        time.sleep(0.8)
+        if not is_world_npc_kind(kind):
+            if attack_point is None:
+                return False
+            self._tap_norm(*attack_point)
+            time.sleep(0.8)
         if kind in {"samurai", "nomad"}:
             opened = self._wait_for(
                 lambda img: is_difficulty_dialog(img)
@@ -1793,6 +2088,58 @@ class BlueStacksEngine:
                 "Табличка лагеря есть, план не открылся — слепую точку start_attack_confirm не жму"
             )
             return False
+        if is_world_npc_kind(kind):
+            layout = (self.layout.get("buttons") or {}).get("start_attack_confirm") or [
+                0.765,
+                0.625,
+            ]
+            layout_pt = (float(layout[0]), float(layout[1]))
+            found = find_world_parchment_attack_button(popup)
+            if found is None:
+                raw = find_plaque_attack_button(popup) or find_target_attack_button(popup)
+                if raw is not None:
+                    logger.info(
+                        "Нападение мира: кнопка ({:.3f}, {:.3f}) не справа внизу, жму разметку",
+                        raw[0],
+                        raw[1],
+                    )
+                attack_point = layout_pt
+            else:
+                attack_point = found
+            logger.info("Нападение мира ({:.3f}, {:.3f})", attack_point[0], attack_point[1])
+            self._tap_norm(*attack_point)
+            opened = self._wait_for(
+                lambda img: is_formation_screen(img)
+                or is_no_commanders_parchment(img)
+                or is_travel_dialog(img),
+                timeout=8,
+                label="план мира",
+            )
+            shot = opened if opened is not None else self._image()
+            if self._dismiss_no_commanders(shot):
+                return False
+            if is_formation_screen(shot) or is_travel_dialog(shot):
+                return True
+            logger.info(
+                "План мира не открылся — ещё раз жму Нападение по разметке ({:.3f}, {:.3f})",
+                layout_pt[0],
+                layout_pt[1],
+            )
+            self._tap_norm(*layout_pt)
+            opened = self._wait_for(
+                lambda img: is_formation_screen(img)
+                or is_no_commanders_parchment(img)
+                or is_travel_dialog(img),
+                timeout=8,
+                label="повтор плана мира",
+            )
+            shot = opened if opened is not None else self._image()
+            if self._dismiss_no_commanders(shot):
+                return False
+            if is_formation_screen(shot) or is_travel_dialog(shot):
+                return True
+            logger.warning("Табличка мира есть, план не открылся — не жму слепую точку")
+            return False
         self.tap_rel("start_attack_confirm")
         opened = self._wait_for(
             lambda img: is_formation_screen(img)
@@ -1823,6 +2170,14 @@ class BlueStacksEngine:
         before = self._read_ratio_from_image(image, "picker_units")
         if not before or time.time() >= deadline:
             return False
+        if before[1] > 0 and before[0] >= before[1]:
+            logger.info(
+                "Пикер уже {}/{} — карту другого солдата не жму",
+                before[0],
+                before[1],
+            )
+            self._last_picker_fill = before
+            return True
         cards = [
             card
             for card in find_picker_cards(image)
@@ -1918,6 +2273,10 @@ class BlueStacksEngine:
                 self._tap_norm_exact(float(layout[0]), float(layout[1]))
             else:
                 self.tap_rel("picker_max")
+        if before and before[1] > 0 and before[0] >= before[1]:
+            self._last_picker_fill = before
+            logger.info("Пикер уже {}/{} — MAX нажат, другого солдата не беру", before[0], before[1])
+            return True
         deadline = time.time() + wait_seconds
         started = time.time()
         next_heartbeat = started + 2.0
@@ -1941,7 +2300,7 @@ class BlueStacksEngine:
                         return True
             if self._picker_confirm_point(shot) is not None:
                 cur, cap = self._assume_picker_capacity(shot, before)
-                if cur > 0:
+                if cur > 0 and cap > 0 and cur >= cap:
                     self._last_picker_fill = (cur, cap)
                     logger.info(
                         "Пикер: галочка видна после MAX — считаю {}/{}",
@@ -1949,6 +2308,14 @@ class BlueStacksEngine:
                         cap,
                     )
                     return True
+                if cur > 0:
+                    self._last_picker_fill = (cur, cap)
+                    logger.info(
+                        "Пикер: галочка при {}/{} — MAX не добрал, слот не полный",
+                        cur,
+                        cap,
+                    )
+                    return False
             if time.time() >= next_heartbeat:
                 logger.info("Пикер: жду MAX… ({:.0f}s)", time.time() - started)
                 next_heartbeat = time.time() + 2.0
@@ -1959,19 +2326,48 @@ class BlueStacksEngine:
 
     def _fill_picker_to_capacity(self) -> bool:
         """Select a unit row if empty, then MAX until current==capacity."""
-        if not self._positive_unit_fill(self._last_picker_fill):
+        live = self._read_ratio_from_image(self._image(), "picker_units")
+        if live and live[1] > 0 and live[0] >= live[1]:
+            self._last_picker_fill = live
+            logger.info(
+                "Пикер уже {}/{} — другого солдата не выбираю, только MAX/галочка",
+                live[0],
+                live[1],
+            )
+        elif not self._positive_unit_fill(self._last_picker_fill):
             self._select_best_picker_card()
         max_attempts = int((self.config.get("vision") or {}).get("picker_max_attempts") or 3)
         wait_seconds = self._vision_seconds("picker_fill_timeout_seconds", 10)
         for attempt in range(max(1, max_attempts)):
             if self._dump_picker_max():
                 return True
+            live = self._read_ratio_from_image(self._image(), "picker_units")
+            if live and live[1] > 0 and live[0] >= live[1]:
+                self._last_picker_fill = live
+                return True
             if not self._positive_unit_fill(self._last_picker_fill):
+                self._select_best_picker_card()
+            elif (
+                self._last_picker_fill
+                and self._last_picker_fill[1] > 0
+                and self._last_picker_fill[0] < self._last_picker_fill[1]
+            ):
+                logger.info(
+                    "Пикер {}/{} после MAX — меняю карту в той же ячейке, не открываю второго солдата",
+                    self._last_picker_fill[0],
+                    self._last_picker_fill[1],
+                )
                 self._select_best_picker_card()
             if attempt + 1 < max_attempts:
                 logger.info("MAX без заполнения — повтор {}/{}", attempt + 2, max_attempts)
                 CONTROL.sleep(0.35)
         if self._vision_fill_picker_fallback():
+            return True
+        live = self._read_ratio_from_image(self._image(), "picker_units")
+        if live and live[1] > 0 and live[0] >= live[1]:
+            self._last_picker_fill = live
+            return True
+        if self._positive_unit_fill(self._last_picker_fill) and self._last_picker_fill[0] >= self._last_picker_fill[1]:
             return True
         if not self._select_best_picker_card():
             return self._vision_fill_picker_fallback()
@@ -2002,17 +2398,65 @@ class BlueStacksEngine:
 
     def _prepare_single_center_wave(self) -> tuple[bool, str]:
         # Every attack, including the 4th+: cell → MAX → 10/10 → green check.
-        # Do not skip confirm because leftover OCR still looks like 10/10.
+        # After OK the formation stays confirmed — never pick a different soldier.
         last_reason = ""
         for sequence_attempt in range(2):
             self._dismiss_empty_wave_warning()
+            image = self._image()
+            overlay_open = self._picker_overlay_open(image)
+            picker_ratio = self._read_ratio_from_image(image, "picker_units")
+            formation_units = self._read_ratio_from_image(image, "formation_units")
+            picker_full = bool(
+                picker_ratio and picker_ratio[1] > 0 and picker_ratio[0] >= picker_ratio[1]
+            )
+            wave_assigned = bool(formation_units and formation_units[0] > 0)
             if sequence_attempt:
-                logger.warning("Пикер: повтор полной последовательности 2/2")
-                slot = self.layout.get("buttons", {}).get("unit_slot")
-                if slot:
-                    self._tap_norm_exact(float(slot[0]), float(slot[1]))
-                    CONTROL.sleep(0.5)
-            self._last_picker_fill = None
+                if picker_full or (not overlay_open and wave_assigned):
+                    logger.warning(
+                        "Пикер: повтор 2/2 не выбирает другого солдата — уже {}",
+                        picker_ratio or formation_units,
+                    )
+                    if overlay_open and picker_full:
+                        self._last_picker_fill = picker_ratio
+                    elif wave_assigned:
+                        self._last_picker_fill = formation_units
+                else:
+                    logger.warning("Пикер: повтор полной последовательности 2/2")
+                    if not overlay_open:
+                        slot = self.layout.get("buttons", {}).get("unit_slot")
+                        if slot:
+                            self._tap_norm_exact(float(slot[0]), float(slot[1]))
+                            CONTROL.sleep(0.5)
+                    if not self._positive_unit_fill(self._last_picker_fill):
+                        self._last_picker_fill = None
+            elif not overlay_open and wave_assigned:
+                full = bool(
+                    formation_units
+                    and formation_units[1] > 0
+                    and formation_units[0] >= formation_units[1]
+                )
+                if full:
+                    logger.info(
+                        "Волна уже {}/{} — пикер не открываю, иду в Нападение",
+                        formation_units[0],
+                        formation_units[1],
+                    )
+                    self._last_picker_fill = formation_units
+                else:
+                    logger.info(
+                        "Волна {}/{} не 100% — открою пикер добрать, другого солдата не выбираю",
+                        formation_units[0],
+                        formation_units[1],
+                    )
+                    slot = self.layout.get("buttons", {}).get("unit_slot")
+                    if slot:
+                        self._tap_norm_exact(float(slot[0]), float(slot[1]))
+                        CONTROL.sleep(0.5)
+                    self._last_picker_fill = formation_units
+            elif picker_full:
+                self._last_picker_fill = picker_ratio
+            else:
+                self._last_picker_fill = None
             ok, reason = self._prepare_single_center_wave_once()
             if ok:
                 return True, ""
@@ -2023,8 +2467,57 @@ class BlueStacksEngine:
 
     def _prepare_single_center_wave_once(self) -> tuple[bool, str]:
         formation = self._image()
-        max_actions = int((self.config.get("vision") or {}).get("picker_max_actions") or 4)
-        slot_keys = ("unit_slot", "unit_slot_second")[:max_actions]
+        if not self._picker_overlay_open(formation):
+            units = self._read_ratio_from_image(formation, "formation_units")
+            if units and units[1] > 0 and units[0] >= units[1]:
+                logger.info(
+                    "Формирование уже {}/{} — второй солдат не выбираю",
+                    units[0],
+                    units[1],
+                )
+                self._last_picker_fill = units
+                observed = units
+                final_units = units
+                final_tools = self._read_ratio_from_image(formation, "formation_tools")
+                if final_tools is None:
+                    final_tools = (0, 0)
+                if not final_units or final_units[1] <= 0:
+                    save_shot(formation, "formation-verification-failed.png")
+                    return False, "center_capacity_not_read"
+                if not final_tools or final_tools[0] != 0:
+                    save_shot(formation, "formation-verification-failed.png")
+                    return False, "tools_not_empty"
+                fill_ratio = final_units[0] / final_units[1]
+                kind = str(
+                    getattr(self, "_wave_kind", "")
+                    or (self.config or {}).get("current_target_kind")
+                    or ""
+                )
+                minimum = self._kind_min_fill(kind)
+                if not flank_fill_allowed(final_units[0], final_units[1], minimum):
+                    percentage = round(fill_ratio * 100)
+                    message = (
+                        f"Солдаты кончились: центральный фланг "
+                        f"{final_units[0]}/{final_units[1]} ({percentage}%)"
+                    )
+                    self.telegram.report_status(f"⚠️ {message}")
+                    self.store.live.last_error = message
+                    self.store.save()
+                    save_shot(formation, "formation-verification-failed.png")
+                    return False, "soldiers_depleted"
+                logger.info(
+                    f"Центральный фланг: {final_units[0]}/{final_units[1]} "
+                    f"({fill_ratio:.0%}), орудия 0"
+                )
+                return True, ""
+            if units and units[0] > 0:
+                logger.info(
+                    "Формирование {}/{} неполное — открываю пикер добрать, другого солдата не выбираю",
+                    units[0],
+                    units[1],
+                )
+                self._last_picker_fill = units
+        slot_keys = ("unit_slot",)
         for slot_key in slot_keys:
             picker, reason = self._open_unit_picker(slot_key)
             if picker is None:
@@ -2043,24 +2536,40 @@ class BlueStacksEngine:
                 click=True,
                 observed_fill=self._last_picker_fill,
             )
-            if not confirmed or formation is None:
-                return False, reason
-            units = self._read_ratio_from_image(formation, "formation_units")
-            if units and units[0] == units[1] and units[1] > 0:
+            if confirmed and formation is not None:
                 break
-            if units is None and self._positive_unit_fill(self._last_picker_fill):
+            latest = self._image()
+            picker_closed = not self._picker_overlay_open(latest)
+            if self._positive_unit_fill(self._last_picker_fill) and picker_closed:
+                logger.info(
+                    "OK закрыл пикер при {}/{} — другого солдата не выбираю, иду в Нападение",
+                    self._last_picker_fill[0],
+                    self._last_picker_fill[1],
+                )
+                formation = latest
                 break
+            return False, reason
         observed = self._last_picker_fill
         final_units = self._read_ratio_from_image(formation, "formation_units")
         if final_units is not None and final_units[0] <= 0:
-            save_shot(formation, "formation-units-empty.png")
-            logger.warning(
-                "Формирование {}/{} после пикера {} — Нападение не жму",
-                final_units[0],
-                final_units[1],
-                observed,
-            )
-            return False, "formation_units_empty"
+            if self._positive_unit_fill(observed):
+                logger.info(
+                    "OCR формирования {}/{} после пикера {}/{} — беру заполнение пикера, Нападение",
+                    final_units[0],
+                    final_units[1],
+                    observed[0],
+                    observed[1],
+                )
+                final_units = observed
+            else:
+                save_shot(formation, "formation-units-empty.png")
+                logger.warning(
+                    "Формирование {}/{} после пикера {} — Нападение не жму",
+                    final_units[0],
+                    final_units[1],
+                    observed,
+                )
+                return False, "formation_units_empty"
         if self._positive_unit_fill(observed) and not final_units:
             logger.info(
                 "OCR формирования пуст после {}/{}; беру заполнение пикера",
@@ -2078,7 +2587,8 @@ class BlueStacksEngine:
             save_shot(formation, "formation-verification-failed.png")
             return False, "tools_not_empty"
         fill_ratio = final_units[0] / final_units[1]
-        minimum = float((self.config.get("vision") or {}).get("minimum_flank_fill") or 0.70)
+        kind = str(getattr(self, "_wave_kind", "") or (self.config or {}).get("current_target_kind") or "")
+        minimum = self._kind_min_fill(kind)
         if not flank_fill_allowed(final_units[0], final_units[1], minimum):
             percentage = round(fill_ratio * 100)
             message = (
@@ -2113,6 +2623,70 @@ class BlueStacksEngine:
                 self._tap_norm_exact(float(close[0]), float(close[1]))
                 CONTROL.sleep(0.8)
 
+    def _return_home_via_castle_hud(self) -> bool:
+        """After a baron send: top-center castle name → LEFT green wooden home. Never ruby/+ or right castle."""
+        if not getattr(self, "adb", None):
+            return False
+        try:
+            image = self._image()
+        except Exception:
+            return False
+        if self._dismiss_quit_game_if_open(image):
+            image = self._image()
+        if self._plan_or_picker_open(image) or is_travel_dialog(image) or is_formation_screen(image):
+            image = self._await_world_map(timeout=6) or image
+        try:
+            if self._plan_or_picker_open(image) or is_travel_dialog(image) or is_formation_screen(image):
+                logger.info("Домой через шапку — жду карту, план не закрываю")
+                return False
+        except Exception:
+            return False
+        if not is_castle_home_banner(image):
+            name = find_castle_name_hud_point(image)
+            if name is None:
+                name = (0.52, 0.028)
+            if is_ruby_plus_hud_point(*name) or name[0] >= 0.78:
+                name = (0.50, 0.028)
+            logger.info(
+                "После атаки — жму название замка в шапке ({:.3f}, {:.3f})",
+                name[0],
+                name[1],
+            )
+            self._tap_norm_exact(*name)
+            CONTROL.sleep(0.5)
+            image = self._image()
+            if self._dismiss_quit_game_if_open(image):
+                image = self._image()
+        home = find_home_sextant_button(image)
+        if home is None:
+            home = (0.32, 0.145)
+        if home[0] >= 0.50:
+            logger.warning(
+                "Правую иконку замка не жму ({:.3f}, {:.3f}) — беру левую кнопку домой",
+                home[0],
+                home[1],
+            )
+            home = (0.32, home[1] if home[1] < 0.28 else 0.145)
+        if is_ruby_plus_hud_point(*home):
+            logger.warning("Не жму рубины/+ вместо кнопки домой")
+            return False
+        logger.info(
+            "Жму левую зелёную кнопку домой ({:.3f}, {:.3f}), правый замок не трогаю",
+            home[0],
+            home[1],
+        )
+        self._tap_norm_exact(*home)
+        CONTROL.sleep(0.55)
+        self._dismiss_quit_game_if_open()
+        self._hunt_queue = []
+        self._blocked_screen_targets = []
+        logger.info("Дома — следующая охота с ближайшей небитой цели")
+        return True
+
+    def _home_after_send(self, kind: str, result: str) -> None:
+        if result == kind and (kind == "baron" or is_world_npc_kind(kind)):
+            self._return_home_via_castle_hud()
+
     def _read_ratio_from_image(self, image: Any, key: str) -> tuple[int, int] | None:
         region = self.layout.get("regions", {}).get(key)
         return parse_ratio(ocr_text(crop_rel(image, region))) if region else None
@@ -2143,6 +2717,28 @@ class BlueStacksEngine:
             self._hunt_queue = []
         if getattr(self, "_blocked_screen_targets", None) is None:
             self._blocked_screen_targets = []
+        try:
+            already = self._image()
+        except Exception:
+            already = None
+        if already is not None and self._plan_or_picker_open(already):
+            if getattr(self, "_need_ge_home", False):
+                logger.info(
+                    "Набор армии открыт, но старт с Великой империи — закрываю старый план и иду в империю"
+                )
+                self.close_formation_plan()
+            else:
+                logger.info(
+                    "Экран планирования уже открыт — не закрываю и не меняю мир, продолжаю набор/Нападение"
+                )
+                result = self._execute_formation_attack(kind, (0.50, 0.50))
+                self._home_after_send(kind, result)
+                return result
+        switched = self._ensure_world(kind)
+        if switched != "ok":
+            if is_world_npc_kind(kind) or kind == "baron":
+                logger.warning("Переход в мир не удался: {}", switched)
+                return switched
         current = self._image()
         if self._dismiss_no_commanders(current):
             return "no_commanders"
@@ -2152,14 +2748,24 @@ class BlueStacksEngine:
             logger.info(
                 "Экран планирования уже открыт — не закрываю, продолжаю набор/Нападение"
             )
-            return self._execute_formation_attack(kind, (0.50, 0.50))
+            result = self._execute_formation_attack(kind, (0.50, 0.50))
+            self._home_after_send(kind, result)
+            return result
+        self._dismiss_quit_game_if_open(current)
         self._dismiss_special_offers_if_open(current)
         if not self._hunt_queue:
             self._blocked_screen_targets.clear()
             self._hunt_queue = self._collect_hunt_batch(kind)
+            if not self._hunt_queue and is_world_npc_kind(kind):
+                tries = int(getattr(self, "_world_recenter_tries", 0) or 0)
+                if tries < 3:
+                    self._world_recenter_tries = tries + 1
+                    if self._recenter_current_world_via_nav(kind):
+                        self._hunt_queue = self._collect_hunt_batch(kind)
             if not self._hunt_queue:
-                logger.info("На карте нет доступных замков разбойников")
+                logger.info("На карте нет доступных целей этого мира")
                 return "no_targets"
+            self._world_recenter_tries = 0
             logger.info(
                 "Охота закончена: {} целей, дальше бью по списку без повторного скана",
                 len(self._hunt_queue),
@@ -2170,7 +2776,10 @@ class BlueStacksEngine:
                 logger.info(
                     "Экран планирования уже открыт — не закрываю, продолжаю набор/Нападение"
                 )
-                return self._execute_formation_attack(kind, (0.50, 0.50))
+                result = self._execute_formation_attack(kind, (0.50, 0.50))
+                self._home_after_send(kind, result)
+                return result
+            self._dismiss_quit_game_if_open(current)
             self._dismiss_special_offers_if_open(current)
             target = self._hunt_queue.pop(0)
             point = self._focus_hunt_target(kind, target)
@@ -2200,6 +2809,9 @@ class BlueStacksEngine:
                     time.sleep(0.8)
                     point = self._focus_hunt_target(kind, target) or point
                     continue
+                if is_world_npc_kind(kind):
+                    logger.info("Цель мира не дала план — следующая из пачки без трёх повторов")
+                    break
                 action = popup_action(blocked)
                 if action:
                     self._tap_norm(*action)
@@ -2210,7 +2822,13 @@ class BlueStacksEngine:
                     "Не открылся экран формирования — беру следующую цель из пачки"
                 )
                 continue
-            return self._execute_formation_attack(kind, point)
+            result = self._execute_formation_attack(kind, point)
+            self._home_after_send(kind, result)
+            return result
+        if is_world_npc_kind(kind) and int(getattr(self, "_world_recenter_tries", 0) or 0) < 3:
+            self._world_recenter_tries = int(getattr(self, "_world_recenter_tries", 0) or 0) + 1
+            if self._recenter_current_world_via_nav(kind):
+                return self.on_screen_attack(kind)
         return "no_targets"
 
     def _tap_formation_attack(self) -> None:
@@ -2225,8 +2843,13 @@ class BlueStacksEngine:
     def _execute_formation_attack(self, kind: str, point: tuple[float, float]) -> str:
         self._dismiss_empty_wave_warning()
         self._last_picker_fill = None
-        ok, reason = self._prepare_single_center_wave()
+        if is_world_npc_kind(kind):
+            ok, reason = self._prepare_waves_for_kind(kind)
+        else:
+            ok, reason = self._prepare_single_center_wave()
         if not ok:
+            if is_world_npc_kind(kind):
+                return self._handle_world_fill_failure(kind, reason)
             self.store.live.last_error = reason
             self.store.save()
             if reason in self._PICKER_STALL_REASONS:
@@ -2322,12 +2945,6 @@ class BlueStacksEngine:
         commander_no = parse_commander_number(self.read_region("commander_number"))
         if commander_no is None:
             commander_no = self._next_commander
-        ok_cmd, cmd_msg = commander_number_ok(commander_no, self.config)
-        if not ok_cmd:
-            self.store.live.stopped_reason = cmd_msg
-            self.telegram.report_stop(cmd_msg)
-            self._dismiss_blocking_overlay()
-            return "stop"
         self._next_commander = int(commander_no) + 1
         one_way = one_way or parse_march_seconds(self.read_region("march_time"))
         if one_way is None:
@@ -2416,17 +3033,12 @@ class BlueStacksEngine:
                 return "no_targets"
             sent = 0
             for target in rows:
-                if not concurrent_ok(len(self.store.in_flight()), self.config)[0]:
-                    return "wait_return"
                 result = self.search_and_attack(kind, target)
                 if result == "stop":
                     return "stop"
                 sent += 1
             return f"client:{sent}"
 
-        if not concurrent_ok(len(self.store.in_flight()), self.config)[0]:
-            emit("attack.cycle.end", result="wait_return", kind=kind)
-            return "wait_return"
         result = self.on_screen_attack(kind)
         if result == "stop":
             emit("attack.cycle.end", result="stop", kind=kind, error=self.store.live.stopped_reason)

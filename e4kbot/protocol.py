@@ -9,8 +9,6 @@ from e4kbot.bluestacks import AdbClient, capture_game_image, save_shot
 from e4kbot.config import enabled_account, load_config, server_endpoint
 from e4kbot.paths import add_legacy_bot_path
 from e4kbot.safety import (
-    commander_number_ok,
-    concurrent_ok,
     mark_successful_send,
     wait_for_send_slot,
 )
@@ -109,6 +107,9 @@ class ProtocolEngine:
     def run_cycle(self) -> str:
         from fleet.event_intel import EventKind, detect_primary_event
 
+        from e4kbot.runtime.scheduler import sync_legacy_modes
+
+        sync_legacy_modes(self.config)
         modes = self.config.get("modes") or {}
         event = None
         try:
@@ -159,7 +160,6 @@ class ProtocolEngine:
         assert self.socket is not None
         account = self.store.live.account
         dry_run = bool(self.config.get("dry_run", True))
-        cap_cmd = int(self.config.get("max_commander_number") or 30)
         gcl = self.socket.get_castles(quiet=True)
         source = _main_castle_from_gcl(gcl, kingdom)
         if not source:
@@ -170,7 +170,7 @@ class ProtocolEngine:
 
         self.socket.go_to_castle(kingdom, int(source["castle_id"]), quiet=True)
         lords_data = payload_data(self.socket.get_lords(quiet=True))
-        slot_cap = min(extract_commander_slot_cap(lords_data), cap_cmd)
+        slot_cap = extract_commander_slot_cap(lords_data)
         bet_level = extract_bet_level(lords_data)
         movement_wrappers = fetch_movement_wrappers(self.socket)
         lords, meta = _available_attack_lords(
@@ -183,29 +183,12 @@ class ProtocolEngine:
         attack_sources = _attack_sources_for_lords(
             lords, movement_wrappers, self.player_id, source
         )
-        in_flight = len(self.store.in_flight())
-        ok_conc, conc_msg = concurrent_ok(in_flight, self.config)
-        if not ok_conc:
-            logger.info(conc_msg)
-            return "wait_return"
-
         sent = 0
         for entry in attack_sources:
             self.store.prune()
-            in_flight = len(self.store.in_flight())
-            ok_conc, conc_msg = concurrent_ok(in_flight, self.config)
-            if not ok_conc:
-                logger.info(conc_msg)
-                break
-
             lord = entry["lord"]
             row_source = entry["source"]
             commander_no = commander_slot_number(lord, lords_data)
-            ok_cmd, cmd_msg = commander_number_ok(commander_no, self.config)
-            if not ok_cmd:
-                self.store.live.stopped_reason = cmd_msg
-                self.telegram.report_stop(cmd_msg)
-                return "stop"
             if commander_no is None:
                 logger.warning("Не удалось определить номер военачальника — пропуск")
                 continue

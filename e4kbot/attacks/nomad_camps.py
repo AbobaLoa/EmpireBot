@@ -8,7 +8,6 @@ from loguru import logger
 
 from e4kbot.bluestacks import save_shot
 from e4kbot.control import CONTROL
-from e4kbot.safety import concurrent_ok
 from e4kbot.client import HuntTarget
 from e4kbot.vision import (
     NOMAD_TEMPLATE,
@@ -85,9 +84,6 @@ class NomadCampsModule:
         logger.info("Кочевники: цикл охоты, пресет={}", self._preset_ready)
         if bool(driver.config.get("nomad_preset_ready")):
             self._preset_ready = True
-        ok, _ = concurrent_ok(len(driver.store.in_flight()), driver.config)
-        if not ok:
-            return "wait_return"
         if driver.wait_out_loading():
             return "map_loading"
         sent = int((driver.store.live.session_by_mode or {}).get(self.spec_id) or 0)
@@ -129,7 +125,8 @@ class NomadCampsModule:
         if not driver._hunt_queue:
             driver._hunt_queue = driver._collect_hunt_batch("nomad")[:NOMAD_MAP_CAP]
             if not driver._hunt_queue:
-                logger.info("На карте нет лагерей кочевников")
+                logger.warning("Вторжение кочевников не на карте — пропускаю, следующий включённый приоритет")
+                driver.store.skip_mode(self.spec_id)
                 return "no_targets"
             logger.info("Кочевники: {} лагерей рядом, дальше по списку", len(driver._hunt_queue))
             if not self._difficulty_chosen_by_bot:
@@ -463,10 +460,6 @@ class NomadCampsModule:
     def _attack_next_camp_now(self, driver: Any) -> str | None:
         """After 11 hits, open the next queued camp immediately. One follow-up per cycle."""
         if getattr(self, "_following_next_camp", False):
-            return None
-        ok, _ = concurrent_ok(len(driver.store.in_flight()), driver.config)
-        if not ok:
-            logger.info("Следующий лагерь подождёт свободного военачальника")
             return None
         self._following_next_camp = True
         try:
@@ -1015,8 +1008,10 @@ class NomadCampsModule:
             close = find_red_cross_force(report, title_bar_only=True) or find_red_cross_force(report)
             if close and close[1] < 0.18:
                 driver._tap_forced(*close)
-            else:
+            elif not is_map_screen(report):
                 driver.adb.key(4)
+            else:
+                logger.warning("Отчёт: крестик не найден, Back на карте не жму")
             CONTROL.sleep(0.45)
         driver._dismiss_inbox_if_open()
         return totals

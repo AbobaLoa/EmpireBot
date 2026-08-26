@@ -1,25 +1,12 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![windows_subsystem = "windows"]
 
-use serde_json::Value;
-use std::io::{BufRead, BufReader, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::Mutex;
-use tauri::{AppHandle, Emitter, State};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
-struct Engine {
-    child: Mutex<Option<Child>>,
-    stdin: Mutex<Option<ChildStdin>>,
-}
-
-impl Default for Engine {
-    fn default() -> Self {
-        Self {
-            child: Mutex::new(None),
-            stdin: Mutex::new(None),
-        }
-    }
-}
+const PANEL_PORT: u16 = 8766;
+const PANEL_URL: &str = "http://127.0.0.1:8766/";
 
 fn repo_root() -> PathBuf {
     let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -29,103 +16,110 @@ fn repo_root() -> PathBuf {
 }
 
 fn python_bin(root: &PathBuf) -> PathBuf {
+    let venv = root.join(".venv").join("Scripts").join("pythonw.exe");
+    if venv.exists() {
+        return venv;
+    }
     let venv = root.join(".venv").join("Scripts").join("python.exe");
     if venv.exists() {
         venv
     } else {
-        PathBuf::from("python")
+        PathBuf::from("pythonw")
     }
 }
 
-#[tauri::command]
-fn engine_root() -> String {
-    repo_root().display().to_string()
+fn panel_listening() -> bool {
+    TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], PANEL_PORT)),
+        Duration::from_millis(250),
+    )
+    .is_ok()
 }
 
-#[tauri::command]
-fn start_engine(app: AppHandle, engine: State<Engine>) -> Result<String, String> {
-    let mut child_guard = engine.child.lock().map_err(|e| e.to_string())?;
-    if let Some(child) = child_guard.as_mut() {
-        if child.try_wait().map_err(|e| e.to_string())?.is_none() {
-            return Ok("already-running".into());
-        }
+fn pid_running(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
     }
-    let root = repo_root();
-    let python = python_bin(&root);
-    let mut child = Command::new(python)
-        .current_dir(&root)
-        .args(["-u", "run.py", "worker"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+    let output = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output();
+    match output {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).contains(&pid.to_string()),
+        Err(_) => false,
+    }
+}
+
+fn live_bot_pid(root: &PathBuf) -> Option<u32> {
+    let lock = root.join("data").join("bot.lock");
+    let text = std::fs::read_to_string(lock).ok()?;
+    let pid: u32 = text.trim().parse().ok()?;
+    if pid_running(pid) {
+        Some(pid)
+    } else {
+        None
+    }
+}
+
+fn spawn_backend(root: &PathBuf) -> Result<&'static str, String> {
+    if panel_listening() {
+        return Ok("attached");
+    }
+    if let Some(_pid) = live_bot_pid(root) {
+        return Ok("waiting-existing-bot");
+    }
+    let python = python_bin(root);
+    let mut cmd = Command::new(&python);
+    cmd.current_dir(root)
+        .args(["-u", "run.py", "--no-panel"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+    let _child = cmd
         .spawn()
-        .map_err(|e| format!("Не удалось запустить Python-движок: {e}"))?;
-    let stdout = child.stdout.take().ok_or("нет stdout")?;
-    let stderr = child.stderr.take().ok_or("нет stderr")?;
-    let stdin = child.stdin.take().ok_or("нет stdin")?;
-    let app_out = app.clone();
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().flatten() {
-            let _ = app_out.emit("engine-line", line);
+        .map_err(|e| format!("Не удалось запустить FastAPI-панель: {e}"))?;
+    Ok("started-paused")
+}
+
+fn wait_for_panel(timeout: Duration) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if panel_listening() {
+            return true;
         }
-        let _ = app_out.emit(
-            "engine-line",
-            r#"{"type":"log","event":"worker.stdout_closed","level":"WARNING"}"#,
-        );
-    });
-    let app_err = app.clone();
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines().flatten() {
-            let payload = serde_json::json!({
-                "type": "log",
-                "event": "python.stderr",
-                "level": "DEBUG",
-                "message": line,
-            });
-            let _ = app_err.emit("engine-line", payload.to_string());
-        }
-    });
-    *engine.stdin.lock().map_err(|e| e.to_string())? = Some(stdin);
-    *child_guard = Some(child);
-    Ok("started".into())
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    false
 }
 
 #[tauri::command]
-fn send_engine_cmd(engine: State<Engine>, command: Value) -> Result<(), String> {
-    let mut stdin = engine.stdin.lock().map_err(|e| e.to_string())?;
-    let handle = stdin.as_mut().ok_or("движок не запущен")?;
-    writeln!(handle, "{command}").map_err(|e| e.to_string())?;
-    handle.flush().map_err(|e| e.to_string())
+fn panel_url() -> String {
+    PANEL_URL.to_string()
 }
 
 #[tauri::command]
-fn stop_engine(engine: State<Engine>) -> Result<(), String> {
-    if let Ok(mut stdin) = engine.stdin.lock() {
-        if let Some(handle) = stdin.as_mut() {
-            let _ = writeln!(handle, r#"{{"cmd":"stop"}}"#);
-            let _ = handle.flush();
-        }
-        *stdin = None;
+fn ensure_panel() -> Result<String, String> {
+    let root = repo_root();
+    if panel_listening() {
+        return Ok("attached".into());
     }
-    if let Ok(mut child) = engine.child.lock() {
-        if let Some(mut proc) = child.take() {
-            let _ = proc.kill();
-        }
+    let status = spawn_backend(&root)?;
+    if wait_for_panel(Duration::from_secs(45)) {
+        return Ok(status.into());
     }
-    Ok(())
+    Err("Панель FastAPI не поднялась на 127.0.0.1:8766".into())
 }
 
 fn main() {
     tauri::Builder::default()
-        .manage(Engine::default())
-        .invoke_handler(tauri::generate_handler![
-            engine_root,
-            start_engine,
-            send_engine_cmd,
-            stop_engine
-        ])
+        .invoke_handler(tauri::generate_handler![ensure_panel, panel_url])
         .run(tauri::generate_context!())
         .expect("error while running EmpireBot desktop");
 }

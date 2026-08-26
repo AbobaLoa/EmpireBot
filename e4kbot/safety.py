@@ -113,18 +113,10 @@ def wait_active_hours(config: dict[str, Any]) -> None:
 
 
 def commander_number_ok(number: int | None, config: dict[str, Any]) -> tuple[bool, str]:
-    if number is None:
-        return True, ""
-    cap = int(config.get("max_commander_number") or MAX_COMMANDER_NUMBER)
-    if int(number) > cap:
-        return False, (
-            f"Номер военачальника {number} > {cap}. Атаки остановлены."
-        )
+    """Never stop on a numeric commander index. Only the in-game inscription stops sends."""
     return True, ""
 
 
 def concurrent_ok(in_flight: int, config: dict[str, Any]) -> tuple[bool, str]:
-    cap = int(config.get("max_concurrent_attacks") or MAX_CONCURRENT_ATTACKS)
-    if in_flight >= cap:
-        return False, f"Уже {in_flight} атак в пути (лимит {cap})"
+    """Never stop on an in-flight count. Keep sending until the no-commanders parchment."""
     return True, ""

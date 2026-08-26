@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 from e4kbot.attacks.base import AttackModule, StubAttackModule
+from e4kbot.attacks.kingdom_npcs import (
+    BarbarianTowersModule,
+    CultistTowersModule,
+    DesertTowersModule,
+    StormFortsModule,
+)
 from e4kbot.attacks.nomad_camps import NomadCampsModule
 from e4kbot.attacks.robber_barons import RobberBaronsModule
 from e4kbot.attacks.samurai_camps import SamuraiCampsModule
@@ -8,6 +14,10 @@ from e4kbot.modes.catalog import MODES
 
 _LIVE = {
     "robber_barons": RobberBaronsModule,
+    "barbarian_towers": BarbarianTowersModule,
+    "desert_towers": DesertTowersModule,
+    "cultist_towers": CultistTowersModule,
+    "storm_forts": StormFortsModule,
     "nomad_camps": NomadCampsModule,
     "samurai_camps": SamuraiCampsModule,
 }

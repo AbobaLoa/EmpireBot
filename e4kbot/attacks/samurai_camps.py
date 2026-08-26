@@ -7,7 +7,6 @@ from loguru import logger
 
 from e4kbot.bluestacks import save_shot
 from e4kbot.control import CONTROL
-from e4kbot.safety import concurrent_ok
 from e4kbot.client import HuntTarget
 from e4kbot.vision import (
     crop_rel,
@@ -79,9 +78,6 @@ class SamuraiCampsModule:
         if bool(driver.config.get("samurai_preset_ready")):
             self._preset_ready = True
             self._chosen_tool_percent = 3
-        ok, _ = concurrent_ok(len(driver.store.in_flight()), driver.config)
-        if not ok:
-            return "wait_return"
         if driver.wait_out_loading():
             return "map_loading"
         sent = int((driver.store.live.session_by_mode or {}).get(self.spec_id) or 0)
@@ -115,7 +111,8 @@ class SamuraiCampsModule:
             driver._blocked_screen_targets.clear()
             driver._hunt_queue = driver._collect_hunt_batch("samurai")[:SAMURAI_MAP_CAP]
             if not driver._hunt_queue:
-                logger.info("На карте нет лагерей самураев")
+                logger.warning("Нашествие самураев не на карте — пропускаю, следующий включённый приоритет")
+                driver.store.skip_mode(self.spec_id)
                 return "no_targets"
             logger.info("Самураи: {} лагерей рядом, дальше по списку", len(driver._hunt_queue))
             if not self._difficulty_chosen_by_bot:

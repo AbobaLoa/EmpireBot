@@ -19,10 +19,15 @@ from e4kbot.vision import (
     find_robber_candidates,
     find_picker_confirm_button,
     find_empty_wave_warning_confirm,
+    find_home_sextant_button,
+    find_quit_dialog_no_button,
     flank_fill_allowed,
     is_burning_candidate,
     is_green_hire_point,
+    is_map_screen,
     is_offer_rail_point,
+    is_quit_game_dialog,
+    is_ruby_plus_hud_point,
     is_special_offers_screen,
     movement_confirm_diagnostics,
     no_commanders_diagnostics,
@@ -151,6 +156,8 @@ class VisionTests(unittest.TestCase):
         )
         self.assertIn("наместников", namestnik)
         self.assertFalse(_no_commanders_text_hit("Начать нападение?"))
+        self.assertTrue(_no_commanders_text_hit("У тебя военачальников больше нет."))
+        self.assertFalse(_no_commanders_text_hit("В пути 30 атак"))
         live_garbled = (
             "Buumanne! Cenuyac y Te6A HET CBOOOQHbIX BOCHAYAIbHUKOB. "
             "XOYELUb HaHATb PeSe€pBHOIO BOeEHAYaNIbHUKa OA 3TOFO HanageHuna? LleHa: 125"
@@ -501,6 +508,7 @@ class VisionTests(unittest.TestCase):
         self.assertEqual(engine.adb.tap.call_count, 1)
         self.assertEqual(engine.adb.tap.call_args.args[0], 837)
         self.assertEqual(engine.adb.tap.call_args.args[1], 64)
+        engine.adb.key.assert_not_called()
 
     def test_search_button_is_never_tapped(self) -> None:
         engine = BlueStacksEngine.__new__(BlueStacksEngine)
@@ -541,14 +549,14 @@ class VisionTests(unittest.TestCase):
 
 
 class HuntTests(unittest.TestCase):
-    def test_hunt_quota_defaults_to_ten_commanders(self) -> None:
+    def test_hunt_quota_is_map_batch_not_commander_cap(self) -> None:
         engine = BlueStacksEngine.__new__(BlueStacksEngine)
         engine.config = {}
         self.assertEqual(engine._hunt_quota(), 10)
-        engine.config = {"max_commanders": 10}
+        engine.config = {"max_commanders": 30, "army_slots": 7, "max_commander_number": 30}
         self.assertEqual(engine._hunt_quota(), 10)
-        engine.config = {"army_slots": 7}
-        self.assertEqual(engine._hunt_quota(), 7)
+        engine.config = {"current_target_kind": "barbarian_tower"}
+        self.assertEqual(engine._hunt_quota(), 5)
 
     def test_jump_to_coords_does_not_tap_search(self) -> None:
         engine = BlueStacksEngine.__new__(BlueStacksEngine)
@@ -655,7 +663,7 @@ class HuntTests(unittest.TestCase):
 
     def test_hunt_collects_quota_then_stops(self) -> None:
         engine = BlueStacksEngine.__new__(BlueStacksEngine)
-        engine.config = {"max_commanders": 2, "vision": {"map_scan_rings": 1}}
+        engine.config = {"vision": {"map_scan_rings": 1}}
         engine.store = Mock()
         engine.store.live = Mock()
         green = Image.new("RGB", (900, 1600), (104, 151, 57))
@@ -671,9 +679,10 @@ class HuntTests(unittest.TestCase):
         )
         with patch("e4kbot.client.is_map_screen", return_value=True):
             batch = engine._collect_hunt_batch("baron")
-        self.assertEqual(len(batch), 2)
+        self.assertEqual(len(batch), 3)
         self.assertEqual(batch[0].coords, (601, 700))
         self.assertEqual(batch[1].coords, (603, 701))
+        self.assertEqual(batch[2].coords, (605, 702))
         engine._pan_map.assert_not_called()
 
     def test_on_screen_attack_hunts_before_giving_up(self) -> None:
@@ -895,7 +904,7 @@ class HuntTests(unittest.TestCase):
         engine.tap_rel.assert_not_called()
         engine._wait_for.assert_not_called()
 
-    def test_select_best_picker_card_does_not_skip_on_stale_full_ocr(self) -> None:
+    def test_select_best_picker_card_does_not_tap_when_already_full(self) -> None:
         dummy = Image.new("RGB", (900, 1600), (80, 50, 30))
         engine = BlueStacksEngine.__new__(BlueStacksEngine)
         engine.config = {"vision": {"picker_timeout_seconds": 1}}
@@ -903,17 +912,54 @@ class HuntTests(unittest.TestCase):
         engine._image = Mock(return_value=dummy)
         engine._tap_norm = Mock()
         engine._is_plain_formation = Mock(return_value=False)
+        engine._read_ratio_from_image = Mock(return_value=(10, 10))
+        other = {
+            "available": 8,
+            "selected": 0,
+            "fingerprint": "other-soldier",
+            "point": (0.40, 0.42),
+        }
+        with patch("e4kbot.client.find_picker_cards", return_value=[other]):
+            self.assertTrue(engine._select_best_picker_card())
+        engine._tap_norm.assert_not_called()
+        self.assertEqual(engine._last_picker_fill, (10, 10))
+
+    def test_retry_does_not_reopen_picker_after_ok_closed_it(self) -> None:
+        dummy = Image.new("RGB", (900, 1600), (80, 50, 30))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.config = {"vision": {"picker_max_actions": 4, "minimum_flank_fill": 0.70}}
+        engine.telegram = Mock()
+        engine.store = Mock()
+        engine.store.live = Mock()
+        engine.layout = {"buttons": {"unit_slot": [0.07, 0.70]}}
+        engine._image = Mock(return_value=dummy)
+        engine._tap_norm_exact = Mock()
+        engine._dismiss_empty_wave_warning = Mock(return_value=False)
+        engine.tap_rel = Mock()
+        engine._wait_for = Mock(return_value=dummy)
+        engine._picker_overlay_open = Mock(return_value=True)
+        engine._dump_picker_max = Mock(
+            side_effect=lambda: setattr(engine, "_last_picker_fill", (10, 10)) or True
+        )
         engine._read_ratio_from_image = Mock(
+            side_effect=lambda _image, key: {
+                "picker_units": (10, 10),
+                "formation_units": None,
+                "formation_tools": None,
+            }.get(key)
+        )
+        engine.diagnose_unit_picker_confirm = Mock(
             side_effect=[
-                (10, 10),
-                (10, 10),
-                (10, 10),
-                (10, 10),
+                (False, "unit_picker_confirm_transition_failed", None),
+                (True, "confirmed", dummy),
             ]
         )
-        with patch("e4kbot.client.find_picker_cards", return_value=[]):
-            self.assertFalse(engine._select_best_picker_card())
-        engine._tap_norm.assert_not_called()
+        engine._select_best_picker_card = Mock(return_value=True)
+        ok, reason = engine._prepare_single_center_wave()
+        self.assertTrue(ok)
+        self.assertEqual(reason, "")
+        engine._tap_norm_exact.assert_not_called()
+        engine._select_best_picker_card.assert_not_called()
 
 
 class StateTests(unittest.TestCase):
@@ -1018,6 +1064,106 @@ class StateTests(unittest.TestCase):
                 viewport=(607, 738),
             )
             self.assertEqual(chosen, (0.60, 0.54))
+
+
+def _quit_dialog_image() -> Image.Image:
+    image = Image.new("RGB", (900, 1600), (104, 151, 57))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((80, 520, 820, 820), fill=(70, 70, 72))
+    draw.rectangle((520, 740, 620, 790), fill=(70, 200, 200))
+    draw.rectangle((680, 740, 800, 790), fill=(70, 200, 200))
+    return image
+
+
+def _castle_home_banner_image() -> Image.Image:
+    image = Image.new("RGB", (900, 1600), (104, 151, 57))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((80, 10, 820, 230), fill=(230, 210, 170))
+    draw.ellipse((140, 70, 250, 180), fill=(46, 140, 52))
+    draw.rectangle((650, 70, 780, 190), fill=(236, 236, 236))
+    return image
+
+
+class QuitDialogAndHomeHudTests(unittest.TestCase):
+    def test_grassy_map_is_not_special_offers(self) -> None:
+        image = Image.new("RGB", (900, 1600), (104, 151, 57))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((820, 8, 890, 70), fill=(210, 30, 20))
+        self.assertTrue(is_map_screen(image))
+        self.assertFalse(is_special_offers_screen(image))
+        self.assertIsNone(popup_action(image))
+
+    def test_quit_dialog_clicks_net_never_da(self) -> None:
+        image = _quit_dialog_image()
+        self.assertTrue(is_quit_game_dialog(image))
+        point = find_quit_dialog_no_button(image)
+        self.assertLess(point[0], 0.72)
+        self.assertGreater(point[0], 0.50)
+        da_x = 740 / 900
+        self.assertLess(point[0], da_x - 0.05)
+
+    def test_dismiss_quit_taps_net_only(self) -> None:
+        image = _quit_dialog_image()
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.adb = Mock()
+        engine._size = Mock(return_value=(900, 1600))
+        engine._image = Mock(return_value=image)
+        with patch("e4kbot.client.CONTROL") as control:
+            control.sleep = Mock()
+            with patch("e4kbot.client.time.sleep"):
+                closed = engine._dismiss_quit_game_if_open(image)
+        self.assertTrue(closed)
+        self.assertEqual(engine.adb.tap.call_count, 1)
+        nx = engine.adb.tap.call_args.args[0] / 900
+        self.assertLess(nx, 0.72)
+        engine.adb.key.assert_not_called()
+
+    def test_ruby_plus_hud_is_never_tapped_on_map(self) -> None:
+        self.assertTrue(is_ruby_plus_hud_point(0.93, 0.04))
+        self.assertFalse(is_ruby_plus_hud_point(0.52, 0.028))
+        green = Image.new("RGB", (900, 1600), (104, 151, 57))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.adb = Mock()
+        engine._image = Mock(return_value=green)
+        engine._size = Mock(return_value=(900, 1600))
+        engine._plan_or_picker_open = Mock(return_value=False)
+        engine._tap_norm(0.93, 0.04)
+        engine._tap_forced(0.92, 0.05)
+        engine.adb.tap.assert_not_called()
+
+    def test_home_sextant_is_left_not_right_castle(self) -> None:
+        image = _castle_home_banner_image()
+        point = find_home_sextant_button(image)
+        self.assertIsNotNone(point)
+        assert point is not None
+        self.assertLess(point[0], 0.50)
+        self.assertGreater(point[1], 0.04)
+        self.assertLess(point[1], 0.22)
+
+    def test_return_home_clicks_name_then_left_button(self) -> None:
+        map_shot = Image.new("RGB", (900, 1600), (104, 151, 57))
+        draw = ImageDraw.Draw(map_shot)
+        draw.rectangle((300, 4, 620, 70), fill=(230, 210, 170))
+        banner = _castle_home_banner_image()
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.adb = Mock()
+        engine._size = Mock(return_value=(900, 1600))
+        engine._image = Mock(side_effect=[map_shot, banner, banner, banner])
+        engine._plan_or_picker_open = Mock(return_value=False)
+        engine._dismiss_quit_game_if_open = Mock(return_value=False)
+        engine._await_world_map = Mock(return_value=map_shot)
+        with patch("e4kbot.client.is_travel_dialog", return_value=False):
+            with patch("e4kbot.client.is_formation_screen", return_value=False):
+                with patch("e4kbot.client.CONTROL") as control:
+                    control.sleep = Mock()
+                    with patch("e4kbot.client.time.sleep"):
+                        ok = engine._return_home_via_castle_hud()
+        self.assertTrue(ok)
+        xs = [call.args[0] / 900 for call in engine.adb.tap.call_args_list]
+        self.assertGreaterEqual(len(xs), 2)
+        self.assertLess(xs[0], 0.78)
+        self.assertLess(xs[-1], 0.50)
+        self.assertFalse(any(x >= 0.78 for x in xs))
 
 
 if __name__ == "__main__":

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import unittest
 
-from e4kbot.bluestacks import mapped_playfield, score_game_window
+from unittest.mock import Mock, patch
+
+from e4kbot.bluestacks import AdbClient, mapped_playfield, score_game_window
 
 
 class WindowTargetingTests(unittest.TestCase):
@@ -32,3 +34,12 @@ class WindowTargetingTests(unittest.TestCase):
 
     def test_same_aspect_uses_full_client(self) -> None:
         self.assertEqual(mapped_playfield(450, 800, 900, 1600), (0, 0, 450, 800))
+
+    def test_failed_adb_back_does_not_send_window_escape(self) -> None:
+        client = AdbClient({"bluestacks": {}})
+        client.serial = "127.0.0.1:5555"
+        failed = Mock(returncode=1, stderr="error: closed")
+        client._run = Mock(return_value=failed)
+        with patch("e4kbot.bluestacks.press_escape_on_game") as escape:
+            client.key(4)
+        escape.assert_not_called()
