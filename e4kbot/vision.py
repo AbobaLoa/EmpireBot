@@ -28,6 +28,12 @@ WORLD_CASTLE_TEMPLATES: dict[str, tuple[Path, ...]] = {
     "storm_fort": (STORM_ISLAND_CASTLE_A_TEMPLATE, STORM_ISLAND_CASTLE_B_TEMPLATE),
 }
 SAMURAI_TEMPLATE = ROOT / "assets" / "samurai_camp.png"
+DAIMYO_TEMPLATES: tuple[Path, ...] = (
+    ROOT / "assets" / "samurai" / "daimyo_blue_a.png",
+    ROOT / "assets" / "samurai" / "daimyo_blue_b.png",
+    ROOT / "assets" / "samurai" / "daimyo_blue_c.png",
+    ROOT / "assets" / "samurai" / "daimyo_gold.png",
+)
 NOMAD_TEMPLATE = ROOT / "assets" / "nomad_camp.png"
 NOMAD_TOOL_BADGE_TEMPLATE = ROOT / "assets" / "nomad_tool_bonus.png"
 NOMAD_TOOL_TILE_TEMPLATE = ROOT / "assets" / "nomad_tool_tile.png"
@@ -47,6 +53,16 @@ APPLY_PRESET_ALL_TEMPLATE = ROOT / "assets" / "apply_preset_all.png"
 PRESETS_DIALOG_TEMPLATE = ROOT / "assets" / "presets_dialog.png"
 AUTOSELECT_BUTTON_TEMPLATE = ROOT / "assets" / "autoselect_waves.png"
 AUTOSELECT_DIALOG_TEMPLATE = ROOT / "assets" / "autoselect_dialog.png"
+SAVE_PRESET_BUTTON_TEMPLATE = ROOT / "assets" / "save_preset_button.png"
+SAVE_PRESET_CONFIRM_TEMPLATE = ROOT / "assets" / "save_preset_confirm.png"
+TOOL_PLUS_TEMPLATE = ROOT / "assets" / "samurai" / "tool_plus_enabled.png"
+FEATHER_HORSE_TEMPLATE = ROOT / "assets" / "feather_horse.png"
+SAMURAI_FEATHER_HORSE_TEMPLATE = ROOT / "assets" / "samurai" / "feather_horse.png"
+# Movement dialog: gold, 10-ruby, 21-ruby warhorse, winged feather (rightmost).
+GOLD_HORSE_POINT = (0.20, 0.34)
+RUBY_WARHORSE_POINT = (0.62, 0.34)
+FEATHER_HORSE_POINT = (0.80, 0.34)
+FEATHER_HORSE_MIN_X = 0.72
 SPECIAL_OFFERS_MARKERS = (
     "спецпредлож",
     "спецпредл",
@@ -904,13 +920,10 @@ def _seal_blobs(
     return found
 
 
-def find_travel_seal_pair(
+def find_start_attack_gate_seals(
     image: Image.Image,
 ) -> tuple[tuple[float, float], tuple[float, float]] | None:
-    """Red cancel + green confirm wax seals on compact «Начать нападение».
-
-    Search a mid-dialog band so map grass does not swallow the green seal.
-    """
+    """Red + green seals on compact «Начать нападение». This is NOT the send."""
     bgr = _reference_bgr(image)
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     green_mask = cv2.inRange(hsv, (35, 60, 40), (95, 255, 255))
@@ -920,6 +933,29 @@ def find_travel_seal_pair(
     )
     reds = _seal_blobs(red_mask, 0.10, 0.45, 0.50, 0.76)
     greens = _seal_blobs(green_mask, 0.70, 0.86, 0.54, 0.68)
+    return _best_seal_pair(reds, greens)
+
+
+def find_travel_seal_pair(
+    image: Image.Image,
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    """Red cancel + green confirm on the march dialog. Bottom band only."""
+    bgr = _reference_bgr(image)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    green_mask = cv2.inRange(hsv, (35, 60, 40), (95, 255, 255))
+    red_mask = cv2.bitwise_or(
+        cv2.inRange(hsv, (0, 80, 50), (18, 255, 255)),
+        cv2.inRange(hsv, (165, 80, 50), (180, 255, 255)),
+    )
+    reds = _seal_blobs(red_mask, 0.10, 0.45, 0.74, 0.92)
+    greens = _seal_blobs(green_mask, 0.62, 0.92, 0.74, 0.92)
+    return _best_seal_pair(reds, greens)
+
+
+def _best_seal_pair(
+    reds: list[tuple[int, float, float, float]],
+    greens: list[tuple[int, float, float, float]],
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
     if not reds or not greens:
         return None
     best: tuple[float, tuple[float, float], tuple[float, float]] | None = None
@@ -937,13 +973,43 @@ def find_travel_seal_pair(
     return best[1], best[2]
 
 
+def is_start_attack_gate(image: Image.Image) -> bool:
+    """Compact «Начать нападение» before planning. Green check opens the plan, it does not send."""
+    if is_formation_screen(image):
+        return False
+    pair = find_start_attack_gate_seals(image)
+    if pair is None:
+        return False
+    text = _ocr_compact(ocr_text_ui(crop_rel(image, [0.10, 0.14, 0.90, 0.58]), psm=6))
+    markers = (
+        "начатьнападен",
+        "начать",
+        "цель",
+        "начало",
+        "лагерьсаму",
+        "nachat",
+        "napaden",
+        "cel",
+        "lager",
+    )
+    if any(token in text for token in markers):
+        return True
+    return _center_parchment_ratio(image) > 0.10 and find_formation_attack_button(image) is None
+
+
 def is_travel_dialog(image: Image.Image) -> bool:
-    """True only for the march confirm (wax seals or the wide green submit)."""
+    """True only for the march confirm. Never the compact start-attack gate."""
+    if is_formation_screen(image) or is_start_attack_gate(image):
+        return False
     if find_travel_seal_pair(image) is not None:
         return True
     if _no_commanders_unique_template_score(image) >= 0.48:
         return False
-    return bool(movement_confirm_diagnostics(image).get("valid"))
+    diagnostic = movement_confirm_diagnostics(image)
+    point = diagnostic.get("point")
+    if not diagnostic.get("valid") or point is None:
+        return False
+    return float(point[1]) >= 0.74
 
 
 def find_formation_attack_button(image: Image.Image) -> tuple[float, float] | None:
@@ -1785,6 +1851,49 @@ def _center_looks_like_parchment(image: Image.Image) -> bool:
     return brown_ratio > 0.03 and brown_ratio > grass_ratio
 
 
+def plaque_text_is_samurai_camp(text: str) -> bool:
+    """True when OCR names a samurai tent, not a player keep."""
+    blob = _ocr_compact(text)
+    tokens = (
+        "лагерьсамурая",
+        "лагерьсамураев",
+        "лагерысамурая",
+        "самураев",
+        "самурая",
+        "samuraicamp",
+        "samuraicamps",
+        "samurai",
+    )
+    return any(token in blob for token in tokens)
+
+
+def plaque_text_is_player_keep(text: str) -> bool:
+    """True for a real player castle / daimyo keep. Never attack these."""
+    if plaque_text_is_samurai_camp(text):
+        return False
+    blob = _ocr_compact(text)
+    tokens = (
+        "замок",
+        "castle",
+        "шпионаж",
+        "spy",
+        "дайме",
+        "daimyo",
+        "daimyou",
+    )
+    return any(token in blob for token in tokens)
+
+
+def is_samurai_camp_plaque(image: Image.Image) -> bool:
+    text = ocr_text_ui(crop_rel(image, [0.12, 0.10, 0.88, 0.55]), psm=6)
+    return plaque_text_is_samurai_camp(text)
+
+
+def is_player_keep_plaque(image: Image.Image) -> bool:
+    text = ocr_text_ui(crop_rel(image, [0.12, 0.10, 0.88, 0.55]), psm=6)
+    return plaque_text_is_player_keep(text)
+
+
 def find_plaque_attack_button(image: Image.Image) -> tuple[float, float] | None:
     """Gold/green «Нападение» on the info parchment. Never the map reticle or shop rail."""
     bgr = _reference_bgr(image)
@@ -1947,11 +2056,12 @@ def movement_confirm_diagnostics(image: Image.Image) -> dict[str, Any]:
     pair = find_travel_seal_pair(image)
     if pair is not None:
         green_point, _red_point = pair
-        diagnostic["point"] = green_point
-        diagnostic["green_ratio"] = 0.55
-        diagnostic["check_ratio"] = 0.05
-        diagnostic["valid"] = True
-        return diagnostic
+        if float(green_point[1]) >= 0.74:
+            diagnostic["point"] = green_point
+            diagnostic["green_ratio"] = 0.55
+            diagnostic["check_ratio"] = 0.05
+            diagnostic["valid"] = True
+            return diagnostic
     bgr = _reference_bgr(image)
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     green_mask = cv2.inRange(hsv, (35, 90, 45), (95, 255, 255))
@@ -1964,7 +2074,7 @@ def movement_confirm_diagnostics(image: Image.Image) -> dict[str, Any]:
             area >= 2500
             and width >= 1.5 * max(1, height)
             and cx > 0.50 * REFERENCE_SIZE[0]
-            and cy > 0.68 * REFERENCE_SIZE[1]
+            and cy >= 0.74 * REFERENCE_SIZE[1]
         ):
             candidates.append((area, x, y, width, height))
     if not candidates:
@@ -1981,7 +2091,8 @@ def movement_confirm_diagnostics(image: Image.Image) -> dict[str, Any]:
     diagnostic["check_ratio"] = float(np.count_nonzero(check)) / check.size
     diagnostic["point"] = ((x + width / 2) / 900, (y + height / 2) / 1600)
     diagnostic["valid"] = (
-        diagnostic["green_ratio"] >= 0.40
+        float(diagnostic["point"][1]) >= 0.74
+        and diagnostic["green_ratio"] >= 0.40
         and diagnostic["red_ratio"] <= 0.05
         and diagnostic["check_ratio"] >= 0.01
     )
@@ -2019,13 +2130,26 @@ def _movement_tile_score(image: Image.Image, nx: float, ny: float) -> float:
 
 def is_feather_selected(
     image: Image.Image,
-    feather: tuple[float, float] = (0.80, 0.34),
-    gold: tuple[float, float] = (0.20, 0.34),
+    feather: tuple[float, float] = FEATHER_HORSE_POINT,
+    gold: tuple[float, float] = GOLD_HORSE_POINT,
+    ruby: tuple[float, float] = RUBY_WARHORSE_POINT,
 ) -> bool:
-    """True when the right-hand feather tile looks selected vs the gold tile."""
+    """True when the rightmost winged/feather card is yellow, not the 21-ruby warhorse."""
     feather_score = _movement_tile_score(image, feather[0], feather[1])
     gold_score = _movement_tile_score(image, gold[0], gold[1])
-    return feather_score > gold_score + 0.035
+    ruby_score = _movement_tile_score(image, ruby[0], ruby[1])
+    return feather_score > ruby_score + 0.08 and feather_score > gold_score + 0.02
+
+
+def is_ruby_horse_selected(
+    image: Image.Image,
+    ruby: tuple[float, float] = RUBY_WARHORSE_POINT,
+    feather: tuple[float, float] = FEATHER_HORSE_POINT,
+) -> bool:
+    """True when the 21-ruby +41% warhorse (card 3) is highlighted."""
+    ruby_score = _movement_tile_score(image, ruby[0], ruby[1])
+    feather_score = _movement_tile_score(image, feather[0], feather[1])
+    return ruby_score > feather_score + 0.08
 
 
 def choose_movement(feather_count: int | None) -> str:
@@ -2712,11 +2836,277 @@ def find_tool_slider_plus(image: Image.Image, row_y: float) -> tuple[float, floa
     return (0.80, min(0.72, row_y))
 
 
+def find_formation_tool_slots(image: Image.Image) -> list[tuple[float, float]]:
+    """Empty tool + slots on the right of the expanded first wave."""
+    wave = formation_wave_diagnostics(image)
+    if not wave["expanded"] or wave["content_bounds"] is None:
+        return []
+    left, top, right, bottom = wave["content_bounds"]
+    bgr = _reference_bgr(image)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    dark = cv2.inRange(hsv, (0, 0, 0), (35, 255, 105))
+    y1, y2 = round(top * 1600), round(bottom * 1600)
+    x1 = max(round(0.48 * 900), round(left * 900))
+    x2 = min(round(0.86 * 900), round(right * 900))
+    roi = dark[y1:y2, x1:x2]
+    if roi.size == 0:
+        return []
+    count, _, stats, _ = cv2.connectedComponentsWithStats(roi)
+    points: list[tuple[int, int]] = []
+    for index in range(1, count):
+        x, y, width, height, area = (int(value) for value in stats[index])
+        if area < 220 or not (0.55 < width / max(1, height) < 1.8):
+            continue
+        patch = roi[y : y + height, x : x + width]
+        mid_y, mid_x = height // 2, width // 2
+        row = patch[max(0, mid_y - 4) : min(height, mid_y + 5), :]
+        column = patch[:, max(0, mid_x - 4) : min(width, mid_x + 5)]
+        if np.mean(row > 0) < 0.45 or np.mean(column > 0) < 0.45:
+            continue
+        points.append((x + width // 2 + x1, y + height // 2 + y1))
+    selected: list[tuple[int, int]] = []
+    for point in sorted(points, key=lambda item: (item[1], item[0])):
+        if all((point[0] - px) ** 2 + (point[1] - py) ** 2 > 45**2 for px, py in selected):
+            selected.append(point)
+    return [(x / 900, y / 1600) for x, y in selected[:3]]
+
+
+def is_tool_catalog(image: Image.Image) -> bool:
+    """Tool inventory overlay with stock rows. Never treat Buy now as a tap target."""
+    text = _ocr_compact(ocr_text_ui(crop_rel(image, [0.08, 0.10, 0.92, 0.88]), psm=6))
+    markers = (
+        "купитьсейчас",
+        "купить",
+        "лестниц",
+        "оруди",
+        "сегун",
+        "сёгун",
+        "segun",
+        "kupit",
+    )
+    if any(token in text for token in markers) and not is_formation_screen(image):
+        return True
+    if find_in_stock_tool_plus(image) is not None and find_formation_attack_button(image) is None:
+        return True
+    return False
+
+
+def is_save_preset_dialog(image: Image.Image) -> bool:
+    text = _ocr_compact(ocr_text_ui(crop_rel(image, [0.08, 0.16, 0.92, 0.72]), psm=6))
+    save_tokens = ("сохранить", "coxpa", "sohran", "cohranit")
+    extra = ("предустанов", "изменишь", "измен", "продолж", "predustanov", "hocuew")
+    if any(token in text for token in save_tokens) and any(token in text for token in extra):
+        return True
+    return find_template_center(image, SAVE_PRESET_CONFIRM_TEMPLATE, threshold=0.42) is not None
+
+
+def find_save_preset_button(image: Image.Image) -> tuple[float, float] | None:
+    """Floppy-disk «save selected wave as preset». Never Buy extra presets."""
+    point = find_template_center(
+        image,
+        SAVE_PRESET_BUTTON_TEMPLATE,
+        threshold=0.52,
+        x_min=0.04,
+        x_max=0.45,
+        y_min=0.38,
+        y_max=0.86,
+    )
+    if point is not None:
+        return point
+    apply = find_apply_preset_all(image)
+    if apply is None:
+        return None
+    return (apply[0], max(0.40, apply[1] - 0.08))
+
+
+def find_dialog_green_check(
+    image: Image.Image,
+    y_min: float = 0.38,
+    y_max: float = 0.92,
+) -> tuple[float, float] | None:
+    """Right-hand green check of a brown modal. Save preset, autoselect, travel."""
+    diagnostic = movement_confirm_diagnostics(image)
+    point = diagnostic.get("point")
+    if diagnostic.get("valid") and point is not None:
+        if point[0] > 0.50 and y_min <= point[1] <= y_max:
+            return point
+    bgr = _reference_bgr(image)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    green_mask = cv2.inRange(hsv, (35, 80, 45), (95, 255, 255))
+    count, _, stats, centers = cv2.connectedComponentsWithStats(green_mask)
+    best: tuple[float, float, float] | None = None
+    for index in range(1, count):
+        x, y, width, height, area = (int(v) for v in stats[index])
+        if area < 1800 or area > 90000:
+            continue
+        ratio = width / max(1, height)
+        if not (0.70 <= ratio <= 3.8):
+            continue
+        nx = float(centers[index][0]) / REFERENCE_SIZE[0]
+        ny = float(centers[index][1]) / REFERENCE_SIZE[1]
+        if not (nx > 0.50 and y_min <= ny <= y_max):
+            continue
+        patch = hsv[y : y + height, x : x + width]
+        check = cv2.inRange(patch, (0, 0, 185), (180, 85, 255))
+        if float(np.count_nonzero(check)) / max(1, check.size) < 0.01:
+            continue
+        score = area + (1.0 - abs(nx - 0.72)) * 4000
+        if best is None or score > best[0]:
+            best = (score, nx, ny)
+    if best is None:
+        return None
+    return (best[1], best[2])
+
+
+def read_tool_row_ratio(
+    image: Image.Image,
+    plus: tuple[float, float],
+) -> tuple[int, int] | None:
+    """0/40 vs 0/0 on the selected catalog row, left of the plus."""
+    nx, ny = plus
+    region = [
+        max(0.18, nx - 0.46),
+        max(0.22, ny - 0.055),
+        min(0.90, nx - 0.05),
+        min(0.84, ny + 0.055),
+    ]
+    return parse_ratio(ocr_text_ui(crop_rel(image, region), psm=6))
+
+
+def find_in_stock_tool_plus(image: Image.Image) -> tuple[float, float] | None:
+    """First catalog plus with stock. Skip 0/0 and the ruby cart below the row."""
+    hits = find_template_matches(
+        image,
+        cv2.imread(str(TOOL_PLUS_TEMPLATE)) if TOOL_PLUS_TEMPLATE.exists() else None,
+        threshold=0.58,
+        scales=(0.55, 0.7, 0.85, 1.0, 1.2, 1.45),
+        x_min=0.62,
+        x_max=0.96,
+        y_min=0.26,
+        y_max=0.80,
+        max_hits=8,
+        min_distance=48,
+    )
+    rgb = Image.fromarray(cv2.cvtColor(_reference_bgr(image), cv2.COLOR_BGR2RGB))
+    ranked: list[tuple[float, float]] = []
+    if hits:
+        ranked = sorted(((nx, ny) for nx, ny, _score in hits), key=lambda item: item[1])
+    if not ranked:
+        ranked = _plus_squares_from_edges(image)
+    for plus in ranked:
+        if plus[0] < 0.74:
+            continue
+        ratio = read_tool_row_ratio(rgb, plus)
+        if ratio is not None and ratio[1] <= 0:
+            continue
+        if ratio is not None and ratio[1] > 0:
+            return plus
+        if _tool_plus_enabled(image, plus):
+            return plus
+    return ranked[0] if ranked else None
+
+
+def _plus_squares_from_edges(image: Image.Image) -> list[tuple[float, float]]:
+    bgr = _reference_bgr(image)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    beige = cv2.inRange(hsv, (8, 35, 150), (40, 200, 255))
+    x1, x2 = int(0.70 * REFERENCE_SIZE[0]), int(0.94 * REFERENCE_SIZE[0])
+    y1, y2 = int(0.28 * REFERENCE_SIZE[1]), int(0.78 * REFERENCE_SIZE[1])
+    roi = beige[y1:y2, x1:x2]
+    if roi.size == 0:
+        return []
+    count, _, stats, centers = cv2.connectedComponentsWithStats(roi)
+    found: list[tuple[float, float]] = []
+    for index in range(1, count):
+        _x, _y, width, height, area = stats[index]
+        if not (400 <= area <= 9000 and 18 <= width <= 90 and 18 <= height <= 90):
+            continue
+        if not (0.70 <= width / max(1, height) <= 1.45):
+            continue
+        nx = (centers[index][0] + x1) / REFERENCE_SIZE[0]
+        ny = (centers[index][1] + y1) / REFERENCE_SIZE[1]
+        found.append((float(nx), float(ny)))
+    found.sort(key=lambda item: item[1])
+    return found[:6]
+
+
+def _tool_plus_enabled(image: Image.Image, plus: tuple[float, float]) -> bool:
+    crop = crop_rel(
+        image,
+        [
+            max(0.0, plus[0] - 0.04),
+            max(0.0, plus[1] - 0.03),
+            min(1.0, plus[0] + 0.04),
+            min(1.0, plus[1] + 0.03),
+        ],
+    )
+    arr = np.asarray(crop.convert("RGB"))
+    if arr.size == 0:
+        return False
+    hsv = cv2.cvtColor(arr[:, :, ::-1], cv2.COLOR_BGR2HSV)
+    return float(hsv[:, :, 1].mean()) >= 45
+
+
+def find_tool_row_minus(image: Image.Image, plus: tuple[float, float]) -> tuple[float, float]:
+    """Left slider control on the same row as plus — soldier-style full dump."""
+    bgr = _reference_bgr(image)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    beige = cv2.inRange(hsv, (8, 25, 140), (40, 200, 255))
+    y1 = int(max(0.24, plus[1] - 0.04) * REFERENCE_SIZE[1])
+    y2 = int(min(0.82, plus[1] + 0.04) * REFERENCE_SIZE[1])
+    x1 = int(0.28 * REFERENCE_SIZE[0])
+    x2 = int(max(0.40, plus[0] - 0.18) * REFERENCE_SIZE[0])
+    roi = beige[y1:y2, x1:x2]
+    if roi.size:
+        count, _, stats, centers = cv2.connectedComponentsWithStats(roi)
+        best: tuple[int, float, float] | None = None
+        for index in range(1, count):
+            _x, _y, width, height, area = stats[index]
+            if not (200 <= area <= 8000 and 14 <= width <= 80 and 14 <= height <= 80):
+                continue
+            nx = (centers[index][0] + x1) / REFERENCE_SIZE[0]
+            ny = (centers[index][1] + y1) / REFERENCE_SIZE[1]
+            if best is None or abs(ny - plus[1]) < abs(best[2] - plus[1]):
+                best = (int(area), nx, ny)
+        if best is not None:
+            return (best[1], best[2])
+    return (max(0.30, plus[0] - 0.42), plus[1])
+
+
+def find_feather_horse(image: Image.Image) -> tuple[float, float] | None:
+    """Rightmost winged horse (1 feather, +41%). Never the 21-ruby warhorse to its left."""
+    templates = (
+        SAMURAI_FEATHER_HORSE_TEMPLATE,
+        FEATHER_HORSE_TEMPLATE,
+    )
+    best: tuple[float, float] | None = None
+    for template in templates:
+        if not template.exists():
+            continue
+        point = find_template_center(
+            image,
+            template,
+            threshold=0.40,
+            x_min=FEATHER_HORSE_MIN_X,
+            x_max=0.98,
+            y_min=0.12,
+            y_max=0.62,
+        )
+        if point is None or point[0] < FEATHER_HORSE_MIN_X:
+            continue
+        if best is None or point[0] > best[0]:
+            best = point
+    if best is not None:
+        return best
+    return FEATHER_HORSE_POINT
+
+
 def find_samurai_candidates(
     image: Image.Image,
     threshold: float = 0.65,
+    max_hits: int = 16,
 ) -> list[tuple[float, float, float]]:
-    """Up to four camps: template-match samurai_camp.png (green grass masked)."""
+    """Samurai tents: template-match samurai_camp.png (green grass masked)."""
     if not SAMURAI_TEMPLATE.exists() or not is_map_screen(image):
         return []
     template = cv2.imread(str(SAMURAI_TEMPLATE))
@@ -2743,6 +3133,11 @@ def find_samurai_candidates(
         except cv2.error:
             continue
         ys, xs = np.where(scores >= score_min)
+        if ys.size == 0:
+            continue
+        if ys.size > 60:
+            keep = np.argpartition(scores[ys, xs], -60)[-60:]
+            ys, xs = ys[keep], xs[keep]
         half_w, half_h = width // 2, height // 2
         for y, x in zip(ys, xs):
             cx, cy = int(x + half_w), int(y + half_h)
@@ -2773,7 +3168,84 @@ def find_samurai_candidates(
     for score, x, y in ranked:
         if all((x - px) ** 2 + (y - py) ** 2 > min_distance**2 for _, px, py in selected):
             selected.append((score, x, y))
-        if len(selected) >= 4:
+        if len(selected) >= max(1, int(max_hits)):
+            break
+    return [
+        (x / REFERENCE_SIZE[0], y / REFERENCE_SIZE[1], score)
+        for score, x, y in selected
+    ]
+
+
+def _patch_has_sakura(bgr: np.ndarray, cx: int, cy: int) -> bool:
+    patch = bgr[
+        max(0, cy - 42) : cy + 42,
+        max(0, cx - 42) : cx + 42,
+    ]
+    if patch.size == 0:
+        return False
+    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    pink = cv2.bitwise_or(
+        cv2.inRange(hsv, (140, 50, 90), (175, 255, 255)),
+        cv2.inRange(hsv, (165, 40, 140), (179, 180, 255)),
+    )
+    return float(np.mean(pink)) / 255 >= 0.012
+
+
+def find_daimyo_candidates(
+    image: Image.Image,
+    threshold: float = 0.62,
+    max_hits: int = 16,
+) -> list[tuple[float, float, float]]:
+    """Daimyo castles: pagoda + pink sakura. Report-only, never attack."""
+    if not is_map_screen(image):
+        return []
+    bgr = _reference_bgr(image)
+    ranked: list[tuple[float, int, int]] = []
+    score_min = max(0.88, float(threshold))
+    for path in DAIMYO_TEMPLATES:
+        if not path.exists():
+            continue
+        template = cv2.imread(str(path))
+        if template is None:
+            continue
+        hsv = cv2.cvtColor(template, cv2.COLOR_BGR2HSV)
+        mask = cv2.bitwise_not(cv2.inRange(hsv, (28, 35, 25), (95, 255, 255)))
+        for scale in (0.85, 1.0, 1.15, 1.35, 1.55):
+            width = max(18, int(template.shape[1] * scale))
+            height = max(18, int(template.shape[0] * scale))
+            if width >= bgr.shape[1] or height >= bgr.shape[0]:
+                continue
+            resized = cv2.resize(template, (width, height), interpolation=cv2.INTER_AREA)
+            resized_mask = cv2.resize(mask, (width, height), interpolation=cv2.INTER_NEAREST)
+            _, resized_mask = cv2.threshold(resized_mask, 127, 255, cv2.THRESH_BINARY)
+            try:
+                scores = cv2.matchTemplate(
+                    bgr, resized, cv2.TM_CCORR_NORMED, mask=resized_mask
+                )
+            except cv2.error:
+                continue
+            ys, xs = np.where(scores >= score_min)
+            if ys.size == 0:
+                continue
+            if ys.size > 40:
+                keep = np.argpartition(scores[ys, xs], -40)[-40:]
+                ys, xs = ys[keep], xs[keep]
+            half_w, half_h = width // 2, height // 2
+            for y, x in zip(ys, xs):
+                cx, cy = int(x + half_w), int(y + half_h)
+                nx, ny = cx / REFERENCE_SIZE[0], cy / REFERENCE_SIZE[1]
+                if not (0.07 < nx < OFFER_RAIL_X and 0.16 < ny < 0.82):
+                    continue
+                if not _patch_has_sakura(bgr, cx, cy):
+                    continue
+                ranked.append((float(scores[y, x]), cx, cy))
+    ranked.sort(reverse=True)
+    selected: list[tuple[float, int, int]] = []
+    min_distance = 52
+    for score, x, y in ranked:
+        if all((x - px) ** 2 + (y - py) ** 2 > min_distance**2 for _, px, py in selected):
+            selected.append((score, x, y))
+        if len(selected) >= max(1, int(max_hits)):
             break
     return [
         (x / REFERENCE_SIZE[0], y / REFERENCE_SIZE[1], score)

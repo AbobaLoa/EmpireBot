@@ -431,6 +431,60 @@ class VisionTests(unittest.TestCase):
         self.assertEqual(reason, "diagnostic_only")
         engine.adb.tap.assert_not_called()
 
+    def test_burst_movement_confirm_fails_if_dialog_stays_open(self) -> None:
+        image = Image.new("RGB", (900, 1600), (55, 35, 25))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((100, 1280, 310, 1370), fill=(205, 30, 20))
+        draw.rectangle((590, 1280, 810, 1370), fill=(65, 165, 10))
+        draw.line((665, 1325, 700, 1350, 750, 1300), fill="white", width=16)
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.adb = Mock()
+        engine._image = Mock(return_value=image)
+        engine._speed_burst_active = Mock(return_value=True)
+        engine._dismiss_no_commanders = Mock(return_value=False)
+        engine._tap_norm_exact = Mock()
+        engine._wait_for = Mock(return_value=None)
+        engine._picker_overlay_open = Mock(return_value=False)
+        with (
+            patch("e4kbot.client.is_travel_dialog", return_value=True),
+            patch("e4kbot.client.is_formation_screen", return_value=False),
+            patch("e4kbot.client.is_start_attack_gate", return_value=False),
+        ):
+            confirmed, reason, _ = engine.diagnose_movement_confirm(click=True)
+        self.assertFalse(confirmed)
+        self.assertEqual(reason, "movement_confirm_transition_failed")
+        engine._tap_norm_exact.assert_called_once()
+
+    def test_execute_formation_attack_does_not_fake_one_way(self) -> None:
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.store = Mock()
+        engine.store.live = Mock()
+        engine.tap_rel = Mock()
+        engine._dismiss_empty_wave_warning = Mock(return_value=False)
+        engine._dismiss_no_commanders = Mock(return_value=False)
+        engine._prepare_single_center_wave = Mock(return_value=(True, ""))
+        engine._speed_burst_active = Mock(return_value=True)
+        engine._last_picker_fill = None
+        engine._picker_stall_count = 0
+        engine._mark_pack_prep = Mock()
+        engine._tap_formation_attack = Mock()
+        engine._wait_for = Mock(return_value=Image.new("RGB", (900, 1600)))
+        engine._movement_option = Mock(return_value=("gold", 0))
+        engine._image = Mock(return_value=Image.new("RGB", (900, 1600)))
+        engine._read_march_time = Mock(return_value=None)
+        engine._picker_overlay_open = Mock(return_value=False)
+        engine._finish_attack = Mock()
+        engine._selected_target_coords = (607, 743)
+        with (
+            patch("e4kbot.client.is_start_attack_gate", return_value=False),
+            patch("e4kbot.client.is_formation_screen", return_value=False),
+            patch("e4kbot.client.time.sleep"),
+        ):
+            result = engine._execute_formation_attack("baron", (0.42, 0.51))
+        self.assertEqual(result, "march_time_not_read")
+        engine._finish_attack.assert_not_called()
+        engine.tap_rel.assert_called_with("travel_cancel")
+
     def test_selects_visible_robber_without_ocr_coordinates(self) -> None:
         engine = BlueStacksEngine.__new__(BlueStacksEngine)
         engine._blocked_screen_targets = []
@@ -576,6 +630,97 @@ class HuntTests(unittest.TestCase):
         engine.tap_rel.assert_not_called()
         engine.adb.text.assert_not_called()
 
+    def test_pan_toward_coords_swipes_without_search(self) -> None:
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.config = {"vision": {"map_coordinate_scale": [0.044, 0.044]}}
+        engine._image = Mock(return_value=Image.new("RGB", (900, 1600)))
+        engine._read_map_coords = Mock(return_value=((607, 738), (607, 738)))
+        engine._pan_map = Mock()
+        engine.tap_rel = Mock()
+        engine.adb = Mock()
+        with patch("e4kbot.client.CONTROL") as control:
+            control.sleep = Mock()
+            moved = engine._pan_toward_coords((606, 731))
+        self.assertTrue(moved)
+        engine._pan_map.assert_called_once()
+        dx, dy = engine._pan_map.call_args[0]
+        self.assertLess(dx, 0)
+        self.assertLess(dy, 0)
+        engine.tap_rel.assert_not_called()
+        engine.adb.text.assert_not_called()
+
+    def test_pan_toward_coords_skips_when_already_there(self) -> None:
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.config = {"vision": {}}
+        engine._image = Mock(return_value=Image.new("RGB", (900, 1600)))
+        engine._read_map_coords = Mock(return_value=((606, 731), (606, 731)))
+        engine._pan_map = Mock()
+        self.assertFalse(engine._pan_toward_coords((606, 731)))
+        engine._pan_map.assert_not_called()
+
+    def test_pick_visible_pans_when_no_tents(self) -> None:
+        from tools.one_samurai_attack import _pick_visible
+
+        green = Image.new("RGB", (900, 1600), (104, 151, 57))
+        client = BlueStacksEngine.__new__(BlueStacksEngine)
+        client.config = {"vision": {"map_coordinate_scale": [0.044, 0.044]}}
+        client._image = Mock(return_value=green)
+        client._dismiss_reward_popups = Mock()
+        client._dismiss_special_offers_if_open = Mock()
+        client._dismiss_hire_menu_if_open = Mock()
+        client._dismiss_inbox_if_open = Mock()
+        client._read_map_coords = Mock(return_value=((607, 738), (607, 738)))
+        client._pan_toward_coords = Mock(side_effect=[True, True])
+        client._map_scan_offsets = Mock(return_value=[(0.3, 0.0)])
+        client._pan_map = Mock()
+        with patch(
+            "tools.one_samurai_attack.find_samurai_candidates",
+            side_effect=[[], [], [(0.48, 0.40, 0.91)]],
+        ):
+            with patch(
+                "tools.one_samurai_attack.project_map_coordinate",
+                return_value=(606.0, 731.0),
+            ):
+                with patch("tools.one_samurai_attack.CONTROL") as control:
+                    control.sleep = Mock()
+                    with patch("tools.one_samurai_attack.save_shot"):
+                        picked = _pick_visible(client, (606, 731))
+        self.assertIsNotNone(picked)
+        self.assertEqual(picked.coords, (606, 731))
+        self.assertGreaterEqual(client._pan_toward_coords.call_count, 1)
+        client._pan_map.assert_not_called()
+
+    def test_pick_visible_keeps_panning_past_far_tent(self) -> None:
+        from tools.one_samurai_attack import _pick_visible
+
+        green = Image.new("RGB", (900, 1600), (104, 151, 57))
+        client = BlueStacksEngine.__new__(BlueStacksEngine)
+        client.config = {"vision": {"map_coordinate_scale": [0.044, 0.044]}}
+        client._image = Mock(return_value=green)
+        client._dismiss_reward_popups = Mock()
+        client._dismiss_special_offers_if_open = Mock()
+        client._dismiss_hire_menu_if_open = Mock()
+        client._dismiss_inbox_if_open = Mock()
+        client._read_map_coords = Mock(return_value=((608, 735), (608, 735)))
+        client._pan_toward_coords = Mock(return_value=True)
+        client._map_scan_offsets = Mock(return_value=[(0.3, 0.0)])
+        client._pan_map = Mock()
+        with patch(
+            "tools.one_samurai_attack.find_samurai_candidates",
+            side_effect=[[(0.30, 0.41, 0.96)], [(0.48, 0.40, 0.91)]],
+        ):
+            with patch(
+                "tools.one_samurai_attack.project_map_coordinate",
+                side_effect=[(604.0, 732.0), (606.0, 731.0)],
+            ):
+                with patch("tools.one_samurai_attack.CONTROL") as control:
+                    control.sleep = Mock()
+                    with patch("tools.one_samurai_attack.save_shot"):
+                        picked = _pick_visible(client, (606, 731))
+        self.assertIsNotNone(picked)
+        self.assertEqual(picked.coords, (606, 731))
+        self.assertGreaterEqual(client._pan_toward_coords.call_count, 1)
+
     def test_focus_hunt_skips_missing_target_without_search(self) -> None:
         green = Image.new("RGB", (900, 1600), (104, 151, 57))
         engine = BlueStacksEngine.__new__(BlueStacksEngine)
@@ -614,6 +759,49 @@ class HuntTests(unittest.TestCase):
         )
         self.assertEqual(blocked, (0.42, 0.51))
         engine._recenter_on_main_castle.assert_called()
+
+    def test_focus_samurai_does_not_click_unmatched_tent_or_keep(self) -> None:
+        from e4kbot.client import HuntTarget
+
+        green = Image.new("RGB", (900, 1600), (104, 151, 57))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine._await_world_map = Mock(return_value=green)
+        engine._dismiss_special_offers_if_open = Mock(return_value=False)
+        engine._match_visible_target = Mock(return_value=None)
+        engine._recenter_on_main_castle = Mock(return_value=green)
+        engine._jump_to_coords = Mock()
+        engine._speed_burst_active = Mock(return_value=False)
+        with patch("e4kbot.client.find_samurai_candidates", return_value=[(0.40, 0.36, 0.96)]):
+            point = engine._focus_hunt_target(
+                "samurai", HuntTarget((0.50, 0.50), (606, 733))
+            )
+        self.assertIsNone(point)
+        engine._jump_to_coords.assert_not_called()
+
+    def test_match_samurai_ignores_far_tent_and_does_not_blind_click(self) -> None:
+        from e4kbot.client import HuntTarget
+
+        green = Image.new("RGB", (900, 1600), (104, 151, 57))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine._list_eligible_targets = Mock(
+            return_value=[
+                HuntTarget((0.40, 0.36), (603, 730)),
+                HuntTarget((0.51, 0.50), (610, 740)),
+            ]
+        )
+        with patch("e4kbot.client.is_burning_candidate", return_value=False):
+            missed = engine._match_visible_target(
+                green, "samurai", HuntTarget((0.50, 0.50), (606, 733))
+            )
+        engine._list_eligible_targets = Mock(
+            return_value=[HuntTarget((0.48, 0.34), (606, 732))]
+        )
+        with patch("e4kbot.client.is_burning_candidate", return_value=False):
+            hit = engine._match_visible_target(
+                green, "samurai", HuntTarget((0.48, 0.34), (606, 733))
+            )
+        self.assertIsNone(missed)
+        self.assertEqual(hit, (0.48, 0.34))
 
     def test_match_nomad_ignores_dummy_center_and_other_yurt(self) -> None:
         from e4kbot.client import HuntTarget
@@ -1227,6 +1415,52 @@ class QuitDialogAndHomeHudTests(unittest.TestCase):
         engine._navigation_home_for_world.assert_called_once_with("great_empire")
         engine._finish_verified_home.assert_called_once()
 
+    def test_home_after_send_burst_recenters_main_castle(self) -> None:
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine._speed_burst_active = Mock(return_value=True)
+        engine._recenter_after_pack_send = Mock()
+        engine._return_home_via_castle_hud = Mock()
+        engine._home_after_send("baron", "baron")
+        engine._recenter_after_pack_send.assert_called_once()
+        engine._return_home_via_castle_hud.assert_not_called()
+
+    def test_recenter_after_pack_taps_home_sextant_not_nav(self) -> None:
+        green = Image.new("RGB", (900, 1600), (104, 151, 57))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine._image = Mock(return_value=green)
+        engine._picker_overlay_open = Mock(return_value=False)
+        engine._tap_norm_exact = Mock()
+        engine._deselect_via_safe_grass = Mock()
+        engine._pan_map = Mock()
+        engine._speed_burst_active = Mock(return_value=True)
+        engine._fast_world_home = Mock()
+        with (
+            patch("e4kbot.client.is_travel_dialog", return_value=False),
+            patch("e4kbot.client.is_formation_screen", return_value=False),
+            patch("e4kbot.client.find_main_castle_marker", return_value=(0.82, 0.40)),
+            patch("e4kbot.client.find_home_sextant_button", return_value=(0.22, 0.12)),
+            patch("e4kbot.client.CONTROL") as control,
+        ):
+            control.sleep = Mock()
+            engine._recenter_after_pack_send()
+        engine._tap_norm_exact.assert_called_once_with(0.22, 0.12)
+        engine._pan_map.assert_not_called()
+        engine._fast_world_home.assert_not_called()
+
+    def test_empty_wave_not_dismissed_on_formation(self) -> None:
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine._image = Mock(return_value=Image.new("RGB", (900, 1600)))
+        engine._picker_overlay_open = Mock(return_value=False)
+        engine._tap_norm_exact = Mock()
+        with (
+            patch("e4kbot.client.is_no_commanders_parchment", return_value=False),
+            patch("e4kbot.client.is_formation_screen", return_value=True),
+            patch("e4kbot.client.is_travel_dialog", return_value=False),
+            patch("e4kbot.client.find_empty_wave_warning_confirm", return_value=(0.77, 0.63)),
+        ):
+            self.assertFalse(engine._dismiss_empty_wave_warning())
+        engine._tap_norm_exact.assert_not_called()
+
     def test_pending_home_is_retried_before_next_hunt(self) -> None:
         engine = BlueStacksEngine.__new__(BlueStacksEngine)
         engine.store = Mock()
@@ -1355,6 +1589,7 @@ class PackHudAndLeftoverTravelTests(unittest.TestCase):
             return kind
 
         engine._pack_confirm_open_travel = Mock(side_effect=confirm)
+        engine._recenter_after_pack_send = Mock()
         with (
             patch("e4kbot.client.is_travel_dialog", return_value=True),
             patch("e4kbot.client.is_formation_screen", return_value=False),
@@ -1364,6 +1599,89 @@ class PackHudAndLeftoverTravelTests(unittest.TestCase):
         self.assertEqual(result, "barbarian_tower")
         engine._pack_confirm_open_travel.assert_called_once()
         engine._block_screen_target.assert_called_once()
+
+    def test_pack_leftover_gate_enters_plan_and_is_not_a_send(self) -> None:
+        engine = self._engine()
+        engine._qualifying_cycles = 0
+        engine._burst_send_times = []
+        engine._switched_world_id = "great_empire"
+        engine._pack_finished = False
+        engine._image = Mock(return_value=Image.new("RGB", (900, 1600)))
+        engine._dismiss_empty_wave_warning = Mock(return_value=False)
+        engine._picker_overlay_open = Mock(return_value=False)
+        engine._block_screen_target = Mock()
+        engine._begin_world_pack = Mock()
+        engine._fast_world_home = Mock()
+        engine._pack_confirm_open_travel = Mock(return_value="baron")
+        engine._execute_formation_attack = Mock(return_value="baron")
+        engine._recenter_after_pack_send = Mock()
+        engine._pack_hud_matches_world = Mock(return_value=True)
+
+        def tap_green(*_args: float) -> None:
+            engine._pack_finished = True
+
+        engine._tap_norm_exact = Mock(side_effect=tap_green)
+        with (
+            patch("e4kbot.client.is_start_attack_gate", return_value=True),
+            patch("e4kbot.client.is_travel_dialog", return_value=False),
+            patch("e4kbot.client.is_formation_screen", return_value=False),
+            patch(
+                "e4kbot.client.find_start_attack_gate_seals",
+                return_value=((0.775, 0.642), (0.24, 0.642)),
+            ),
+            patch("e4kbot.client.CONTROL.check"),
+            patch("e4kbot.client.CONTROL.sleep"),
+        ):
+            result = engine._world_speed_pack("baron")
+        self.assertEqual(result, "baron")
+        engine._pack_confirm_open_travel.assert_not_called()
+        engine._execute_formation_attack.assert_not_called()
+        engine._block_screen_target.assert_not_called()
+        engine._recenter_after_pack_send.assert_not_called()
+        engine._tap_norm_exact.assert_called_once_with(0.775, 0.642)
+
+    def test_pack_confirm_open_travel_refuses_gate_and_picker(self) -> None:
+        engine = self._engine()
+        engine._image = Mock(return_value=Image.new("RGB", (900, 1600)))
+        engine._dismiss_no_commanders = Mock(return_value=False)
+        engine._picker_overlay_open = Mock(return_value=False)
+        engine._finish_attack = Mock()
+        with (
+            patch("e4kbot.client.is_start_attack_gate", return_value=True),
+            patch("e4kbot.client.is_travel_dialog", return_value=False),
+            patch("e4kbot.client.is_formation_screen", return_value=False),
+        ):
+            result = engine._pack_confirm_open_travel("baron")
+        self.assertEqual(result, "travel_dialog_not_found")
+        engine._finish_attack.assert_not_called()
+
+    def test_pack_confirm_open_travel_does_not_fake_one_way(self) -> None:
+        engine = self._engine()
+        engine._image = Mock(return_value=Image.new("RGB", (900, 1600)))
+        engine._dismiss_no_commanders = Mock(return_value=False)
+        engine._picker_overlay_open = Mock(return_value=False)
+        engine._speed_burst_active = Mock(return_value=True)
+        engine._mark_pack_prep = Mock()
+        engine._read_march_time = Mock(return_value=None)
+        engine.tap_rel = Mock()
+        engine._finish_attack = Mock()
+        with (
+            patch("e4kbot.client.is_start_attack_gate", return_value=False),
+            patch("e4kbot.client.is_travel_dialog", return_value=True),
+            patch("e4kbot.client.is_formation_screen", return_value=False),
+            patch(
+                "e4kbot.client.find_travel_seal_pair",
+                return_value=((0.768, 0.816), (0.23, 0.816)),
+            ),
+            patch(
+                "e4kbot.client.movement_confirm_diagnostics",
+                return_value={"valid": True, "point": (0.768, 0.816)},
+            ),
+        ):
+            result = engine._pack_confirm_open_travel("baron")
+        self.assertEqual(result, "march_time_not_read")
+        engine._finish_attack.assert_not_called()
+        engine.tap_rel.assert_called_with("travel_cancel")
 
 
 if __name__ == "__main__":

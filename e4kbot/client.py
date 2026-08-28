@@ -21,7 +21,7 @@ from e4kbot.farm_reports import (
     unread_battle_rows,
     write_progress,
 )
-from e4kbot.paths import LAYOUTS_DIR, ROOT
+from e4kbot.paths import DATA_DIR, LAYOUTS_DIR, ROOT
 from e4kbot.runtime.live import emit
 from e4kbot.safety import (
     mark_successful_send,
@@ -47,11 +47,13 @@ from e4kbot.vision import (
     find_robber_candidates,
     find_world_castle_candidates,
     find_samurai_candidates,
+    find_daimyo_candidates,
     find_nomad_candidates,
     find_formation_attack_button,
     find_formation_unit_slots,
     find_red_cross_force,
     find_target_attack_button,
+    find_start_attack_gate_seals,
     find_travel_seal_pair,
     find_plaque_attack_button,
     find_world_list_sextants,
@@ -75,6 +77,10 @@ from e4kbot.vision import (
     is_hire_menu,
     is_inbox_screen,
     is_info_plaque,
+    is_player_keep_plaque,
+    is_samurai_camp_plaque,
+    plaque_text_is_player_keep,
+    plaque_text_is_samurai_camp,
     is_loading_screen,
     is_map_screen,
     is_no_commanders_parchment,
@@ -83,6 +89,7 @@ from e4kbot.vision import (
     is_ruby_plus_hud_point,
     is_ruby_shop,
     is_special_offers_screen,
+    is_start_attack_gate,
     is_taxes_dialog,
     is_travel_dialog,
     map_grass_ratio,
@@ -120,6 +127,37 @@ def _dummy_center(point: tuple[float, float] | None) -> bool:
     if point is None:
         return True
     return abs(float(point[0]) - 0.50) < 0.02 and abs(float(point[1]) - 0.50) < 0.02
+
+
+SAMURAI_CAMP_COORD_TOLERANCE = 2
+_DEFAULT_SAMURAI_CAMPS = ((603, 736), (605, 734), (606, 733), (606, 731))
+
+
+def load_samurai_allowed_camps() -> set[tuple[int, int]]:
+    camps = {tuple(int(v) for v in item) for item in _DEFAULT_SAMURAI_CAMPS}
+    path = DATA_DIR / "samurai_targets.json"
+    if not path.exists():
+        return camps
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return camps
+    for item in payload.get("camps") or []:
+        if len(item) >= 2:
+            camps.add((int(item[0]), int(item[1])))
+    test = payload.get("test_target")
+    if test and len(test) >= 2:
+        camps.add((int(test[0]), int(test[1])))
+    return camps
+
+
+def samurai_coords_allowed(coords: tuple[int, int] | None, tolerance: int = SAMURAI_CAMP_COORD_TOLERANCE) -> bool:
+    if coords is None:
+        return False
+    for camp_x, camp_y in load_samurai_allowed_camps():
+        if abs(int(coords[0]) - camp_x) + abs(int(coords[1]) - camp_y) <= tolerance:
+            return True
+    return False
 
 
 def load_layout(name: str) -> dict[str, Any]:
@@ -851,6 +889,12 @@ class BlueStacksEngine(WorldSwitchMixin):
             return False
         if is_no_commanders_parchment(image):
             return False
+        if (
+            is_formation_screen(image)
+            or is_travel_dialog(image)
+            or self._picker_overlay_open(image)
+        ):
+            return False
         point = find_empty_wave_warning_confirm(image)
         if point is None:
             return False
@@ -1018,7 +1062,11 @@ class BlueStacksEngine(WorldSwitchMixin):
                 self._positive_unit_fill(observed_fill)
                 and find_formation_attack_button(img) is not None
             ),
-            timeout=self._vision_seconds("picker_confirm_timeout_seconds", 8),
+            timeout=(
+                0.7
+                if self._speed_burst_active()
+                else self._vision_seconds("picker_confirm_timeout_seconds", 8)
+            ),
             label="закрытие пикера",
         )
         latest = after if after is not None else self._image()
@@ -1107,28 +1155,22 @@ class BlueStacksEngine(WorldSwitchMixin):
         logger.info("Movement confirm diagnostic: {}", diagnostic)
         if self._dismiss_no_commanders(image):
             return False, "no_commanders", None
-        if not diagnostic["valid"] or point is None:
+        if is_start_attack_gate(image) or is_formation_screen(image) or self._picker_overlay_open(image):
+            return False, "movement_confirm_not_confident", None
+        if not diagnostic["valid"] or point is None or float(point[1]) < 0.74:
             return False, "movement_confirm_not_confident", None
         if not click:
             return True, "diagnostic_only", image
-        if click and self._speed_burst_active():
-            self._tap_norm_exact(*point)
-            closed = self._wait_for(
-                lambda img: (not is_travel_dialog(img)) and (not is_formation_screen(img)),
-                timeout=0.35,
-                label="закрытие похода",
-            )
-            return True, "confirmed", closed if closed is not None else image
         self._tap_norm_exact(*point)
         closed = self._wait_for(
-            lambda img: (not is_travel_dialog(img)) and (not is_formation_screen(img)),
+            lambda img: not self._send_confirm_still_open(img),
             timeout=1.2 if self._speed_burst_active() else 10,
             label="закрытие похода",
         )
         latest = closed if closed is not None else self._image()
         if self._dismiss_no_commanders(latest):
             return False, "no_commanders", None
-        if is_travel_dialog(latest) or is_formation_screen(latest):
+        if self._send_confirm_still_open(latest):
             failed = latest
             if not self._speed_burst_active():
                 save_shot(failed, "movement-confirm-transition-failed.png")
@@ -1136,6 +1178,15 @@ class BlueStacksEngine(WorldSwitchMixin):
         if not self._speed_burst_active():
             save_shot(latest, "movement-confirm-after.png")
         return True, "confirmed", latest
+
+    def _send_confirm_still_open(self, image: Any) -> bool:
+        """True when the tap did not actually send: travel, gate, plan, or picker still up."""
+        return (
+            is_travel_dialog(image)
+            or is_formation_screen(image)
+            or is_start_attack_gate(image)
+            or self._picker_overlay_open(image)
+        )
 
     def _swipe_norm(
         self,
@@ -1282,6 +1333,42 @@ class BlueStacksEngine(WorldSwitchMixin):
             coords[0],
             coords[1],
         )
+
+    def _pan_toward_coords(self, coords: tuple[int, int], *, max_step: float = 0.22) -> bool:
+        """Swipe the kingdom map toward coords. Never uses search or shop."""
+        image = self._image()
+        _main, viewport = self._read_map_coords(image)
+        if viewport is None:
+            logger.info(
+                "Вьюпорт не прочитался — к {}:{} карту по координатам не двигаю",
+                coords[0],
+                coords[1],
+            )
+            return False
+        manhattan = abs(int(coords[0]) - int(viewport[0])) + abs(int(coords[1]) - int(viewport[1]))
+        if manhattan <= 2:
+            logger.info("Вьюпорт уже у лагеря {} (оценка {})", coords, viewport)
+            return False
+        vision = self.config.get("vision") or {}
+        scale = vision.get("map_coordinate_scale") or [0.044, 0.044]
+        dx = (int(coords[0]) - int(viewport[0])) * float(scale[0])
+        dy = (int(coords[1]) - int(viewport[1])) * float(scale[1])
+        step_dx = max(-float(max_step), min(float(max_step), dx))
+        step_dy = max(-float(max_step), min(float(max_step), dy))
+        if abs(step_dx) < 0.015 and abs(step_dy) < 0.015:
+            return False
+        logger.info(
+            "Двигаю карту к {}:{} с {}:{} сдвиг ({:.3f}, {:.3f})",
+            coords[0],
+            coords[1],
+            viewport[0],
+            viewport[1],
+            step_dx,
+            step_dy,
+        )
+        self._pan_map(step_dx, step_dy)
+        CONTROL.sleep(0.65)
+        return True
 
     def _recenter_on_main_castle(self, image: Any) -> Any:
         """Keep the hunt anchored on the account's MAIN castle, not the last target."""
@@ -1753,6 +1840,21 @@ class BlueStacksEngine(WorldSwitchMixin):
                         len(found),
                     )
                     return found
+        if kind == "samurai" and not found:
+            for camp in sorted(load_samurai_allowed_camps()):
+                logger.info("Самураи: шатров у замка нет — двигаю карту к {}", camp)
+                for _ in range(6):
+                    if not self._pan_toward_coords(camp):
+                        break
+                    image = self._image()
+                    if ingest(image):
+                        return found
+                    if found:
+                        logger.info("После сдвига к {} нашёл {} шатров", camp, len(found))
+                        return found
+                image = self._image()
+                if ingest(image) or found:
+                    return found
         for dx, dy in self._map_scan_offsets():
             logger.info("Скан карты: сдвиг ({:+.2f}, {:+.2f})", dx, dy)
             self._pan_map(dx, dy)
@@ -1829,6 +1931,8 @@ class BlueStacksEngine(WorldSwitchMixin):
                 )
                 return nearest[1].point
             return None
+        if kind == "samurai":
+            return self._match_visible_samurai_tent(image, items, target)
         expected = target.point
         screen_tol = 0.04
         for item in items:
@@ -1845,26 +1949,57 @@ class BlueStacksEngine(WorldSwitchMixin):
             ) ** 2
             if dist2 < screen_tol**2:
                 return item.point
-        if kind == "samurai":
-            nearest = None
-            for item in items:
-                if is_burning_candidate(image, item.point):
-                    continue
-                dist2 = (item.point[0] - target.point[0]) ** 2 + (
-                    item.point[1] - target.point[1]
-                ) ** 2
-                if nearest is None or dist2 < nearest[0]:
-                    nearest = (dist2, item)
-            if nearest is not None:
-                logger.info(
-                    "Лагерь на экране ({:.3f}, {:.3f}), dist={:.3f}",
-                    nearest[1].point[0],
-                    nearest[1].point[1],
-                    nearest[0] ** 0.5,
-                )
-                if nearest[1].coords:
-                    self._selected_target_coords = nearest[1].coords
-                return nearest[1].point
+        return None
+
+    def _match_visible_samurai_tent(
+        self,
+        image: Any,
+        items: list[HuntTarget],
+        target: HuntTarget,
+    ) -> tuple[float, float] | None:
+        """Only a white samurai tent at the queued coords. Never a nearby keep."""
+        best: tuple[int, HuntTarget] | None = None
+        for item in items:
+            if is_burning_candidate(image, item.point):
+                continue
+            if not target.coords or not item.coords:
+                if target.point and not _dummy_center(target.point):
+                    dist2 = (item.point[0] - target.point[0]) ** 2 + (
+                        item.point[1] - target.point[1]
+                    ) ** 2
+                    if dist2 <= 0.06**2 and (best is None or dist2 < best[0]):
+                        best = (dist2, item)
+                continue
+            dist = abs(item.coords[0] - target.coords[0]) + abs(item.coords[1] - target.coords[1])
+            if dist > SAMURAI_CAMP_COORD_TOLERANCE:
+                continue
+            if not samurai_coords_allowed(item.coords) and not samurai_coords_allowed(target.coords):
+                logger.warning("Шатёр {} не из списка лагерей — пропускаю", item.coords)
+                continue
+            if best is None or dist < best[0]:
+                best = (dist, item)
+        if best is not None:
+            logger.info(
+                "Шатёр самураев {} совпал с очередью {} ({:.3f}, {:.3f})",
+                best[1].coords,
+                target.coords,
+                best[1].point[0],
+                best[1].point[1],
+            )
+            self._selected_target_coords = target.coords
+            return best[1].point
+        if target.point and not _dummy_center(target.point):
+            logger.info(
+                "Координат карты нет — жму шатёр очереди ({:.3f}, {:.3f}) для {}",
+                target.point[0],
+                target.point[1],
+                target.coords,
+            )
+            return target.point
+        logger.info(
+            "Шатёр {} не на экране — чужой шатёр и замок не трогаю",
+            target.coords,
+        )
         return None
 
     def _focus_hunt_target(self, kind: str, target: HuntTarget) -> tuple[float, float] | None:
@@ -1934,29 +2069,19 @@ class BlueStacksEngine(WorldSwitchMixin):
             logger.info("Лагерь {} не на экране — очередь не сбрасываю", target.coords)
             return None
         if kind == "samurai":
-            finder = find_samurai_candidates
-
-            def visible_camps(shot: Any) -> list[tuple[float, float, float]]:
-                return [
-                    camp
-                    for camp in finder(shot)
-                    if not self._is_blocked_screen_target((float(camp[0]), float(camp[1])))
-                ]
-
-            camps = visible_camps(image)
-            if not camps:
-                logger.info("Видимых лагерей нет — центрирую замок и смотрю ещё раз")
-                image = self._recenter_on_main_castle(image)
-                camps = visible_camps(image)
-            if camps:
-                point = (float(camps[0][0]), float(camps[0][1]))
+            if target.point and not _dummy_center(target.point):
                 logger.info(
-                    "Беру видимый лагерь без сверки координат ({:.3f}, {:.3f})",
-                    point[0],
-                    point[1],
+                    "Лагерь {} не совпал по координатам — жму шатёр очереди ({:.3f}, {:.3f})",
+                    target.coords,
+                    target.point[0],
+                    target.point[1],
                 )
-                return point
-            logger.info("Видимых лагерей нет — не панорамирую и не открываю поиск")
+                return target.point
+            logger.info(
+                "Лагерь {} не совпал на экране — чужой шатёр и замок игрока не трогаю",
+                target.coords,
+            )
+            return None
         elif is_world_npc_kind(kind):
             point = target.point
             if point and self._world_map_npc_point(point):
@@ -2161,13 +2286,40 @@ class BlueStacksEngine(WorldSwitchMixin):
             return False
         return 0.30 <= nx <= 0.82 and 0.28 <= ny <= 0.72
 
+    def _abort_non_samurai_target(self, image: Any | None = None) -> None:
+        """Close a player keep / daimyo / wrong plaque. Never tap Напасть."""
+        shot = image if image is not None else self._image()
+        logger.error("Цель не белый шатёр самураев — закрываю, Нападение не жму")
+        close = find_parchment_title_close(shot) or find_red_cross_force(shot, title_bar_only=True)
+        if close and close[0] < 0.92 and close[1] < 0.22:
+            self._tap_forced(*close)
+            CONTROL.sleep(0.4)
+        else:
+            self.tap_rel("map")
+            CONTROL.sleep(0.35)
+        self._deselect_via_safe_grass()
+
     def _open_formation(self, point: tuple[float, float], kind: str) -> bool:
         already = self._image()
         if find_picker_cards(already):
             logger.info("Пикер уже открыт — не закрываю и не жму карту")
             return True
         if not self._speed_burst_active():
+            if is_start_attack_gate(already):
+                logger.info("«Начать нападение» уже на экране — галочка в план, не отправка")
+                return self._enter_plan_from_start_gate(already)
             if is_travel_dialog(already):
+                if kind == "samurai":
+                    logger.error("Поход открыт до проверки шатра — красная печать, замок не бью")
+                    pair = find_travel_seal_pair(already)
+                    if pair is not None:
+                        _green, red = pair
+                        self._tap_norm_exact(*red)
+                    else:
+                        cancel = (self.layout.get("buttons") or {}).get("travel_cancel") or [0.23, 0.815]
+                        self._tap_norm_exact(float(cancel[0]), float(cancel[1]))
+                    CONTROL.sleep(0.4)
+                    return False
                 logger.info("Планирование уже открыто — не закрываю и не жму карту")
                 return True
         world_attack = (
@@ -2189,7 +2341,12 @@ class BlueStacksEngine(WorldSwitchMixin):
             logger.info("Табличка мира уже открыта — не жму метку повторно")
             popup = already
         else:
-            self._tap_norm(*point)
+            if kind == "samurai":
+                for dx, dy, _score in find_daimyo_candidates(already):
+                    if ((dx - point[0]) ** 2 + (dy - point[1]) ** 2) ** 0.5 < 0.07:
+                        logger.info("Клик рядом с даймё ({:.3f}, {:.3f}) — не атакую", dx, dy)
+                        return False
+            self._tap_norm_exact(*point)
         if kind in {"samurai", "nomad"}:
             plaque_ready = lambda image: (
                 is_info_plaque(image)
@@ -2201,12 +2358,29 @@ class BlueStacksEngine(WorldSwitchMixin):
                 or is_formation_screen(image)
             )
             popup = self._wait_for(plaque_ready, timeout=1.2 if self._speed_burst_active() else 3, label="табличка лагеря")
-            if popup is None:
+            if popup is None and kind == "samurai":
+                try:
+                    save_shot(self._image(), "samurai_radial_miss.png")
+                except Exception:
+                    pass
+                logger.info(
+                    "Радиал: второй клик в центр шатра — Напасть, не обзор ({:.3f}, {:.3f})",
+                    point[0],
+                    point[1],
+                )
+                self._tap_norm_exact(*point)
+                popup = self._wait_for(
+                    plaque_ready,
+                    timeout=5,
+                    label="радиал Напасть по центру шатра",
+                )
+            elif popup is None:
                 lower = (float(point[0]), min(0.80, float(point[1]) + 0.04))
                 logger.info("Табличка не вышла — жму чуть ниже лагеря ({:.3f}, {:.3f})", lower[0], lower[1])
                 self._tap_norm(*lower)
                 popup = self._wait_for(plaque_ready, timeout=1.5 if self._speed_burst_active() else 5, label="табличка после повторного клика")
             if popup is not None and self._plan_or_picker_open(popup):
+                logger.info("План/поход открылся после клика по шатру — продолжаю")
                 return True
             if popup is not None and is_overview_plaque(popup):
                 logger.info("Открылся обзор лагеря, не Нападение — закрываю")
@@ -2272,6 +2446,35 @@ class BlueStacksEngine(WorldSwitchMixin):
                 self._dismiss_wrong_world_target(popup)
                 self._block_screen_target(point)
                 return False
+        if kind == "samurai" and popup is not None and not is_info_plaque(popup):
+            logger.info(
+                "Радиал самураев — сразу центр шатра Напасть ({:.3f}, {:.3f}), без OCR",
+                point[0],
+                point[1],
+            )
+            self._tap_norm_exact(*point)
+            CONTROL.sleep(0.35)
+            opened = self._wait_for(
+                lambda img: is_difficulty_dialog(img)
+                or is_formation_screen(img)
+                or is_no_commanders_parchment(img)
+                or is_travel_dialog(img)
+                or is_start_attack_gate(img),
+                timeout=10,
+                label="план после радиала Напасть",
+            )
+            shot = opened if opened is not None else self._image()
+            if self._dismiss_no_commanders(shot):
+                return False
+            if (
+                is_difficulty_dialog(shot)
+                or is_formation_screen(shot)
+                or is_travel_dialog(shot)
+                or is_start_attack_gate(shot)
+            ):
+                return True
+            logger.warning("После центра шатра план не открылся")
+            return False
         if not self._speed_burst_active():
             x_region = self.layout.get("regions", {}).get("viewport_x")
             y_region = self.layout.get("regions", {}).get("viewport_y")
@@ -2290,6 +2493,24 @@ class BlueStacksEngine(WorldSwitchMixin):
                         target_y,
                         self._selected_target_coords,
                     )
+                elif (
+                    kind == "samurai"
+                    and self._selected_target_coords
+                    and (
+                        abs(target_x - self._selected_target_coords[0])
+                        + abs(target_y - self._selected_target_coords[1])
+                        > SAMURAI_CAMP_COORD_TOLERANCE
+                        or not samurai_coords_allowed((target_x, target_y))
+                    )
+                ):
+                    logger.error(
+                        "Табличка дала ({}, {}) — это не шатёр {} — замок не бью",
+                        target_x,
+                        target_y,
+                        self._selected_target_coords,
+                    )
+                    self._abort_non_samurai_target(popup)
+                    return False
                 elif (
                     kind in {"samurai", "nomad"}
                     and self._selected_target_coords
@@ -2335,11 +2556,34 @@ class BlueStacksEngine(WorldSwitchMixin):
                     logger.info("Лагерь {} без атак — закрываю табличку", self._selected_target_coords)
                     self.tap_rel("map")
                     return False
+            if kind == "samurai":
+                if plaque_text_is_player_keep(blob) or is_player_keep_plaque(popup):
+                    logger.error("Табличка замка игрока: {} — Нападение не жму", blob[:80])
+                    self._abort_non_samurai_target(popup)
+                    return False
+                if is_info_plaque(popup) and not plaque_text_is_samurai_camp(blob):
+                    logger.error(
+                        "Пергамент без «Лагерь самураев»: {} — Нападение не жму",
+                        blob[:80],
+                    )
+                    self._abort_non_samurai_target(popup)
+                    return False
+                if not samurai_coords_allowed(self._selected_target_coords):
+                    logger.error(
+                        "Координаты {} не из списка шатров — Нападение не жму",
+                        self._selected_target_coords,
+                    )
+                    self._abort_non_samurai_target(popup)
+                    return False
         attack_point = None
         if kind in {"samurai", "nomad"}:
             if is_info_plaque(popup):
                 attack_point = find_plaque_attack_button(popup)
                 if attack_point is None:
+                    if kind == "samurai":
+                        logger.error("На пергаменте нет Нападения — центр таблички не жму, это может быть замок")
+                        self._abort_non_samurai_target(popup)
+                        return False
                     attack_point = (0.50, 0.60)
                     logger.info("На пергаменте нет золотой кнопки — жму Нападение по центру таблички")
                 else:
@@ -2351,24 +2595,44 @@ class BlueStacksEngine(WorldSwitchMixin):
                     if kind != "nomad":
                         self._block_screen_target(point)
                     return False
-                logger.info(
-                    "Радиал Напасть ({:.3f}, {:.3f}) — не Обзор и не шпионаж",
-                    attack_point[0],
-                    attack_point[1],
-                )
+                dist = (
+                    (attack_point[0] - point[0]) ** 2 + (attack_point[1] - point[1]) ** 2
+                ) ** 0.5
+                if kind == "samurai" and dist > 0.03:
+                    logger.info(
+                        "Радиал шаблон ({:.3f}, {:.3f}) смещён — жму центр шатра Напасть ({:.3f}, {:.3f})",
+                        attack_point[0],
+                        attack_point[1],
+                        point[0],
+                        point[1],
+                    )
+                    attack_point = point
+                else:
+                    logger.info(
+                        "Радиал Напасть ({:.3f}, {:.3f}) — не Обзор и не шпионаж",
+                        attack_point[0],
+                        attack_point[1],
+                    )
         else:
             attack_point = find_target_attack_button(popup)
         if not is_world_npc_kind(kind):
             if attack_point is None:
                 return False
-            self._tap_norm(*attack_point)
-            time.sleep(0.8)
+            if kind in {"samurai", "nomad"}:
+                self._tap_norm_exact(*attack_point)
+            else:
+                self._tap_norm(*attack_point)
+            if self._speed_burst_active():
+                CONTROL.sleep(0.08)
+            else:
+                time.sleep(0.8)
         if kind in {"samurai", "nomad"}:
             opened = self._wait_for(
                 lambda img: is_difficulty_dialog(img)
                 or is_formation_screen(img)
                 or is_no_commanders_parchment(img)
-                or is_travel_dialog(img),
+                or is_travel_dialog(img)
+                or is_start_attack_gate(img),
                 timeout=10,
                 label="сложность или план лагеря",
             )
@@ -2378,7 +2642,7 @@ class BlueStacksEngine(WorldSwitchMixin):
             if is_difficulty_dialog(shot):
                 logger.info("Окно «выберите сложность» — не жду план, отдам модулю")
                 return True
-            if is_formation_screen(shot) or is_travel_dialog(shot):
+            if is_formation_screen(shot) or is_travel_dialog(shot) or is_start_attack_gate(shot):
                 return True
             fresh = self._image()
             retry = (
@@ -2387,20 +2651,31 @@ class BlueStacksEngine(WorldSwitchMixin):
                 else find_target_attack_button(fresh, near=point)
             )
             if retry is not None:
+                if kind == "samurai":
+                    retry = point
                 logger.info("План не открылся — ещё раз жму Нападение ({:.3f}, {:.3f})", retry[0], retry[1])
-                self._tap_norm(*retry)
+                if kind == "samurai":
+                    self._tap_norm_exact(*retry)
+                else:
+                    self._tap_norm(*retry)
                 opened = self._wait_for(
                     lambda img: is_difficulty_dialog(img)
                     or is_formation_screen(img)
                     or is_no_commanders_parchment(img)
-                    or is_travel_dialog(img),
+                    or is_travel_dialog(img)
+                    or is_start_attack_gate(img),
                     timeout=10,
                     label="повтор таблички лагеря",
                 )
                 shot = opened if opened is not None else self._image()
                 if self._dismiss_no_commanders(shot):
                     return False
-                if is_difficulty_dialog(shot) or is_formation_screen(shot) or is_travel_dialog(shot):
+                if (
+                    is_difficulty_dialog(shot)
+                    or is_formation_screen(shot)
+                    or is_travel_dialog(shot)
+                    or is_start_attack_gate(shot)
+                ):
                     return True
             if is_travel_dialog(self._image()):
                 logger.info("После Напасть открыт диалог похода — план отдаю модулю")
@@ -2445,12 +2720,29 @@ class BlueStacksEngine(WorldSwitchMixin):
             logger.warning("Табличка мира есть, план не открылся — закрываю табличку")
             self._deselect_via_safe_grass()
             return False
+        if self._speed_burst_active() and kind == "baron":
+            opened = self._wait_for(
+                lambda img: is_formation_screen(img)
+                or is_no_commanders_parchment(img)
+                or is_travel_dialog(img)
+                or is_start_attack_gate(img),
+                timeout=1.15,
+                label="формирование",
+            )
+            shot = opened if opened is not None else self._image()
+            if self._dismiss_no_commanders(shot):
+                return False
+            if is_start_attack_gate(shot):
+                if not self._enter_plan_from_start_gate(shot):
+                    return False
+                shot = self._image()
+            return is_formation_screen(shot) or is_travel_dialog(shot)
         self.tap_rel("start_attack_confirm")
         opened = self._wait_for(
             lambda img: is_formation_screen(img)
             or is_no_commanders_parchment(img)
             or (kind in {"samurai", "nomad"} and is_difficulty_dialog(img)),
-            timeout=10,
+            timeout=1.2 if self._speed_burst_active() else 10,
             label="формирование",
         )
         shot = opened if opened is not None else self._image()
@@ -2588,7 +2880,11 @@ class BlueStacksEngine(WorldSwitchMixin):
 
     def _dump_picker_max(self) -> bool:
         """LEFT-side MAX that fills to capacity. Never the cancel that zeros."""
-        wait_seconds = self._vision_seconds("picker_max_wait_seconds", 10)
+        wait_seconds = (
+            0.45
+            if self._speed_burst_active()
+            else self._vision_seconds("picker_max_wait_seconds", 10)
+        )
         image = self._image()
         before = self._read_ratio_from_image(image, "picker_units")
         if before and before[1] > 0 and before[0] >= before[1]:
@@ -2652,7 +2948,7 @@ class BlueStacksEngine(WorldSwitchMixin):
             if time.time() >= next_heartbeat:
                 logger.info("Пикер: жду MAX… ({:.0f}s)", time.time() - started)
                 next_heartbeat = time.time() + 2.0
-            CONTROL.sleep(0.25)
+            CONTROL.sleep(0.05 if self._speed_burst_active() else 0.25)
         if latest:
             self._last_picker_fill = latest
         return bool(latest and latest[0] >= latest[1] > 0)
@@ -2807,6 +3103,42 @@ class BlueStacksEngine(WorldSwitchMixin):
             return True, "", formation
         return False, "residual_units_unavailable", formation
 
+    def _pack_fill_center_fast(self, image: Any | None = None) -> tuple[bool, str]:
+        """Slot → MAX → check in under ~1s. No 10s OCR waits."""
+        shot = image if image is not None else self._image()
+        if self._picker_overlay_open(shot):
+            self._dump_picker_max()
+            confirm = self._picker_confirm_point(self._image())
+            if confirm is None:
+                return False, "unit_picker_confirm_not_confident"
+            self._tap_norm_exact(*confirm)
+            CONTROL.sleep(0.12)
+            self._last_picker_fill = self._last_picker_fill or (1, 1)
+            return True, ""
+        slot = (self.layout.get("buttons") or {}).get("unit_slot")
+        if slot:
+            self._tap_norm_exact(float(slot[0]), float(slot[1]))
+            CONTROL.sleep(0.08)
+        picker = self._wait_for(self._picker_overlay_open, timeout=0.7, label="открытие пикера")
+        if picker is None:
+            slots = find_formation_unit_slots(self._image())
+            if slots:
+                self._tap_norm_exact(*slots[0])
+                picker = self._wait_for(
+                    self._picker_overlay_open, timeout=0.55, label="открытие пикера слотом"
+                )
+        if picker is None:
+            return False, "unit_picker_not_found"
+        self._picker_max_adjusted = False
+        self._dump_picker_max()
+        confirm = self._picker_confirm_point(self._image())
+        if confirm is None:
+            return False, "unit_picker_confirm_not_confident"
+        self._tap_norm_exact(*confirm)
+        CONTROL.sleep(0.12)
+        self._last_picker_fill = self._last_picker_fill or (1, 1)
+        return True, ""
+
     def _prepare_single_center_wave(self) -> tuple[bool, str]:
         # Every attack, including the 4th+: cell → MAX → 10/10 → green check.
         # After OK the formation stays confirmed — never pick a different soldier.
@@ -2839,9 +3171,13 @@ class BlueStacksEngine(WorldSwitchMixin):
                         confirm[1],
                     )
                     self._tap_norm_exact(*confirm)
-                    CONTROL.sleep(0.22)
+                    CONTROL.sleep(0.12)
                     self._last_picker_fill = (1, 1)
                     return True, ""
+            ok, reason = self._pack_fill_center_fast(shot)
+            if ok:
+                return True, ""
+            logger.warning("PACK: быстрый набор не вышел ({}) — один обычный проход", reason)
         last_reason = ""
         attempts = 1 if self._speed_burst_active() else 2
         for sequence_attempt in range(attempts):
@@ -3343,10 +3679,54 @@ class BlueStacksEngine(WorldSwitchMixin):
         write_progress(inbox_cleared=cleared)
         return cleared
 
+    def _recenter_after_pack_send(self) -> None:
+        """Jump the map to the main castle after a send. Never opens Navigation."""
+        try:
+            image = self._image()
+        except Exception:
+            return
+        if (
+            is_travel_dialog(image)
+            or is_formation_screen(image)
+            or self._picker_overlay_open(image)
+        ):
+            image = self._await_world_map(timeout=1.2) or image
+        if (
+            is_travel_dialog(image)
+            or is_formation_screen(image)
+            or self._picker_overlay_open(image)
+        ):
+            logger.info("После атаки план ещё открыт — ЦЗ подождёт")
+            return
+        marker = find_main_castle_marker(image)
+        if marker and 0.32 < marker[0] < 0.68 and 0.38 < marker[1] < 0.72:
+            logger.info("ЦЗ уже в кадре ({:.3f}, {:.3f})", marker[0], marker[1])
+            self._deselect_via_safe_grass()
+            return
+        sextant = find_home_sextant_button(image)
+        if sextant is not None:
+            logger.info(
+                "После атаки: возврат к ЦЗ секстантом ({:.3f}, {:.3f})",
+                sextant[0],
+                sextant[1],
+            )
+            self._tap_norm_exact(*sextant)
+            CONTROL.sleep(0.14 if self._speed_burst_active() else 0.45)
+            self._deselect_via_safe_grass()
+            return
+        if marker:
+            logger.info("После атаки: дотягиваю карту к маркеру ЦЗ")
+            self._pan_map(marker[0] - 0.50, marker[1] - 0.54)
+            CONTROL.sleep(0.14)
+            self._deselect_via_safe_grass()
+            return
+        logger.info("После атаки: маркер ЦЗ не виден — Навигацию не открываю")
+
     def _home_after_send(self, kind: str, result: str) -> None:
         if result != kind:
             return
         if self._speed_burst_active():
+            self._recenter_after_pack_send()
             return
         self._return_home_via_castle_hud()
 
@@ -3436,10 +3816,50 @@ class BlueStacksEngine(WorldSwitchMixin):
             hud.get("coords"),
         )
 
+    def _enter_plan_from_start_gate(self, image: Any | None = None) -> bool:
+        """Green seal on compact «Начать нападение» opens the plan. It does not send."""
+        shot = image if image is not None else self._image()
+        pair = find_start_attack_gate_seals(shot)
+        if pair is None:
+            return False
+        green, _red = pair
+        logger.warning(
+            "«Начать нападение» — галочка в план ({:.3f}, {:.3f}), не отправка",
+            green[0],
+            green[1],
+        )
+        self._tap_norm_exact(*green)
+        opened = self._wait_for(
+            is_formation_screen,
+            timeout=1.2 if self._speed_burst_active() else 8,
+            label="план после печати",
+        )
+        return opened is not None
+
     def _pack_confirm_open_travel(self, kind: str) -> str:
         """Finish a leftover movement-planning dialog instead of hunting behind it."""
         travel = self._image()
+        if (
+            is_start_attack_gate(travel)
+            or is_formation_screen(travel)
+            or self._picker_overlay_open(travel)
+        ):
+            logger.warning("PACK leftover — гейт/план/пикер, не подтверждаю как поход")
+            return "travel_dialog_not_found"
         if not is_travel_dialog(travel):
+            return "travel_dialog_not_found"
+        pair = find_travel_seal_pair(travel)
+        diagnostic = movement_confirm_diagnostics(travel)
+        point = diagnostic.get("point")
+        bottom = (
+            pair is not None and float(pair[0][1]) >= 0.74
+        ) or (
+            bool(diagnostic.get("valid"))
+            and point is not None
+            and float(point[1]) >= 0.74
+        )
+        if not bottom:
+            logger.warning("PACK leftover — нет нижней печати похода")
             return "travel_dialog_not_found"
         if self._dismiss_no_commanders(travel):
             return "no_commanders"
@@ -3453,11 +3873,8 @@ class BlueStacksEngine(WorldSwitchMixin):
                 return "feather_count_not_read"
         one_way = self._read_march_time(travel)
         if one_way is None:
-            if self._speed_burst_active():
-                one_way = 1
-            else:
-                self.tap_rel("travel_cancel")
-                return "march_time_not_read"
+            self.tap_rel("travel_cancel")
+            return "march_time_not_read"
         logger.warning("PACK leftover travel — confirm {} one_way={}", kind, one_way)
         fake_target = {
             "kingdom": int((self.config.get("baron_attacks") or {}).get("kingdom", 0)),
@@ -3553,7 +3970,9 @@ class BlueStacksEngine(WorldSwitchMixin):
             if getattr(self, "_pack_finished", False):
                 return last if last != "no_targets" else kind
             image = self._image()
-            if self._dismiss_empty_wave_warning():
+            if is_start_attack_gate(image):
+                logger.warning("PACK leftover gate — вход в план, send не считаю")
+                self._enter_plan_from_start_gate(image)
                 continue
             if is_travel_dialog(image):
                 logger.warning("PACK leftover travel — confirm send")
@@ -3561,6 +3980,7 @@ class BlueStacksEngine(WorldSwitchMixin):
                 last = result
                 if result == kind:
                     self._block_screen_target((0.50, 0.50))
+                    self._recenter_after_pack_send()
                 elif result == "no_commanders":
                     return result
                 continue
@@ -3573,8 +3993,11 @@ class BlueStacksEngine(WorldSwitchMixin):
                     leftover = self._image()
                     if is_formation_screen(leftover):
                         self.close_formation_plan()
+                    self._recenter_after_pack_send()
                 elif result == "no_commanders":
                     return result
+                continue
+            if self._dismiss_empty_wave_warning():
                 continue
             if is_loading_screen(image):
                 CONTROL.sleep(0.12)
@@ -3602,6 +4025,14 @@ class BlueStacksEngine(WorldSwitchMixin):
                     CONTROL.sleep(0.12)
                 continue
             if not self._pack_hud_matches_world(image, world_id):
+                if (
+                    self._speed_burst_active()
+                    and world_id == "great_empire"
+                    and map_grass_ratio(image) >= 0.12
+                ):
+                    logger.info("PACK: Великая империя на месте — к ЦЗ без Навигации")
+                    self._recenter_after_pack_send()
+                    continue
                 now = time.time()
                 last_home = float(getattr(self, "_pack_last_home_at", 0.0) or 0.0)
                 if now - last_home >= 2.0:
@@ -3659,6 +4090,10 @@ class BlueStacksEngine(WorldSwitchMixin):
             last = result
             if result == kind:
                 self._block_screen_target(point)
+                leftover = self._image()
+                if is_formation_screen(leftover):
+                    self.close_formation_plan()
+                self._recenter_after_pack_send()
             elif result == "no_commanders":
                 return result
         times = getattr(self, "_pack_send_times", None) or []
@@ -3870,7 +4305,11 @@ class BlueStacksEngine(WorldSwitchMixin):
         self._tap_formation_attack()
         travel = self._wait_for(
             lambda img: is_travel_dialog(img) or is_no_commanders_parchment(img),
-            timeout=self._vision_seconds("travel_dialog_timeout_seconds", 15),
+            timeout=(
+                1.1
+                if self._speed_burst_active()
+                else self._vision_seconds("travel_dialog_timeout_seconds", 15)
+            ),
             label="диалог похода",
         )
         if travel is not None and self._dismiss_no_commanders(travel):
@@ -3883,6 +4322,13 @@ class BlueStacksEngine(WorldSwitchMixin):
                 return "no_commanders"
             logger.warning("Нет диалога похода — план не закрываю крестиком")
             return "travel_dialog_not_found"
+        if (
+            is_start_attack_gate(travel)
+            or is_formation_screen(travel)
+            or self._picker_overlay_open(travel)
+        ):
+            logger.warning("После Нападения гейт/план/пикер — это не поход, send не считаю")
+            return "travel_dialog_not_found"
         movement, feathers = self._movement_option(travel)
         if movement == "unknown":
             self.tap_rel("travel_cancel")
@@ -3892,12 +4338,9 @@ class BlueStacksEngine(WorldSwitchMixin):
         travel = self._image()
         one_way = self._read_march_time(travel)
         if one_way is None:
-            if self._speed_burst_active():
-                one_way = 1
-            else:
-                self.tap_rel("travel_cancel")
-                logger.warning("Атака отменена: не удалось прочитать время похода")
-                return "march_time_not_read"
+            self.tap_rel("travel_cancel")
+            logger.warning("Атака отменена: не удалось прочитать время похода")
+            return "march_time_not_read"
         if movement == "gold":
             logger.warning(f"Перьев нет ({feathers}); выбран разрешённый вариант за золото")
         fake_target = {

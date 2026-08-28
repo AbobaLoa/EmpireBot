@@ -21,28 +21,43 @@ from e4kbot.vision import (
     APPLY_PRESET_ALL_TEMPLATE,
     AUTOSELECT_BUTTON_TEMPLATE,
     AUTOSELECT_DIALOG_TEMPLATE,
+    DAIMYO_TEMPLATES,
+    FEATHER_HORSE_MIN_X,
+    FEATHER_HORSE_TEMPLATE,
     NOMAD_TEMPLATE,
     NOMAD_TOOL_BADGE_TEMPLATE,
     NOMAD_TOOL_TILE_TEMPLATE,
     NomadToolStock,
     PRESET_BUTTON_TEMPLATE,
     PRESETS_DIALOG_TEMPLATE,
+    SAMURAI_FEATHER_HORSE_TEMPLATE,
     SAMURAI_TEMPLATE,
+    SAVE_PRESET_BUTTON_TEMPLATE,
+    SAVE_PRESET_CONFIRM_TEMPLATE,
     TOOL_BONUS_TEMPLATE,
     assign_flank_tools,
     find_apply_preset_all,
     find_autoselect_button,
+    find_daimyo_candidates,
+    find_feather_horse,
+    find_in_stock_tool_plus,
     find_nomad_candidates,
     find_preset_button,
     find_preset_dialog_close,
+    find_save_preset_button,
     find_samurai_candidates,
     find_template_center,
     find_tool_bonus_candidates,
     is_autoselect_dialog,
+    is_feather_selected,
     is_info_plaque,
     is_presets_dialog,
+    is_ruby_horse_selected,
+    is_save_preset_dialog,
     parse_report_resources,
     parse_samurai_camp_level,
+    plaque_text_is_player_keep,
+    plaque_text_is_samurai_camp,
     remaining_attacks_from_level,
     remaining_attacks_from_nomad_level,
 )
@@ -89,6 +104,16 @@ class SamuraiLimitsTests(unittest.TestCase):
         self.assertEqual(parse_samurai_camp_level("Лагерь самураев Ур. 41"), 41)
         self.assertEqual(parse_samurai_camp_level("lvl 21"), 21)
 
+    def test_plaque_text_rejects_player_keep_and_accepts_samurai_camp(self) -> None:
+        self.assertTrue(plaque_text_is_samurai_camp("Лагерь самураев Ур. 41"))
+        self.assertTrue(plaque_text_is_samurai_camp("Samurai camp lvl 31"))
+        self.assertFalse(plaque_text_is_player_keep("Лагерь самураев Ур. 41"))
+        self.assertTrue(plaque_text_is_player_keep("Замок Abozaval"))
+        self.assertTrue(plaque_text_is_player_keep("Castle ThirdAbob"))
+        self.assertTrue(plaque_text_is_player_keep("Даймё крепость"))
+        self.assertFalse(plaque_text_is_samurai_camp("Замок Abozaval"))
+        self.assertFalse(plaque_text_is_samurai_camp("Va ng moka davon Abozaval"))
+
     def test_ten_remaining_then_camp_rests_without_three_hour_cd(self) -> None:
         store = StateStore(path=self._tmp("state.json"))
         store.set_samurai_remaining((100, 200), 10)
@@ -112,7 +137,7 @@ class SamuraiLimitsTests(unittest.TestCase):
         self.assertFalse(wave_has_units((0, 130)))
         self.assertFalse(wave_has_units(None))
 
-    def test_no_tools_skips_preset_and_goes_to_autoselect(self) -> None:
+    def test_no_tools_does_not_press_attack(self) -> None:
         from e4kbot.attacks.samurai_camps import SamuraiCampsModule
 
         module = SamuraiCampsModule()
@@ -126,47 +151,29 @@ class SamuraiLimitsTests(unittest.TestCase):
 
             def _read_ratio_from_image(self, _image, name):
                 if name == "formation_units":
-                    return (0, 130)
+                    return (0, 297)
                 if name == "formation_tools":
-                    return (0, 20)
+                    return (0, 40)
                 return None
 
-        def _fake_fill(_driver):
-            calls.append("fill")
-            return False
-
-        def _fake_preset(_driver):
-            calls.append("preset")
-            return True
-
-        def _fake_autoselect(_driver):
-            calls.append("autoselect")
-            return True
-
-        def _fake_dismiss(_driver):
-            calls.append("dismiss")
-
-        module._fill_support_tools = _fake_fill  # type: ignore[method-assign]
-        module._first_preset_flow = _fake_preset  # type: ignore[method-assign]
-        module._run_autoselect = _fake_autoselect  # type: ignore[method-assign]
-        module._dismiss_tool_picker = _fake_dismiss  # type: ignore[method-assign]
+        module._fill_support_tools = lambda _d: calls.append("fill") or False  # type: ignore[method-assign]
+        module._first_preset_flow = lambda _d: calls.append("preset") or True  # type: ignore[method-assign]
+        module._run_autoselect = lambda _d: calls.append("autoselect") or True  # type: ignore[method-assign]
 
         with patch(
             "e4kbot.attacks.samurai_camps.is_formation_screen",
             return_value=True,
         ):
             ok, reason = module._prepare_waves(_Driver())
-        self.assertTrue(ok)
-        self.assertEqual(reason, "")
-        self.assertEqual(calls, ["fill", "dismiss", "autoselect"])
+        self.assertFalse(ok)
+        self.assertEqual(reason, "tools_not_filled")
+        self.assertEqual(calls, ["fill"])
         self.assertFalse(module._preset_ready)
-        self.assertTrue(module._tools_unavailable)
 
-    def test_later_attack_skips_fill_when_tools_already_empty(self) -> None:
+    def test_first_attack_saves_preset_then_autoselect(self) -> None:
         from e4kbot.attacks.samurai_camps import SamuraiCampsModule
 
         module = SamuraiCampsModule()
-        module._tools_unavailable = True
         calls: list[str] = []
 
         class _Driver:
@@ -176,12 +183,15 @@ class SamuraiLimitsTests(unittest.TestCase):
                 return Image.new("RGB", (900, 1600), (40, 28, 20))
 
             def _read_ratio_from_image(self, _image, name):
-                return (0, 130) if name == "formation_units" else (0, 20)
+                if name == "formation_units":
+                    return (0, 297) if "autoselect" not in calls else (297, 297)
+                if name == "formation_tools":
+                    return (40, 40) if "fill" in calls else (0, 40)
+                return None
 
         module._fill_support_tools = lambda _d: calls.append("fill") or True  # type: ignore[method-assign]
         module._first_preset_flow = lambda _d: calls.append("preset") or True  # type: ignore[method-assign]
         module._run_autoselect = lambda _d: calls.append("autoselect") or True  # type: ignore[method-assign]
-        module._dismiss_tool_picker = lambda _d: calls.append("dismiss")  # type: ignore[method-assign]
 
         with patch(
             "e4kbot.attacks.samurai_camps.is_formation_screen",
@@ -190,8 +200,235 @@ class SamuraiLimitsTests(unittest.TestCase):
             ok, reason = module._prepare_waves(_Driver())
         self.assertTrue(ok)
         self.assertEqual(reason, "")
-        self.assertEqual(calls, ["dismiss", "autoselect"])
-        self.assertFalse(module._preset_ready)
+        self.assertEqual(calls, ["fill", "preset", "autoselect"])
+        self.assertTrue(module._preset_ready)
+
+    def test_later_attack_applies_preset_and_checks_front_tools(self) -> None:
+        from e4kbot.attacks.samurai_camps import SamuraiCampsModule
+
+        module = SamuraiCampsModule()
+        module._preset_ready = True
+        calls: list[str] = []
+
+        class _Driver:
+            layout = {"buttons": {"flank_2": [0.14, 0.51]}, "regions": {}}
+
+            def _image(self):
+                return Image.new("RGB", (900, 1600), (40, 28, 20))
+
+            def _read_ratio_from_image(self, _image, name):
+                if name == "formation_units":
+                    return (0, 297)
+                if name == "formation_tools":
+                    return (40, 40) if "apply" in calls else (0, 40)
+                return None
+
+            def _tap_norm_exact(self, *_args):
+                calls.append("front")
+
+        module._apply_preset_only = lambda _d: calls.append("apply") or True  # type: ignore[method-assign]
+        module._fill_support_tools = lambda _d: calls.append("fill") or True  # type: ignore[method-assign]
+        module._run_autoselect = lambda _d: calls.append("autoselect") or True  # type: ignore[method-assign]
+
+        with patch(
+            "e4kbot.attacks.samurai_camps.is_formation_screen",
+            return_value=True,
+        ):
+            ok, reason = module._prepare_waves(_Driver())
+        self.assertTrue(ok)
+        self.assertEqual(reason, "")
+        self.assertEqual(calls, ["apply", "front", "autoselect"])
+        self.assertNotIn("fill", calls)
+
+    def test_later_attack_refills_when_preset_tools_not_max(self) -> None:
+        from e4kbot.attacks.samurai_camps import SamuraiCampsModule
+
+        module = SamuraiCampsModule()
+        module._preset_ready = True
+        calls: list[str] = []
+
+        class _Driver:
+            layout = {"buttons": {"flank_2": [0.14, 0.51]}, "regions": {}}
+
+            def _image(self):
+                return Image.new("RGB", (900, 1600), (40, 28, 20))
+
+            def _read_ratio_from_image(self, _image, name):
+                if name == "formation_units":
+                    return (0, 297)
+                if name == "formation_tools":
+                    return (40, 40) if "fill" in calls else (12, 40)
+                return None
+
+            def _tap_norm_exact(self, *_args):
+                return None
+
+        module._apply_preset_only = lambda _d: calls.append("apply") or True  # type: ignore[method-assign]
+        module._fill_support_tools = lambda _d: calls.append("fill") or True  # type: ignore[method-assign]
+        module._save_preset_safe = lambda _d: calls.append("save") or True  # type: ignore[method-assign]
+        module._run_autoselect = lambda _d: calls.append("autoselect") or True  # type: ignore[method-assign]
+
+        with patch(
+            "e4kbot.attacks.samurai_camps.is_formation_screen",
+            return_value=True,
+        ):
+            ok, reason = module._prepare_waves(_Driver())
+        self.assertTrue(ok)
+        self.assertEqual(calls, ["apply", "fill", "save", "autoselect"])
+
+    def test_junk_front_ocr_does_not_count_as_empty(self) -> None:
+        from e4kbot.attacks.samurai_camps import SamuraiCampsModule
+
+        module = SamuraiCampsModule()
+        self.assertFalse(module._tools_full((0, 4)))
+        self.assertTrue(module._tools_full((40, 40)))
+
+        class _Driver:
+            def _image(self):
+                return Image.new("RGB", (900, 1600), (40, 28, 20))
+
+            def _read_ratio_from_image(self, _image, name):
+                if name == "formation_tools":
+                    return (0, 4)
+                return None
+
+        with patch(
+            "e4kbot.attacks.samurai_camps.find_formation_tool_slots",
+            return_value=[(0.62, 0.70), (0.70, 0.70)],
+        ):
+            self.assertTrue(module._tools_ready(_Driver()))
+        with patch(
+            "e4kbot.attacks.samurai_camps.find_formation_tool_slots",
+            return_value=[(0.54, 0.70), (0.62, 0.70), (0.70, 0.70)],
+        ):
+            self.assertFalse(module._tools_ready(_Driver()))
+
+    def test_fill_support_tools_switches_front_left_right(self) -> None:
+        from e4kbot.attacks.samurai_camps import SamuraiCampsModule
+
+        taps: list[tuple[float, float]] = []
+        fills: list[str] = []
+
+        class _Driver:
+            layout = {
+                "buttons": {
+                    "flank_1": [0.052, 0.51],
+                    "flank_2": [0.138, 0.51],
+                    "flank_3": [0.218, 0.51],
+                },
+                "regions": {},
+            }
+
+            def _image(self):
+                return Image.new("RGB", (900, 1600), (40, 28, 20))
+
+            def _tap_norm_exact(self, x, y):
+                taps.append((round(float(x), 3), round(float(y), 3)))
+
+            def _read_ratio_from_image(self, _image, name):
+                return (40, 40)
+
+            def _wait_for(self, *_args, **_kwargs):
+                return self._image()
+
+        module = SamuraiCampsModule()
+        module._fill_flank_tools = lambda _d, name: fills.append(name) or True  # type: ignore[method-assign]
+        module._dismiss_tool_picker = lambda _d: None  # type: ignore[method-assign]
+
+        with patch("e4kbot.attacks.samurai_camps.is_formation_screen", return_value=True), patch(
+            "e4kbot.attacks.samurai_camps.find_picker_confirm_button", return_value=None
+        ), patch(
+            "e4kbot.attacks.samurai_camps.is_tool_catalog", return_value=False
+        ), patch(
+            "e4kbot.attacks.samurai_camps.CONTROL.sleep"
+        ):
+            ok = module._fill_support_tools(_Driver())
+        self.assertTrue(ok)
+        self.assertEqual(fills, ["фронт", "левый", "правый"])
+        flank_taps = [item for item in taps if item[1] == 0.51]
+        self.assertEqual(
+            flank_taps,
+            [(0.138, 0.51), (0.052, 0.51), (0.218, 0.51), (0.138, 0.51)],
+        )
+
+    def test_fill_support_tools_requires_all_three_flanks(self) -> None:
+        from e4kbot.attacks.samurai_camps import SamuraiCampsModule
+
+        fills: list[str] = []
+
+        class _Driver:
+            layout = {
+                "buttons": {
+                    "flank_1": [0.052, 0.51],
+                    "flank_2": [0.138, 0.51],
+                    "flank_3": [0.218, 0.51],
+                },
+                "regions": {},
+            }
+
+            def _image(self):
+                return Image.new("RGB", (900, 1600), (40, 28, 20))
+
+            def _tap_norm_exact(self, *_args):
+                return None
+
+            def _read_ratio_from_image(self, _image, name):
+                return (40, 40) if name == "formation_tools" else (0, 297)
+
+            def _wait_for(self, *_args, **_kwargs):
+                return self._image()
+
+        module = SamuraiCampsModule()
+        module._fill_flank_tools = lambda _d, name: fills.append(name) or (name != "правый")  # type: ignore[method-assign]
+        module._dismiss_tool_picker = lambda _d: None  # type: ignore[method-assign]
+
+        with patch("e4kbot.attacks.samurai_camps.is_formation_screen", return_value=True), patch(
+            "e4kbot.attacks.samurai_camps.find_picker_confirm_button", return_value=None
+        ), patch(
+            "e4kbot.attacks.samurai_camps.is_tool_catalog", return_value=False
+        ), patch(
+            "e4kbot.attacks.samurai_camps.CONTROL.sleep"
+        ):
+            ok = module._fill_support_tools(_Driver())
+        self.assertFalse(ok)
+        self.assertEqual(fills, ["фронт", "левый", "правый"])
+
+    def test_fill_flank_tools_opens_slot_even_if_previous_flank_looks_full(self) -> None:
+        from e4kbot.attacks.samurai_camps import SamuraiCampsModule
+
+        taps: list[tuple[float, float]] = []
+
+        class _Driver:
+            layout = {"buttons": {"tool_slot": [0.62, 0.70]}, "regions": {}}
+
+            def _image(self):
+                return Image.new("RGB", (900, 1600), (40, 28, 20))
+
+            def _tap_norm_exact(self, x, y):
+                taps.append((round(float(x), 3), round(float(y), 3)))
+
+            def _read_ratio_from_image(self, _image, name):
+                return (40, 40)
+
+            def _wait_for(self, *_args, **_kwargs):
+                return self._image()
+
+        module = SamuraiCampsModule()
+        with patch("e4kbot.attacks.samurai_camps.is_formation_screen", return_value=True), patch(
+            "e4kbot.attacks.samurai_camps.find_picker_confirm_button", return_value=None
+        ), patch(
+            "e4kbot.attacks.samurai_camps.is_tool_catalog", return_value=False
+        ), patch(
+            "e4kbot.attacks.samurai_camps.find_formation_tool_slots",
+            return_value=[(0.598, 0.697)],
+        ), patch(
+            "e4kbot.attacks.samurai_camps.CONTROL.sleep"
+        ), patch(
+            "e4kbot.attacks.samurai_camps.save_shot"
+        ):
+            ok = module._fill_flank_tools(_Driver(), "левый")
+        self.assertTrue(ok)
+        self.assertEqual(taps[0], (0.598, 0.697))
 
     def _tmp(self, name: str):
         folder = TemporaryDirectory()
@@ -209,8 +446,21 @@ class SamuraiVisionTests(unittest.TestCase):
             AUTOSELECT_BUTTON_TEMPLATE,
             AUTOSELECT_DIALOG_TEMPLATE,
             SAMURAI_TEMPLATE,
+            SAVE_PRESET_BUTTON_TEMPLATE,
+            SAVE_PRESET_CONFIRM_TEMPLATE,
+            FEATHER_HORSE_TEMPLATE,
+            SAMURAI_FEATHER_HORSE_TEMPLATE,
+            *DAIMYO_TEMPLATES,
         ):
             self.assertTrue(path.exists(), path.name)
+
+    def test_finds_daimyo_on_green_map(self) -> None:
+        sprite = DAIMYO_TEMPLATES[0]
+        image = Image.new("RGB", (900, 1600), (62, 128, 48))
+        tmpl = Image.open(sprite).convert("RGB")
+        image.paste(tmpl, (360, 640))
+        daimyo = find_daimyo_candidates(image)
+        self.assertGreaterEqual(len(daimyo), 1)
 
     def test_finds_preset_and_autoselect_on_planning_bar(self) -> None:
         image = _canvas_with(PRESET_BUTTON_TEMPLATE, (0.22, 0.93))
@@ -237,6 +487,27 @@ class SamuraiVisionTests(unittest.TestCase):
     def test_autoselect_dialog_is_detected(self) -> None:
         dialog = Image.open(AUTOSELECT_DIALOG_TEMPLATE).convert("RGB")
         self.assertTrue(is_autoselect_dialog(dialog))
+
+    def test_save_preset_confirm_is_detected(self) -> None:
+        image = Image.new("RGB", (900, 1600), (48, 32, 22))
+        dialog = Image.open(SAVE_PRESET_CONFIRM_TEMPLATE).convert("RGB")
+        image.paste(dialog, (228, 604))
+        self.assertTrue(is_save_preset_dialog(image))
+
+    def test_save_preset_button_matches_floppy(self) -> None:
+        image = _canvas_with(SAVE_PRESET_BUTTON_TEMPLATE, (0.18, 0.58))
+        found = find_save_preset_button(image)
+        self.assertIsNotNone(found)
+        self.assertLess(found[0], 0.45)
+
+    def test_first_in_stock_tool_plus_skips_zero_stock(self) -> None:
+        crop = Image.open(ROOT / "assets" / "samurai" / "tools_ladders.png").convert("RGB")
+        image = Image.new("RGB", (900, 1600), (72, 48, 28))
+        image.paste(crop, (400, 480))
+        plus = find_in_stock_tool_plus(image)
+        self.assertIsNotNone(plus)
+        self.assertGreater(plus[0], 0.70)
+        self.assertGreater(plus[1], 0.38)
 
     def test_tool_bonus_template_matches_itself(self) -> None:
         image = _canvas_with(TOOL_BONUS_TEMPLATE, (0.62, 0.55))
@@ -276,7 +547,7 @@ class SamuraiVisionTests(unittest.TestCase):
         image = Image.new("RGB", (900, 1600), (104, 151, 57))
         tmpl = Image.open(SAMURAI_TEMPLATE).convert("RGB")
         image.paste(tmpl, (360, 400))
-        found = find_samurai_candidates(image, 0.65)
+        found = find_samurai_candidates(image, 0.65, max_hits=4)
         self.assertGreaterEqual(len(found), 1)
         self.assertLessEqual(len(found), 4)
 
@@ -284,7 +555,7 @@ class SamuraiVisionTests(unittest.TestCase):
         path = ROOT / "shots" / "samurai_live_now.png"
         if not path.exists():
             self.skipTest("no live map screenshot")
-        found = find_samurai_candidates(Image.open(path).convert("RGB"), 0.65)
+        found = find_samurai_candidates(Image.open(path).convert("RGB"), 0.65, max_hits=4)
         if len(found) < 3:
             self.skipTest("live screenshot is not a camp map")
         self.assertGreaterEqual(len(found), 3)
@@ -298,6 +569,61 @@ class SamuraiVisionTests(unittest.TestCase):
         draw.ellipse((300, 500, 360, 560), outline=(255, 80, 0), width=6)
         draw.ellipse((500, 700, 560, 760), outline=(255, 80, 0), width=6)
         self.assertEqual(find_samurai_candidates(image, 0.65), [])
+
+    def test_live_send_shot_does_not_tap_ruby_warhorse(self) -> None:
+        path = ROOT / "shots" / "samurai_605_734_1787940203.png"
+        if not path.exists():
+            self.skipTest("no live ruby-horse send screenshot")
+        image = Image.open(path).convert("RGB")
+        point = find_feather_horse(image)
+        self.assertIsNotNone(point)
+        self.assertGreaterEqual(point[0], FEATHER_HORSE_MIN_X)
+        self.assertGreater(point[0], 0.72)
+        self.assertNotAlmostEqual(point[0], 0.662, places=2)
+        self.assertTrue(is_ruby_horse_selected(image))
+        self.assertFalse(is_feather_selected(image))
+
+    def test_movement_dialog_feather_is_rightmost_not_ruby(self) -> None:
+        path = ROOT / "shots" / "movement-confirm-before.png"
+        if not path.exists():
+            self.skipTest("no movement-confirm-before screenshot")
+        image = Image.open(path).convert("RGB")
+        point = find_feather_horse(image)
+        self.assertIsNotNone(point)
+        self.assertGreaterEqual(point[0], FEATHER_HORSE_MIN_X)
+        self.assertGreater(point[0], 0.74)
+        self.assertNotAlmostEqual(point[0], 0.662, places=2)
+        self.assertTrue(is_ruby_horse_selected(image))
+        self.assertFalse(is_feather_selected(image))
+
+    def test_pick_feather_cancels_when_ruby_stays_selected(self) -> None:
+        from e4kbot.attacks.samurai_camps import SamuraiCampsModule
+
+        path = ROOT / "shots" / "samurai_605_734_1787940203.png"
+        if not path.exists():
+            self.skipTest("no live ruby-horse send screenshot")
+        image = Image.open(path).convert("RGB")
+        taps: list[tuple[float, float]] = []
+
+        class _Driver:
+            layout = {"buttons": {"travel_cancel": [0.23, 0.815]}}
+
+            def _image(self):
+                return image
+
+            def _tap_norm_exact(self, x, y):
+                taps.append((float(x), float(y)))
+
+        module = SamuraiCampsModule()
+        with patch("e4kbot.attacks.samurai_camps.CONTROL.sleep"), patch(
+            "e4kbot.attacks.samurai_camps.save_shot"
+        ):
+            result = module._pick_feather(_Driver(), image)
+        self.assertEqual(result, "ruby_movement_refused")
+        horse_taps = [item for item in taps if item[0] >= FEATHER_HORSE_MIN_X]
+        self.assertGreaterEqual(len(horse_taps), 1)
+        self.assertTrue(all(item[0] >= FEATHER_HORSE_MIN_X for item in horse_taps))
+        self.assertTrue(any(item[0] < 0.40 for item in taps))
 
 
 class NomadCampsTests(unittest.TestCase):
@@ -336,11 +662,13 @@ class NomadCampsTests(unittest.TestCase):
         draw.rectangle((160, 280, 740, 1080), fill=(118, 78, 38))
         self.assertTrue(is_info_plaque(parchment))
 
-    def test_compact_start_attack_seals_are_travel_dialog(self) -> None:
+    def test_compact_start_attack_seals_are_gate_not_travel(self) -> None:
         from PIL import ImageDraw
 
         from e4kbot.vision import (
+            find_start_attack_gate_seals,
             find_travel_seal_pair,
+            is_start_attack_gate,
             is_travel_dialog,
             movement_confirm_diagnostics,
         )
@@ -350,18 +678,70 @@ class NomadCampsTests(unittest.TestCase):
         draw.rectangle((80, 220, 820, 1180), fill=(210, 190, 150))
         draw.ellipse((180, 920, 310, 1050), fill=(200, 40, 30))
         draw.ellipse((620, 920, 750, 1050), fill=(40, 170, 55))
+        self.assertTrue(is_start_attack_gate(image))
+        self.assertFalse(is_travel_dialog(image))
+        self.assertIsNone(find_travel_seal_pair(image))
+        pair = find_start_attack_gate_seals(image)
+        self.assertIsNotNone(pair)
+        green, red = pair
+        self.assertGreater(green[0], 0.65)
+        self.assertLess(red[0], 0.40)
+        self.assertAlmostEqual(green[1], 0.616, delta=0.04)
+        self.assertLess(green[1], 0.72)
+        diagnostic = movement_confirm_diagnostics(image)
+        self.assertFalse(diagnostic["valid"])
+        if diagnostic["point"] is not None:
+            self.assertGreaterEqual(diagnostic["point"][1], 0.74)
+        self.assertEqual(find_nomad_candidates(image, 0.65), [])
+
+    def test_bottom_travel_seals_are_the_real_send(self) -> None:
+        from PIL import ImageDraw
+
+        from e4kbot.vision import (
+            find_start_attack_gate_seals,
+            find_travel_seal_pair,
+            is_start_attack_gate,
+            is_travel_dialog,
+            movement_confirm_diagnostics,
+        )
+
+        image = Image.new("RGB", (900, 1600), (104, 151, 57))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((80, 180, 820, 1420), fill=(210, 190, 150))
+        draw.ellipse((142, 1241, 272, 1371), fill=(200, 40, 30))
+        draw.ellipse((626, 1241, 756, 1371), fill=(40, 170, 55))
+        self.assertFalse(is_start_attack_gate(image))
+        self.assertIsNone(find_start_attack_gate_seals(image))
         self.assertTrue(is_travel_dialog(image))
         pair = find_travel_seal_pair(image)
         self.assertIsNotNone(pair)
         green, red = pair
         self.assertGreater(green[0], 0.65)
         self.assertLess(red[0], 0.40)
-        self.assertAlmostEqual(green[1], red[1], delta=0.04)
+        self.assertAlmostEqual(green[1], 0.816, delta=0.04)
+        self.assertGreaterEqual(green[1], 0.74)
         diagnostic = movement_confirm_diagnostics(image)
         self.assertTrue(diagnostic["valid"])
         self.assertGreater(diagnostic["point"][0], 0.65)
-        self.assertLess(diagnostic["point"][1], 0.72)
-        self.assertEqual(find_nomad_candidates(image, 0.65), [])
+        self.assertGreaterEqual(diagnostic["point"][1], 0.74)
+        self.assertAlmostEqual(diagnostic["point"][1], 0.816, delta=0.04)
+
+    def test_movement_diagnostics_prefer_bottom_seal_over_gate(self) -> None:
+        from PIL import ImageDraw
+
+        from e4kbot.vision import movement_confirm_diagnostics
+
+        image = Image.new("RGB", (900, 1600), (104, 151, 57))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((80, 180, 820, 1420), fill=(210, 190, 150))
+        draw.ellipse((180, 920, 310, 1050), fill=(200, 40, 30))
+        draw.ellipse((620, 920, 750, 1050), fill=(40, 170, 55))
+        draw.ellipse((142, 1241, 272, 1371), fill=(200, 40, 30))
+        draw.ellipse((626, 1241, 756, 1371), fill=(40, 170, 55))
+        diagnostic = movement_confirm_diagnostics(image)
+        self.assertTrue(diagnostic["valid"])
+        self.assertGreaterEqual(diagnostic["point"][1], 0.74)
+        self.assertAlmostEqual(diagnostic["point"][1], 0.816, delta=0.04)
 
     def test_grass_map_is_not_a_travel_dialog(self) -> None:
         from e4kbot.vision import is_travel_dialog
