@@ -115,8 +115,12 @@ def steps(config: dict[str, Any], store: StateStore) -> list[CampaignStep]:
         count = max(0, int(item.get("count") or spec.default_quota))
         enabled = bool(item.get("enabled", spec.status == "live"))
         sent = int(sent_map.get(mode_id) or 0)
-        if mode_id in skipped:
-            sent = max(sent, count)
+        if not enabled:
+            remaining = 0
+        elif mode_id in skipped:
+            remaining = 0
+        else:
+            remaining = max(0, count - sent)
         out.append(
             CampaignStep(
                 mode_id=mode_id,
@@ -124,7 +128,7 @@ def steps(config: dict[str, Any], store: StateStore) -> list[CampaignStep]:
                 enabled=enabled,
                 spec=spec,
                 sent=sent,
-                remaining=max(0, count - sent) if enabled else 0,
+                remaining=remaining,
             )
         )
     return out

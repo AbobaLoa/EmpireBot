@@ -32,6 +32,7 @@ class CampaignCheckpointTests(unittest.TestCase):
         store.live.current_world = "Вечнохолодный ледник"
         store.live.mode = "wait_commanders"
         store.live.next_attack_at = time.time() + 30
+        store.live.post_attack_home_pending = True
         mark_paused(store, None, path=ckpt)
         store.live.session_by_mode = {}
         store.live.active_mode = ""
@@ -39,6 +40,7 @@ class CampaignCheckpointTests(unittest.TestCase):
         self.assertEqual(decision, "resume")
         self.assertEqual(store.live.session_by_mode["barbarian_towers"], 2)
         self.assertEqual(store.live.active_mode, "barbarian_towers")
+        self.assertTrue(store.live.post_attack_home_pending)
         self.assertTrue(should_resume({"paused_at": time.time() - 60}))
 
     def test_restart_after_ten_minutes_starts_great_empire(self) -> None:

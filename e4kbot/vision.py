@@ -16,6 +16,17 @@ REFERENCE_SIZE = (900, 1600)
 OFFER_RAIL_X = 0.82
 SPECIAL_OFFERS_CLOSE_FALLBACK = (0.93, 0.04)
 ROBBER_TEMPLATE = ROOT / "assets" / "robber_castle.png"
+GLACIER_CASTLE_TEMPLATE = ROOT / "assets" / "worlds" / "glacier_castle.png"
+SANDS_CASTLE_TEMPLATE = ROOT / "assets" / "worlds" / "sands_castle.png"
+PEAKS_CASTLE_TEMPLATE = ROOT / "assets" / "worlds" / "peaks_castle.png"
+STORM_ISLAND_CASTLE_A_TEMPLATE = ROOT / "assets" / "worlds" / "storm_island_castle_a.png"
+STORM_ISLAND_CASTLE_B_TEMPLATE = ROOT / "assets" / "worlds" / "storm_island_castle_b.png"
+WORLD_CASTLE_TEMPLATES: dict[str, tuple[Path, ...]] = {
+    "barbarian_tower": (GLACIER_CASTLE_TEMPLATE,),
+    "desert_tower": (SANDS_CASTLE_TEMPLATE,),
+    "cultist_tower": (PEAKS_CASTLE_TEMPLATE,),
+    "storm_fort": (STORM_ISLAND_CASTLE_A_TEMPLATE, STORM_ISLAND_CASTLE_B_TEMPLATE),
+}
 SAMURAI_TEMPLATE = ROOT / "assets" / "samurai_camp.png"
 NOMAD_TEMPLATE = ROOT / "assets" / "nomad_camp.png"
 NOMAD_TOOL_BADGE_TEMPLATE = ROOT / "assets" / "nomad_tool_bonus.png"
@@ -45,6 +56,12 @@ SPECIAL_OFFERS_MARKERS = (
     "новое предложение",
     "набор новичка",
     "hoboe",
+    "подписка",
+    "страница приветствия",
+    "nognucka",
+    "ctpahuua npuBettBuA",
+    "пакет военачальника",
+    "aket boeha",
     "npeas",
     "cneunp",
     "npeanox",
@@ -107,7 +124,7 @@ def _ocr_raw(image: Image.Image, psm: int, whitelist: str | None) -> str:
             config += f' --tessdata-dir "{tessdata.as_posix()}" -l rus+eng'
         else:
             config += " -l rus+eng"
-        return pytesseract.image_to_string(gray, config=config).strip()
+        return pytesseract.image_to_string(gray, config=config, timeout=10).strip()
     except Exception:
         return ""
 
@@ -138,8 +155,8 @@ def is_offer_rail_point(nx: float, ny: float | None = None) -> bool:
 
 
 def is_ruby_plus_hud_point(nx: float, ny: float) -> bool:
-    """Top-right gold/ruby/+ buy-rubies HUD. Never click this on the map."""
-    return float(nx) >= 0.78 and float(ny) <= 0.11
+    """Top-right gold/ruby/+ buy-rubies HUD. Never the inbox parchment X (~0.86)."""
+    return float(nx) >= 0.88 and float(ny) <= 0.11
 
 
 def _normalize_ui_text(text: str) -> str:
@@ -151,18 +168,38 @@ def is_special_offers_screen(
     recognized_text: str | None = None,
 ) -> bool:
     """True only when the «спецпредложения» title is present — never formation/map chrome."""
-    if recognized_text is None and is_map_screen(image):
+    if is_inbox_screen(image) or is_taxes_dialog(image, recognized_text):
         return False
+    if _center_parchment_ratio(image) > 0.34:
+        hay = _normalize_ui_text(recognized_text or "")
+        if recognized_text is None:
+            hay = _normalize_ui_text(ocr_text_ui(crop_rel(image, [0.08, 0.00, 0.92, 0.22]), psm=6))
+        strong = ("спецпредлож", "specialoffer", "подписка", "nognucka")
+        if not any(token in hay for token in strong):
+            return False
+    map_like = recognized_text is None and is_map_screen(image)
     if recognized_text is None:
         top = ocr_text_ui(crop_rel(image, [0.05, 0.0, 0.95, 0.28]), psm=6)
         mid = ocr_text_ui(crop_rel(image, [0.12, 0.28, 0.88, 0.62]), psm=6)
-        recognized_text = f"{top} {mid}"
+        body = ocr_text_ui(crop_rel(image, [0.05, 0.05, 0.95, 0.88]), psm=6)
+        recognized_text = f"{top} {mid} {body}"
     text = recognized_text.lower().replace("ё", "е")
     compact = _normalize_ui_text(recognized_text)
-    if any(
+    ocr_hit = any(
         marker in text or _normalize_ui_text(marker) in compact
         for marker in SPECIAL_OFFERS_MARKERS
-    ):
+    )
+    if map_like:
+        if not ocr_hit:
+            return False
+        red = find_red_cross_force(
+            image,
+            allow_right_chrome=True,
+            title_bar_only=True,
+        )
+        # Map HUD OCR often hallucinates «спецпредлож»; require the real title-bar X.
+        return bool(red is not None and red[0] >= 0.88 and red[1] <= 0.08)
+    if ocr_hit:
         return True
     return _looks_like_special_offers_overlay(image)
 
@@ -170,6 +207,8 @@ def is_special_offers_screen(
 def _looks_like_special_offers_overlay(image: Image.Image) -> bool:
     """Shop overlay, not a grassy map, quit dialog, or ruby HUD."""
     if is_map_screen(image):
+        return False
+    if _center_parchment_ratio(image) > 0.34:
         return False
     if _quit_dialog_box(image) is not None:
         return False
@@ -221,7 +260,7 @@ def find_parchment_title_close(image: Image.Image) -> tuple[float, float] | None
     y1 = int(0.01 * REFERENCE_SIZE[1])
     y2 = int(0.12 * REFERENCE_SIZE[1])
     x1 = int(0.70 * REFERENCE_SIZE[0])
-    x2 = int(0.90 * REFERENCE_SIZE[0])
+    x2 = int(0.94 * REFERENCE_SIZE[0])
     white = cv2.inRange(hsv[y1:y2, x1:x2], (0, 0, 180), (180, 50, 255))
     count, _, stats, centers = cv2.connectedComponentsWithStats(white)
     best: tuple[int, float, float] | None = None
@@ -234,9 +273,9 @@ def find_parchment_title_close(image: Image.Image) -> tuple[float, float] | None
             continue
         nx = (centers[index][0] + x1) / REFERENCE_SIZE[0]
         ny = (centers[index][1] + y1) / REFERENCE_SIZE[1]
-        if nx >= 0.88 or nx < 0.78 or ny > 0.09:
+        if nx >= 0.92 or nx < 0.76 or ny > 0.11:
             continue
-        if is_ruby_plus_hud_point(nx, ny):
+        if is_ruby_plus_hud_point(nx, ny) and nx >= 0.88:
             continue
         if best is None or area > best[0]:
             best = (int(area), nx, ny)
@@ -250,15 +289,15 @@ def find_mid_offer_close(image: Image.Image) -> tuple[float, float] | None:
     bgr = _reference_bgr(image)
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     y1 = int(0.50 * REFERENCE_SIZE[1])
-    y2 = int(0.62 * REFERENCE_SIZE[1])
+    y2 = int(0.67 * REFERENCE_SIZE[1])
     x1 = int(0.72 * REFERENCE_SIZE[0])
-    x2 = int(0.88 * REFERENCE_SIZE[0])
+    x2 = int(0.93 * REFERENCE_SIZE[0])
     red = cv2.bitwise_or(
         cv2.inRange(hsv[y1:y2, x1:x2], (0, 110, 70), (14, 255, 255)),
         cv2.inRange(hsv[y1:y2, x1:x2], (165, 110, 70), (180, 255, 255)),
     )
     count, _, stats, centers = cv2.connectedComponentsWithStats(red)
-    best: tuple[float, int, float, float] | None = None
+    best: tuple[float, float] | None = None
     for index in range(1, count):
         _x, _y, width, height, area = stats[index]
         if not (250 <= area <= 4500):
@@ -266,30 +305,37 @@ def find_mid_offer_close(image: Image.Image) -> tuple[float, float] | None:
         ratio = width / max(1, height)
         if not (0.55 <= ratio <= 3.5):
             continue
-        nx = (centers[index][0] + x1) / REFERENCE_SIZE[0]
+        # Checkbox and close button can touch into one wide red component.
+        # In that case click the center of its right-hand button, never the
+        # checkbox on the left.
+        local_x = float(_x) + (0.78 * float(width) if ratio > 1.4 else 0.5 * float(width))
+        nx = (local_x + x1) / REFERENCE_SIZE[0]
         ny = (centers[index][1] + y1) / REFERENCE_SIZE[1]
-        if ny >= 0.62 or nx >= 0.88 or nx < 0.74:
+        if ny >= 0.67 or nx >= 0.93 or nx < 0.74:
             continue
-        square = abs(1.0 - ratio)
-        if best is None or square < best[0] or (square == best[0] and area < best[1]):
-            best = (square, int(area), nx, ny)
-    if best:
-        return (best[2], best[3])
-    return None
+        # The actual close button is the rightmost red square in this opt-out row;
+        # the neighboring checkbox may also contain red artwork.
+        if best is None or nx > best[0]:
+            best = (nx, ny)
+    return best
 
 
 def special_offers_close_point(image: Image.Image) -> tuple[float, float]:
     """Close X of the special-offers overlay only — never buy / chest / rail / ruby HUD."""
+    mid = find_mid_offer_close(image)
+    if mid is not None:
+        return mid
+    title = _normalize_ui_text(ocr_text_ui(image, psm=6))
+    if any(marker in title for marker in ("подписка", "nognucka", "subscription")):
+        # Subscription parchment uses its own wooden X left of the right HUD rail.
+        return (0.872, 0.047)
     red = find_red_cross_force(
         image,
         allow_right_chrome=True,
         title_bar_only=True,
     )
-    if red is not None and red[0] >= 0.78 and red[1] <= 0.18:
+    if red is not None and red[0] >= 0.88 and red[1] <= 0.08:
         return red
-    mid = find_mid_offer_close(image)
-    if mid is not None:
-        return mid
     return SPECIAL_OFFERS_CLOSE_FALLBACK
 
 
@@ -406,17 +452,17 @@ def find_navigation_button(image: Image.Image) -> tuple[float, float] | None:
     matched = find_template_center(
         image,
         NAV_STAR_TEMPLATE,
-        threshold=0.40,
-        x_min=0.08,
-        x_max=0.24,
-        y_min=0.88,
+        threshold=0.34,
+        x_min=0.07,
+        x_max=0.26,
+        y_min=0.87,
         y_max=0.99,
         scales=(0.55, 0.7, 0.85, 1.0, 1.2, 1.45, 1.8, 2.2),
     )
     if (
         matched is not None
-        and 0.08 <= matched[0] <= 0.24
-        and matched[1] >= 0.88
+        and 0.07 <= matched[0] <= 0.26
+        and matched[1] >= 0.87
         and not is_ruby_plus_hud_point(*matched)
     ):
         return matched
@@ -439,7 +485,7 @@ def find_navigation_button(image: Image.Image) -> tuple[float, float] | None:
             continue
         nx = (float(centers[index][0]) + x0) / width
         ny = (float(centers[index][1]) + y0) / height
-        if nx < 0.08 or nx > 0.24 or ny < 0.90 or ny > 0.98 or is_ruby_plus_hud_point(nx, ny):
+        if nx < 0.07 or nx > 0.26 or ny < 0.88 or ny > 0.99 or is_ruby_plus_hud_point(nx, ny):
             continue
         if best is None or area > best[0]:
             best = (area, nx, ny)
@@ -539,7 +585,7 @@ def is_world_list_open(image: Image.Image) -> bool:
     sextants = find_world_list_sextants(image)
     if len(sextants) >= 4:
         xs = [p[0] for p in sextants]
-        if max(xs) - min(xs) <= 0.08:
+        if max(xs) - min(xs) <= 0.08 and _center_parchment_ratio(image) >= 0.22:
             return True
     blob = _navigation_ocr_blob(image)
     if len(sextants) >= 1 and _navigation_ocr_confirms_list(blob):
@@ -644,7 +690,9 @@ def parse_navigation_rows(image: Image.Image) -> list[dict[str, Any]]:
         ]
     height_span = 0.12
     if len(points) >= 2:
-        height_span = max(0.10, min(0.16, abs(points[1][1] - points[0][1]) / 2 + 0.04))
+        pitch = abs(points[1][1] - points[0][1])
+        # Keep the strip inside one row so GE outposts don't steal glacier/sands OCR.
+        height_span = max(0.026, min(0.048, pitch * 0.42))
     for nx, ny in points:
         region = [
             0.12,
@@ -749,10 +797,33 @@ def choose_nearest_main_castle(
     return min(ranked, key=lambda item: item[0])[1]
 
 
+_BGR_CACHE: tuple[int, np.ndarray] | None = None
+
+
 def _reference_bgr(image: Image.Image) -> np.ndarray:
+    global _BGR_CACHE
+    key = id(image)
+    if _BGR_CACHE is not None and _BGR_CACHE[0] == key:
+        return _BGR_CACHE[1]
     rgb = np.asarray(image.convert("RGB"))
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    return cv2.resize(bgr, REFERENCE_SIZE, interpolation=cv2.INTER_AREA)
+    resized = cv2.resize(bgr, REFERENCE_SIZE, interpolation=cv2.INTER_AREA)
+    _BGR_CACHE = (key, resized)
+    return resized
+
+
+def map_grass_ratio(image: Image.Image) -> float:
+    bgr = _reference_bgr(image)
+    hsv = cv2.cvtColor(bgr[140:1420, 0:900], cv2.COLOR_BGR2HSV)
+    green = cv2.inRange(hsv, (30, 45, 35), (95, 255, 255))
+    return float(np.count_nonzero(green)) / max(1, green.size)
+
+
+def _center_parchment_ratio(image: Image.Image) -> float:
+    bgr = _reference_bgr(image)
+    hsv = cv2.cvtColor(bgr[280:1180, 70:830], cv2.COLOR_BGR2HSV)
+    beige = cv2.inRange(hsv, (8, 12, 120), (40, 110, 255))
+    return float(np.count_nonzero(beige)) / max(1, beige.size)
 
 
 def is_map_screen(image: Image.Image) -> bool:
@@ -765,11 +836,18 @@ def is_map_screen(image: Image.Image) -> bool:
     lava = cv2.inRange(hsv, (0, 50, 25), (25, 255, 160))
     water = cv2.inRange(hsv, (85, 40, 35), (130, 255, 220))
     terrain = cv2.bitwise_or(green, cv2.bitwise_or(snow, cv2.bitwise_or(sand, cv2.bitwise_or(lava, water))))
-    return float(np.count_nonzero(terrain)) / terrain.size > 0.22
+    if float(np.count_nonzero(terrain)) / terrain.size <= 0.22:
+        return False
+    # Inbox / taxes / hire parchment covering the map is not a hunt screen.
+    if _center_parchment_ratio(image) > 0.34:
+        return False
+    return True
 
 
 def is_inbox_screen(image: Image.Image) -> bool:
     """Mail / «Входящие» overlay, including «Удалить все» confirm. Not the kingdom map."""
+    if _center_parchment_ratio(image) < 0.18:
+        return False
     top = _ocr_compact(ocr_text_ui(crop_rel(image, [0.12, 0.00, 0.88, 0.16]), psm=6))
     mid = _ocr_compact(ocr_text_ui(crop_rel(image, [0.16, 0.28, 0.84, 0.62]), psm=6))
     blob = f"{top}{mid}"
@@ -787,19 +865,11 @@ def is_inbox_screen(image: Image.Image) -> bool:
 
 
 def is_formation_screen(image: Image.Image) -> bool:
-    """Attack-planning screen: parchment plus a wave header (often above y=0.61)."""
-    if _no_commanders_unique_template_score(image) >= 0.48:
-        return False
-    if is_special_offers_screen(image):
+    """Attack-planning screen: gold footer Нападение plus a wave header."""
+    if find_formation_attack_button(image) is None:
         return False
     wave = formation_wave_diagnostics(image)
-    if not wave.get("first_header"):
-        return False
-    bgr = _reference_bgr(image)
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    brown = cv2.inRange(hsv[0:940], (3, 45, 20), (30, 255, 180))
-    brown_ratio = float(np.count_nonzero(brown)) / brown.size
-    return brown_ratio > 0.12
+    return bool(wave.get("first_header"))
 
 
 def _seal_blobs(
@@ -1378,6 +1448,42 @@ def find_robber_candidates(
     return [
         (x / REFERENCE_SIZE[0], y / REFERENCE_SIZE[1], score)
         for score, x, y in selected
+    ]
+
+
+def _nms_norm_hits(
+    hits: list[tuple[float, float, float]],
+    min_distance: float = 0.055,
+) -> list[tuple[float, float, float]]:
+    selected: list[tuple[float, float, float]] = []
+    min_d2 = float(min_distance) ** 2
+    for nx, ny, score in sorted(hits, key=lambda item: item[2], reverse=True):
+        if all((nx - px) ** 2 + (ny - py) ** 2 > min_d2 for px, py, _ in selected):
+            selected.append((float(nx), float(ny), float(score)))
+    return selected
+
+
+def find_world_castle_candidates(
+    image: Image.Image,
+    kind: str,
+    threshold: float = 0.62,
+) -> list[tuple[float, float, float]]:
+    """NPC castle marks for glacier / sands / peaks / storm (either island sprite)."""
+    paths = WORLD_CASTLE_TEMPLATES.get(str(kind) or "") or ()
+    if not paths:
+        return []
+    hits: list[tuple[float, float, float]] = []
+    for path in paths:
+        hits.extend(find_robber_candidates(image, threshold, path))
+    merged = _nms_norm_hits(hits)
+    marker = find_main_castle_marker(image)
+    if marker is None:
+        return merged
+    mx, my = marker
+    return [
+        hit
+        for hit in merged
+        if (hit[0] - mx) ** 2 + (hit[1] - my) ** 2 > 0.038**2
     ]
 
 

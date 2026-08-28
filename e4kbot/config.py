@@ -89,6 +89,7 @@ DEFAULTS: dict[str, Any] = {
     },
     "vision": {
         "robber_threshold": 0.65,
+        "world_castle_threshold": 0.62,
         "screen_timeout_seconds": 8,
         "popup_retries": 4,
         "map_anchor": [0.50, 0.54],
@@ -118,6 +119,10 @@ DEFAULTS: dict[str, Any] = {
         "public_webapp_url": "",
         "thread_samurai": None,
         "thread_nomad": None,
+    },
+    "player_attack_placeholder": {
+        "implemented": False,
+        "max_attacks": 20,
     },
     "accounts": [],
 }

@@ -72,7 +72,7 @@ def wait_for_send_slot(store: Any, config: dict[str, Any] | None = None) -> floa
     remaining = max(0.0, float(getattr(store.live, "next_send_at", 0) or 0) - time.time())
     if remaining <= 0:
         return 0.0
-    logger.info("Жду слот отправки {:.1f}с (каденс 8–10с от прошлой атаки)", remaining)
+    logger.info("Жду слот отправки {:.1f}с", remaining)
     CONTROL.sleep(remaining)
     return remaining
 

@@ -16,6 +16,7 @@ CONTINUE_ONE_WORLD_LINE = "такие миры не открыты, продол
 
 WORLD_NPC_KINDS = frozenset(
     {
+        "baron",
         "barbarian_tower",
         "desert_tower",
         "cultist_tower",
@@ -56,15 +57,17 @@ WORLDS: tuple[WorldSpec, ...] = (
             "greatempire",
             "benukaa",
             "benukan",
+            "benukxa",
+            "umnep",
             "vimnep",
             "vmnep",
         ),
         target_kind="baron",
         mode_id="robber_barons",
         target_needles=("барон", "baron", "разбой", "robber"),
-        attacks=20,
-        fill_ratio=0.70,
-        tour=False,
+        attacks=5,
+        fill_ratio=1.0,
+        tour=True,
         skip_if_unopened=False,
         skip_if_first_cannot_fill=False,
         wait_last_if_cannot_fill=False,
@@ -173,6 +176,8 @@ WORLDS: tuple[WorldSpec, ...] = (
             "ostrov",
             "uragan",
             "yparan",
+            "yparah",
+            "octposa",
             "stormisland",
             "stormfort",
             "storm fort",
@@ -320,10 +325,8 @@ def world_fill_decision(
     first_must_skip: bool,
     wait_last: bool = True,
 ) -> str:
-    """What to do after a world attack cannot fill waves to 100%."""
-    if sent <= 0:
-        return "world_skip_empty" if first_must_skip else "wait_return"
-    return "wait_return" if wait_last else "world_skip_empty"
+    """Latest policy: insufficient troops skip this world and continue the tour."""
+    return "world_skip_empty"
 
 
 def unopened_report_text(scan: NavigationScan | None, *, missing_ids: list[str] | None = None) -> str:

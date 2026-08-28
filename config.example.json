@@ -21,6 +21,7 @@
     "shogun": true,
     "prefer_events": true
   },
+  "central_castles": {},
   "baron_attacks": {
     "kingdom": 0,
     "npc_type": 2,
@@ -50,7 +51,11 @@
     "map_coordinate_scale": [0.044, 0.044],
     "picker_timeout_seconds": 15,
     "picker_max_actions": 1,
-    "minimum_flank_fill": 0.7
+    "minimum_flank_fill": 0.7,
+    "click_settle_min_seconds": 0.18,
+    "click_settle_max_seconds": 0.38,
+    "exact_click_settle_seconds": 0.32,
+    "forced_click_settle_seconds": 0.32
   },
     "control": {
         "hotkey": "NUM0",
@@ -76,6 +81,10 @@
             {"mode": "bloodcrows", "count": 6, "enabled": false}
         ]
     },
+    "player_attack_placeholder": {
+        "implemented": false,
+        "max_attacks": 20
+    },
     "telegram": {
         "enabled": true,
         "bot_token": "PUT_E4KMOBILE_BOT_TOKEN_HERE",
@@ -84,6 +93,12 @@
         "thread_baron": 5,
         "thread_samurai": 0,
         "thread_nomad": 0,
+        "thread_summary": 0,
+        "thread_great_empire": 0,
+        "thread_everwinter_glacier": 0,
+        "thread_burning_sands": 0,
+        "thread_fire_peaks": 0,
+        "thread_storm_islands": 0,
         "miniapp_host": "127.0.0.1",
         "miniapp_port": 8766,
         "public_webapp_url": ""

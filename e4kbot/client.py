@@ -8,10 +8,19 @@ from dataclasses import dataclass
 from typing import Any
 
 from loguru import logger
-from PIL import ImageDraw
+from PIL import ImageDraw, ImageStat
 
 from e4kbot.bluestacks import AdbClient, capture_game_image, save_shot
 from e4kbot.control import CONTROL
+from e4kbot.farm_reports import (
+    FarmLedger,
+    WORLD_BY_MODE,
+    find_messages_button,
+    is_victory_report,
+    parse_victory_report,
+    unread_battle_rows,
+    write_progress,
+)
 from e4kbot.paths import LAYOUTS_DIR, ROOT
 from e4kbot.runtime.live import emit
 from e4kbot.safety import (
@@ -22,7 +31,8 @@ from e4kbot.safety import (
 from e4kbot.state import StateStore
 from e4kbot.telegram_bot import TelegramReporter
 from e4kbot.world_switch import WorldSwitchMixin
-from e4kbot.worlds import is_world_npc_kind, world_hunt_hits_are_cluster
+from e4kbot.worlds import compact_ui, is_world_npc_kind, match_world_id, spec_for_kind, world_hunt_hits_are_cluster
+from e4kbot.campaign_checkpoint import TOUR_MODE_IDS
 from e4kbot.vision import (
     choose_movement,
     crop_rel,
@@ -35,15 +45,19 @@ from e4kbot.vision import (
     find_reconnect_button,
     find_reward_confirm,
     find_robber_candidates,
+    find_world_castle_candidates,
     find_samurai_candidates,
     find_nomad_candidates,
     find_formation_attack_button,
+    find_formation_unit_slots,
     find_red_cross_force,
     find_target_attack_button,
     find_travel_seal_pair,
     find_plaque_attack_button,
+    find_world_list_sextants,
     find_world_parchment_attack_button,
     find_parchment_title_close,
+    _center_parchment_ratio,
     find_castle_name_hud_point,
     find_home_sextant_button,
     find_quit_dialog_no_button,
@@ -52,6 +66,8 @@ from e4kbot.vision import (
     is_connection_error_dialog,
     is_quit_game_dialog,
     is_formation_screen,
+    is_choose_place_screen,
+    is_world_list_open,
     is_burning_candidate,
     is_difficulty_dialog,
     is_event_reward_popup,
@@ -69,6 +85,7 @@ from e4kbot.vision import (
     is_special_offers_screen,
     is_taxes_dialog,
     is_travel_dialog,
+    map_grass_ratio,
     movement_confirm_diagnostics,
     no_commanders_diagnostics,
     ocr_text,
@@ -178,6 +195,145 @@ class BlueStacksEngine(WorldSwitchMixin):
         self._need_ge_home = False
         self._world_recenter_tries = 0
         self._unopened_tries: dict[str, int] = {}
+        self._report_check_queued = False
+        self._last_report_check = 0.0
+        self._farm_ledger = FarmLedger()
+        self._cached_size: tuple[int, int] | None = None
+        self._burst_send_times: list[float] = []
+        self._speed_burst_done = False
+        self._qualifying_cycles = 0
+        self._tour_pack_ok: dict[str, bool] = {}
+        self._pack_mode = None
+        self._pack_prep_started_at: float | None = None
+        self._pack_send_times: list[float] = []
+        self._pack_finished = False
+        try:
+            from e4kbot.farm_reports import PROGRESS_PATH
+
+            if PROGRESS_PATH.exists():
+                payload = json.loads(PROGRESS_PATH.read_text(encoding="utf-8"))
+                self._qualifying_cycles = int(payload.get("qualifying_cycles") or 0)
+                self._tour_pack_ok = dict(payload.get("tour_pack_ok") or {})
+        except Exception:
+            self._qualifying_cycles = 0
+        if self._qualifying_cycles < 10:
+            sent_map = dict(getattr(self.store.live, "session_by_mode", None) or {})
+            for mode_id in TOUR_MODE_IDS:
+                sent_map[mode_id] = 0
+            logger.warning(
+                "SPEED: свежий тур — 10 циклов по 5×40с, сейчас {}/10",
+                self._qualifying_cycles,
+            )
+            self.store.live.session_by_mode = sent_map
+            self.store.live.post_attack_home_pending = False
+            self.store.live.next_send_at = 0
+            self.store.live.next_attack_at = 0
+            self.store.save()
+
+    def _speed_burst_active(self) -> bool:
+        if getattr(self, "_burst_send_times", None) is None:
+            return False
+        return int(getattr(self, "_qualifying_cycles", 0) or 0) < 10
+
+    def _begin_world_pack(self, kind: str) -> None:
+        spec = spec_for_kind(kind)
+        mode = spec.mode_id if spec is not None else kind
+        if getattr(self, "_pack_mode", None) == mode and not getattr(self, "_pack_finished", False):
+            return
+        self._pack_mode = mode
+        self._pack_prep_started_at = None
+        self._pack_send_times = []
+        self._pack_finished = False
+        logger.warning(
+            "PACK ARM {} — clock starts on first prep, cycles {}/10",
+            mode,
+            int(getattr(self, "_qualifying_cycles", 0) or 0),
+        )
+
+    def _mark_pack_prep(self, kind: str) -> None:
+        if getattr(self, "_pack_finished", False):
+            return
+        if getattr(self, "_pack_prep_started_at", None) is not None:
+            return
+        if getattr(self, "_pack_mode", None) is None:
+            self._begin_world_pack(kind)
+        self._pack_prep_started_at = time.time()
+        logger.warning(
+            "PACK START {} prep clock — 5 sends ≤40s, cycles {}/10",
+            getattr(self, "_pack_mode", kind),
+            int(getattr(self, "_qualifying_cycles", 0) or 0),
+        )
+
+    def _note_pack_send(self, kind: str) -> None:
+        now = time.time()
+        if getattr(self, "_pack_prep_started_at", None) is None:
+            self._mark_pack_prep(kind)
+        times = getattr(self, "_pack_send_times", None)
+        if times is None:
+            self._pack_send_times = []
+            times = self._pack_send_times
+        times.append(now)
+        spec = spec_for_kind(kind)
+        mode = spec.mode_id if spec is not None else kind
+        span = now - float(self._pack_prep_started_at or now)
+        logger.warning(
+            "PACK {} send {}/5 elapsed={:.2f}s (budget 40s from first prep)",
+            mode,
+            len(times),
+            span,
+        )
+        if len(times) >= 5:
+            self._close_world_pack(mode, span, span <= 40.0)
+
+    def _close_world_pack(self, mode: str, span: float, ok: bool) -> None:
+        packs = dict(getattr(self, "_tour_pack_ok", None) or {})
+        packs[mode] = bool(ok)
+        self._tour_pack_ok = packs
+        self._pack_finished = True
+        logger.warning(
+            "PACK DONE {} span={:.2f}s ok={} tour_packs={} cycles={}/10",
+            mode,
+            span,
+            ok,
+            packs,
+            int(getattr(self, "_qualifying_cycles", 0) or 0),
+        )
+        write_progress(
+            last_pack_mode=mode,
+            last_pack_seconds=span,
+            last_pack_ok=ok,
+            tour_pack_ok=packs,
+            qualifying_cycles=int(getattr(self, "_qualifying_cycles", 0) or 0),
+        )
+        if all(item in packs for item in TOUR_MODE_IDS):
+            if all(packs.get(item) for item in TOUR_MODE_IDS):
+                self._qualifying_cycles = int(getattr(self, "_qualifying_cycles", 0) or 0) + 1
+                logger.warning("TOUR CYCLE QUALIFIED {}/10", self._qualifying_cycles)
+            else:
+                logger.warning(
+                    "TOUR CYCLE REJECTED a pack >40s — tally still {}/10 packs={}",
+                    self._qualifying_cycles,
+                    packs,
+                )
+            self._tour_pack_ok = {}
+            write_progress(
+                qualifying_cycles=self._qualifying_cycles,
+                tour_pack_ok={},
+            )
+        self._pack_prep_started_at = None
+        self._pack_send_times = []
+        self._pack_mode = None
+
+    def _mark_speed_proof(self) -> bool:
+        times = getattr(self, "_pack_send_times", None) or getattr(self, "_burst_send_times", None) or []
+        if len(times) < 5:
+            return False
+        span = float(times[-1] - times[0])
+        logger.warning("SPEED window: last 5 spanned {:.2f}s (need ≤40 from prep)", span)
+        return span <= 40.0
+
+    def _speed_sleep(self, slow: float, fast: float = 0.05) -> None:
+        CONTROL.sleep(fast if self._speed_burst_active() else slow)
 
     _PICKER_STALL_REASONS = frozenset(
         {
@@ -195,9 +351,13 @@ class BlueStacksEngine(WorldSwitchMixin):
         return float(vision.get(key) or default)
 
     def _size(self) -> tuple[int, int]:
+        cached = getattr(self, "_cached_size", None)
+        if cached:
+            return cached
         image = capture_game_image(self.config, self.adb)
         if image is None:
             raise RuntimeError("Нет скрина BlueStacks — открой игру")
+        self._cached_size = image.size
         return image.size
 
     def _plan_or_picker_open(self, image: Any | None = None) -> bool:
@@ -205,14 +365,14 @@ class BlueStacksEngine(WorldSwitchMixin):
         try:
             shot = image if image is not None else self._image()
         except Exception:
+            return False
+        if find_picker_cards(shot):
             return True
-        if is_formation_screen(shot):
+        if is_formation_screen(shot) or is_travel_dialog(shot):
             return True
-        if is_travel_dialog(shot):
-            return True
-        if find_picker_cards(shot) or find_picker_confirm_button(shot):
-            return True
-        return False
+        if self._speed_burst_active():
+            return False
+        return bool(find_picker_confirm_button(shot))
 
     def tap_rel(self, key: str) -> None:
         banned = {
@@ -250,15 +410,23 @@ class BlueStacksEngine(WorldSwitchMixin):
         except Exception:
             logger.warning("Не жму рубины/+ ({:.3f}, {:.3f}) — нет скрина", nx, ny)
             return False
-        if is_quit_game_dialog(image) or is_map_screen(image):
+        if is_quit_game_dialog(image):
             logger.warning("Не жму рубины/+ HUD ({:.3f}, {:.3f})", nx, ny)
             return False
-        if not is_special_offers_screen(image):
-            logger.warning("Не жму рубины/+ HUD ({:.3f}, {:.3f})", nx, ny)
-            return False
-        close_x, close_y = special_offers_close_point(image)
-        if abs(nx - close_x) <= 0.06 and abs(ny - close_y) <= 0.10:
+        if is_formation_screen(image) and 0.90 <= nx <= 0.98 and ny <= 0.08:
+            logger.info(
+                "Экран формирования подтверждён — разрешаю его крестик ({:.3f}, {:.3f})",
+                nx,
+                ny,
+            )
             return True
+        if is_special_offers_screen(image):
+            close_x, close_y = special_offers_close_point(image)
+            if abs(nx - close_x) <= 0.06 and abs(ny - close_y) <= 0.10:
+                return True
+        if is_map_screen(image):
+            logger.warning("Не жму рубины/+ HUD ({:.3f}, {:.3f})", nx, ny)
+            return False
         logger.warning("Не жму рубины/+ HUD ({:.3f}, {:.3f})", nx, ny)
         return False
 
@@ -307,13 +475,46 @@ class BlueStacksEngine(WorldSwitchMixin):
             shot = image if image is not None else self._image()
         except Exception:
             return False
-        if not is_special_offers_screen(shot):
+        if is_travel_dialog(shot) or is_formation_screen(shot) or self._picker_overlay_open(shot):
             return False
+        action = popup_action(shot)
+        closed_info = False
+        if (
+            action is not None
+            and 0.68 <= float(action[0]) < 0.88
+            and 0.10 <= float(action[1]) <= 0.22
+            and not is_ruby_plus_hud_point(float(action[0]), float(action[1]))
+        ):
+            logger.warning(
+                "Закрываю инфо-попап поверх магазина ({:.3f}, {:.3f})",
+                float(action[0]),
+                float(action[1]),
+            )
+            self._tap_norm_exact(float(action[0]), float(action[1]))
+            CONTROL.sleep(0.35)
+            closed_info = True
+            try:
+                shot = self._image()
+            except Exception:
+                return True
+        offers = is_special_offers_screen(shot)
+        shop_like = (not is_map_screen(shot)) and _center_parchment_ratio(shot) >= 0.40
+        if not offers and not shop_like:
+            return closed_info
         close_x, close_y = special_offers_close_point(shot)
         # Title-bar X is ~ (0.93, 0.04); mid-dialog «don't show» X is near y≈0.57.
-        title_bar = close_y <= 0.18 and 0.78 <= close_x <= 0.97
+        # Never the ruby/+ rail blob around (0.88, 0.15). Never inbox parchment.
+        if is_inbox_screen(shot):
+            return closed_info
+        title_bar = close_y <= 0.10 and 0.88 <= close_x <= 0.97
         mid_dialog = 0.18 < close_y <= 0.68 and close_x < 0.92
-        if (title_bar or mid_dialog) and not is_green_hire_point(close_x, close_y):
+        if is_ruby_plus_hud_point(close_x, close_y) and not title_bar:
+            logger.warning("Спецпредложения: точка ({:.3f}, {:.3f}) совпала с рубинами — не жму", close_x, close_y)
+            return closed_info
+        if is_ruby_plus_hud_point(close_x, close_y) and title_bar:
+            close_x, close_y = 0.823, 0.038
+            logger.warning("Спецпредложения: крестик магазина сдвинут влево от ruby/+ ({:.3f}, {:.3f})", close_x, close_y)
+        if (title_bar or mid_dialog or (close_x, close_y) == (0.823, 0.038)) and not is_green_hire_point(close_x, close_y):
             logger.info(
                 "Закрываю спецпредложения красным крестиком ({:.3f}, {:.3f})",
                 close_x,
@@ -443,7 +644,7 @@ class BlueStacksEngine(WorldSwitchMixin):
         return True
 
     def _dismiss_inbox_if_open(self, image: Any | None = None) -> bool:
-        """Close mail / «Удалить все» with Back. Never confirm delete, never shop."""
+        """Close mail / «Удалить все» with the parchment X. Never confirm delete, never shop."""
         try:
             shot = image if image is not None else self._image()
         except Exception:
@@ -451,17 +652,21 @@ class BlueStacksEngine(WorldSwitchMixin):
         if not is_inbox_screen(shot):
             return False
         close = find_parchment_title_close(shot)
-        if close and close[0] < 0.90 and close[1] < 0.12:
-            logger.info("Почта открыта — закрываю крестик ({:.3f}, {:.3f})", close[0], close[1])
-            self._tap_forced(*close)
-            CONTROL.sleep(0.45)
+        if close is None or close[1] > 0.14 or close[0] < 0.72 or is_ruby_plus_hud_point(*close):
+            close = (0.86, 0.055)
+        logger.info("Почта открыта — закрываю крестик ({:.3f}, {:.3f})", close[0], close[1])
+        self._tap_forced(*close)
+        CONTROL.sleep(0.45)
         latest = self._image()
-        if is_inbox_screen(latest) and not is_map_screen(latest):
-            logger.info("Почта ещё открыта — ADB Back, Escape в окно не шлю")
+        if is_inbox_screen(latest):
+            logger.info("Почта ещё открыта — второй крестик (0.860, 0.055)")
+            self._tap_forced(0.86, 0.055)
+            CONTROL.sleep(0.45)
+            latest = self._image()
+        if is_inbox_screen(latest):
+            logger.info("Почта не закрылась крестиком — ADB Back, Escape в окно не шлю")
             self.adb.key(4)
             CONTROL.sleep(0.45)
-        elif is_inbox_screen(latest) and is_map_screen(latest):
-            logger.info("Почта на карте без крестика — Back не жму, чтобы не выйти из игры")
         return True
 
     def _dismiss_blocking_menu_if_no_camps(self, image: Any | None = None) -> bool:
@@ -478,11 +683,7 @@ class BlueStacksEngine(WorldSwitchMixin):
             return True
         if find_target_attack_button(shot) is not None:
             return False
-        if (
-            find_samurai_candidates(shot)
-            or find_nomad_candidates(shot)
-            or find_robber_candidates(shot)
-        ):
+        if self._map_has_attack_marks(shot):
             return False
         if self._dismiss_inbox_if_open(shot):
             return True
@@ -578,7 +779,10 @@ class BlueStacksEngine(WorldSwitchMixin):
         x, y = _abs_point(size, [nx, ny])
         jx, jy = tap_jitter(5)
         self.adb.tap(x + jx, y + jy, source_size=size)
-        time.sleep(random.uniform(0.25, 0.7))
+        vision = (getattr(self, "config", None) or {}).get("vision") or {}
+        settle_min = float(vision.get("click_settle_min_seconds") or 0.04)
+        settle_max = float(vision.get("click_settle_max_seconds") or 0.06)
+        time.sleep(random.uniform(min(settle_min, settle_max), max(settle_min, settle_max)))
 
     def _tap_norm_exact(self, nx: float, ny: float) -> None:
         if not self._rail_guard_allows(nx, ny):
@@ -586,7 +790,8 @@ class BlueStacksEngine(WorldSwitchMixin):
         size = self._size()
         x, y = _abs_point(size, [nx, ny])
         self.adb.tap(x, y, source_size=size)
-        time.sleep(0.5)
+        vision = (getattr(self, "config", None) or {}).get("vision") or {}
+        time.sleep(float(vision.get("exact_click_settle_seconds") or 0.05))
 
     def _tap_forced(self, nx: float, ny: float) -> None:
         """Click a known overlay control. Still never the map ruby/+ HUD."""
@@ -595,7 +800,8 @@ class BlueStacksEngine(WorldSwitchMixin):
         size = self._size()
         x, y = _abs_point(size, [nx, ny])
         self.adb.tap(x, y, source_size=size)
-        time.sleep(0.5)
+        vision = (getattr(self, "config", None) or {}).get("vision") or {}
+        time.sleep(float(vision.get("forced_click_settle_seconds") or 0.05))
 
     def close_formation_plan(self) -> bool:
         """Leave attack planning via the parchment X — used when a preset must not store units."""
@@ -607,7 +813,8 @@ class BlueStacksEngine(WorldSwitchMixin):
             close = (self.layout.get("buttons") or {}).get("formation_close") or [0.94, 0.034]
             point = (float(close[0]), float(close[1]))
         logger.warning("Закрываю план атаки крестиком ({:.3f}, {:.3f})", point[0], point[1])
-        if is_ruby_plus_hud_point(*point):
+        formation_close = 0.90 <= point[0] <= 0.98 and point[1] <= 0.08
+        if is_ruby_plus_hud_point(*point) and not formation_close:
             parchment = find_parchment_title_close(image)
             if parchment and not is_ruby_plus_hud_point(*parchment):
                 point = parchment
@@ -627,7 +834,10 @@ class BlueStacksEngine(WorldSwitchMixin):
         """True when the unit picker overlay is visible. Never the empty-wave warning."""
         if find_picker_cards(image):
             return True
-        if find_picker_confirm_button(image) is not None:
+        confirm = find_picker_confirm_button(image) is not None
+        if self._speed_burst_active():
+            return bool(confirm and _center_parchment_ratio(image) > 0.28)
+        if confirm:
             return True
         if find_picker_max_control(image) is not None:
             return True
@@ -651,6 +861,7 @@ class BlueStacksEngine(WorldSwitchMixin):
         )
         self._tap_norm_exact(*point)
         CONTROL.sleep(0.45)
+        self._pack_empty_wave_just_seen = True
         return True
 
     def _dismiss_no_commanders(self, image: Any | None = None) -> bool:
@@ -696,12 +907,30 @@ class BlueStacksEngine(WorldSwitchMixin):
         if self._picker_overlay_open(image):
             logger.info("Пикер уже открыт — жму MAX и галочку без повторного закрытия")
             return image, ""
+        self._picker_max_adjusted = False
         self.tap_rel(slot_key)
+        timeout = 1.6 if self._speed_burst_active() else self._vision_seconds(
+            "picker_open_timeout_seconds", 8
+        )
         picker = self._wait_for(
             self._picker_overlay_open,
-            timeout=self._vision_seconds("picker_open_timeout_seconds", 8),
+            timeout=timeout,
             label="открытие пикера",
         )
+        if picker is None and is_formation_screen(self._image()):
+            slots = find_formation_unit_slots(self._image())
+            if slots:
+                logger.warning(
+                    "Пикер не открылся с unit_slot — жму найденный слот ({:.3f},{:.3f})",
+                    slots[0][0],
+                    slots[0][1],
+                )
+                self._tap_norm_exact(*slots[0])
+                picker = self._wait_for(
+                    self._picker_overlay_open,
+                    timeout=1.1 if self._speed_burst_active() else timeout,
+                    label="открытие пикера слотом",
+                )
         if picker is None:
             return None, "unit_picker_not_found"
         return picker, ""
@@ -727,27 +956,29 @@ class BlueStacksEngine(WorldSwitchMixin):
         """Detect/annotate picker confirmation; detection-only unless click=True."""
         image = self._image()
         diagnostic = picker_confirm_diagnostics(image)
-        annotated = image.copy()
-        draw = ImageDraw.Draw(annotated)
-        left, top, right, bottom = diagnostic["popup_bounds"]
-        draw.rectangle(
-            (
-                round(left * image.width),
-                round(top * image.height),
-                round(right * image.width),
-                round(bottom * image.height),
-            ),
-            outline=(255, 210, 0),
-            width=4,
-        )
+        if not self._speed_burst_active():
+            annotated = image.copy()
+            draw = ImageDraw.Draw(annotated)
+            left, top, right, bottom = diagnostic["popup_bounds"]
+            draw.rectangle(
+                (
+                    round(left * image.width),
+                    round(top * image.height),
+                    round(right * image.width),
+                    round(bottom * image.height),
+                ),
+                outline=(255, 210, 0),
+                width=4,
+            )
+            point = diagnostic["point"]
+            if point is not None:
+                x, y = _abs_point(image.size, point)
+                color = (0, 255, 0) if diagnostic["valid"] else (255, 0, 0)
+                draw.ellipse((x - 24, y - 24, x + 24, y + 24), outline=color, width=6)
+                draw.line((x - 35, y, x + 35, y), fill=color, width=3)
+                draw.line((x, y - 35, x, y + 35), fill=color, width=3)
+            save_shot(annotated, "unit-picker-confirm-before.png")
         point = diagnostic["point"]
-        if point is not None:
-            x, y = _abs_point(image.size, point)
-            color = (0, 255, 0) if diagnostic["valid"] else (255, 0, 0)
-            draw.ellipse((x - 24, y - 24, x + 24, y + 24), outline=color, width=6)
-            draw.line((x - 35, y, x + 35, y), fill=color, width=3)
-            draw.line((x, y - 35, x, y + 35), fill=color, width=3)
-        save_shot(annotated, "unit-picker-confirm-before.png")
         logger.info("Unit picker confirm diagnostic: {}", diagnostic)
         if (not diagnostic["valid"] or point is None) and self._positive_unit_fill(
             observed_fill
@@ -851,27 +1082,28 @@ class BlueStacksEngine(WorldSwitchMixin):
         """Validate the distinct final movement confirmation before sending."""
         image = self._image()
         diagnostic = movement_confirm_diagnostics(image)
-        annotated = image.copy()
-        draw = ImageDraw.Draw(annotated)
-        left, top, right, bottom = diagnostic["dialog_bounds"]
-        draw.rectangle(
-            (
-                round(left * image.width),
-                round(top * image.height),
-                round(right * image.width),
-                round(bottom * image.height),
-            ),
-            outline=(255, 210, 0),
-            width=4,
-        )
         point = diagnostic["point"]
-        if point is not None:
-            x, y = _abs_point(image.size, point)
-            color = (0, 255, 0) if diagnostic["valid"] else (255, 0, 0)
-            draw.ellipse((x - 24, y - 24, x + 24, y + 24), outline=color, width=6)
-            draw.line((x - 35, y, x + 35, y), fill=color, width=3)
-            draw.line((x, y - 35, x, y + 35), fill=color, width=3)
-        save_shot(annotated, "movement-confirm-before.png")
+        if not self._speed_burst_active():
+            annotated = image.copy()
+            draw = ImageDraw.Draw(annotated)
+            left, top, right, bottom = diagnostic["dialog_bounds"]
+            draw.rectangle(
+                (
+                    round(left * image.width),
+                    round(top * image.height),
+                    round(right * image.width),
+                    round(bottom * image.height),
+                ),
+                outline=(255, 210, 0),
+                width=4,
+            )
+            if point is not None:
+                x, y = _abs_point(image.size, point)
+                color = (0, 255, 0) if diagnostic["valid"] else (255, 0, 0)
+                draw.ellipse((x - 24, y - 24, x + 24, y + 24), outline=color, width=6)
+                draw.line((x - 35, y, x + 35, y), fill=color, width=3)
+                draw.line((x, y - 35, x, y + 35), fill=color, width=3)
+            save_shot(annotated, "movement-confirm-before.png")
         logger.info("Movement confirm diagnostic: {}", diagnostic)
         if self._dismiss_no_commanders(image):
             return False, "no_commanders", None
@@ -879,10 +1111,18 @@ class BlueStacksEngine(WorldSwitchMixin):
             return False, "movement_confirm_not_confident", None
         if not click:
             return True, "diagnostic_only", image
+        if click and self._speed_burst_active():
+            self._tap_norm_exact(*point)
+            closed = self._wait_for(
+                lambda img: (not is_travel_dialog(img)) and (not is_formation_screen(img)),
+                timeout=0.35,
+                label="закрытие похода",
+            )
+            return True, "confirmed", closed if closed is not None else image
         self._tap_norm_exact(*point)
         closed = self._wait_for(
             lambda img: (not is_travel_dialog(img)) and (not is_formation_screen(img)),
-            timeout=10,
+            timeout=1.2 if self._speed_burst_active() else 10,
             label="закрытие похода",
         )
         latest = closed if closed is not None else self._image()
@@ -890,9 +1130,11 @@ class BlueStacksEngine(WorldSwitchMixin):
             return False, "no_commanders", None
         if is_travel_dialog(latest) or is_formation_screen(latest):
             failed = latest
-            save_shot(failed, "movement-confirm-transition-failed.png")
+            if not self._speed_burst_active():
+                save_shot(failed, "movement-confirm-transition-failed.png")
             return False, "movement_confirm_transition_failed", None
-        save_shot(latest, "movement-confirm-after.png")
+        if not self._speed_burst_active():
+            save_shot(latest, "movement-confirm-after.png")
         return True, "confirmed", latest
 
     def _swipe_norm(
@@ -908,7 +1150,7 @@ class BlueStacksEngine(WorldSwitchMixin):
             round(finish[1] * height),
             source_size=(width, height),
         )
-        CONTROL.sleep(0.6)
+        CONTROL.sleep(0.12 if self._speed_burst_active() else 0.6)
 
     def scroll_tool_inventory(self, stride: float = 0.04, upward: bool = False) -> None:
         """One inventory row, then caller screenshots. Never shop/search."""
@@ -1084,10 +1326,11 @@ class BlueStacksEngine(WorldSwitchMixin):
             image = self._image()
         if not is_loading_screen(image) and not is_connection_error_dialog(image):
             return False
+        burst = self._speed_burst_active()
         logger.info("Игра грузит игровой сервер — жду карту, не жму магазин и поиск")
-        deadline = time.time() + timeout
+        deadline = time.time() + (min(timeout, 2.0) if burst else timeout)
         while time.time() < deadline:
-            CONTROL.sleep(2.0)
+            CONTROL.sleep(0.15 if burst else 2.0)
             try:
                 image = self._image()
             except Exception:
@@ -1106,6 +1349,18 @@ class BlueStacksEngine(WorldSwitchMixin):
         logger.warning("Сервер всё ещё грузится — повторю цикл без кликов")
         return True
 
+    def _map_has_attack_marks(self, image: Any) -> bool:
+        if (
+            find_samurai_candidates(image)
+            or find_nomad_candidates(image)
+            or find_robber_candidates(image)
+        ):
+            return True
+        kind = str((self.config or {}).get("current_target_kind") or "")
+        if is_world_npc_kind(kind) and kind != "baron":
+            return bool(find_world_castle_candidates(image, kind))
+        return False
+
     def _hunt_quota(self) -> int:
         """How many unique map marks to collect before attacking — not a commander cap."""
         kind = str((self.config or {}).get("current_target_kind") or "")
@@ -1117,43 +1372,32 @@ class BlueStacksEngine(WorldSwitchMixin):
 
     def _await_world_map(self, timeout: float = 6.0) -> Any | None:
         """Wait for the kingdom map without ESC/formation_close after a successful plan."""
+        if self._speed_burst_active():
+            image = self._image()
+            if is_map_screen(image):
+                return image
+            return self._wait_for(is_map_screen, timeout=min(float(timeout), 2.0), label="карта")
         image = self._image()
         if self._dismiss_quit_game_if_open(image):
             CONTROL.sleep(0.3)
             image = self._image()
-        if is_map_screen(image) and (
-            find_samurai_candidates(image)
-            or find_nomad_candidates(image)
-            or find_robber_candidates(image)
-        ):
+        if is_map_screen(image) and self._map_has_attack_marks(image):
             return image
         if self._dismiss_inbox_if_open(image):
             CONTROL.sleep(0.3)
             image = self._image()
-            if is_map_screen(image) and (
-                find_samurai_candidates(image)
-                or find_nomad_candidates(image)
-                or find_robber_candidates(image)
-            ):
+            if is_map_screen(image) and self._map_has_attack_marks(image):
                 return image
         if self._dismiss_blocking_menu_if_no_camps(image):
             CONTROL.sleep(0.3)
             image = self._image()
-            if is_map_screen(image) and (
-                find_samurai_candidates(image)
-                or find_nomad_candidates(image)
-                or find_robber_candidates(image)
-            ):
+            if is_map_screen(image) and self._map_has_attack_marks(image):
                 return image
         if is_map_screen(image):
             if self._dismiss_taxes_if_open(image) or self._dismiss_special_offers_if_open(image):
                 CONTROL.sleep(0.35)
                 image = self._image()
-            if is_map_screen(image) and (
-                find_samurai_candidates(image)
-                or find_nomad_candidates(image)
-                or find_robber_candidates(image)
-            ):
+            if is_map_screen(image) and self._map_has_attack_marks(image):
                 return image
             if is_map_screen(image) and not is_taxes_dialog(image):
                 return image
@@ -1168,7 +1412,7 @@ class BlueStacksEngine(WorldSwitchMixin):
     def _world_map_npc_point(self, point: tuple[float, float]) -> bool:
         """Reject HUD / nav chrome that robber-template matching treats as towers."""
         nx, ny = float(point[0]), float(point[1])
-        if ny > 0.70 or ny < 0.16:
+        if ny > 0.80 or ny < 0.16:
             return False
         if nx < 0.12 or nx > 0.88:
             return False
@@ -1200,7 +1444,7 @@ class BlueStacksEngine(WorldSwitchMixin):
             return False
         logger.info("Пробую метку мира ({:.3f}, {:.3f})", point[0], point[1])
         self._tap_norm(*point)
-        CONTROL.sleep(0.55)
+        CONTROL.sleep(0.12 if self._speed_burst_active() else 0.55)
         image = self._image()
         if is_travel_dialog(image) or self._picker_overlay_open(image):
             logger.info("Проба мира открыла план — беру эту цель")
@@ -1228,6 +1472,7 @@ class BlueStacksEngine(WorldSwitchMixin):
             return False
         if not self._world_target_title_ok(image, kind):
             logger.info("Проба мира: не башня этого мира — закрываю")
+            save_shot(image, f"world-title-rejected-{kind}.png")
             self._dismiss_wrong_world_target(image)
             self._block_screen_target(point)
             return False
@@ -1265,6 +1510,14 @@ class BlueStacksEngine(WorldSwitchMixin):
             threshold = float((self.config.get("vision") or {}).get("nomad_threshold") or 0.65)
             candidates = find_nomad_candidates(image, threshold)
             skip_burning = True
+        elif is_world_npc_kind(kind) and kind != "baron":
+            threshold = float(
+                (self.config.get("vision") or {}).get("world_castle_threshold") or 0.62
+            )
+            if self._speed_burst_active():
+                threshold = min(threshold, 0.47)
+            candidates = find_world_castle_candidates(image, kind, threshold)
+            skip_burning = True
         else:
             threshold = float((self.config.get("vision") or {}).get("robber_threshold") or 0.65)
             candidates = find_robber_candidates(image, threshold)
@@ -1272,6 +1525,21 @@ class BlueStacksEngine(WorldSwitchMixin):
             skip_burning = is_world_npc_kind(kind)
         if not candidates:
             return []
+        if self._speed_burst_active():
+            items = [
+                HuntTarget((item[0], item[1]), None)
+                for item in candidates
+                if not is_offer_rail_point(item[0], item[1])
+                and not self._is_blocked_screen_target((item[0], item[1]))
+                and (skip_burning or not is_burning_candidate(image, (item[0], item[1])))
+                and (
+                    kind == "baron"
+                    or not is_world_npc_kind(kind)
+                    or self._world_map_npc_point((item[0], item[1]))
+                )
+            ]
+            items.sort(key=lambda item: (item.point[0] - 0.50) ** 2 + (item.point[1] - 0.54) ** 2)
+            return items
         main, viewport = self._read_map_coords(image)
         if main is None or viewport is None or not self._coords_plausible(main, viewport):
             logger.warning(
@@ -1284,7 +1552,7 @@ class BlueStacksEngine(WorldSwitchMixin):
                     continue
                 if is_offer_rail_point(point[0], point[1]):
                     continue
-                if is_world_npc_kind(kind) and not self._world_map_npc_point(point):
+                if kind != "baron" and is_world_npc_kind(kind) and not self._world_map_npc_point(point):
                     continue
                 if not include_blocked and self._is_blocked_screen_target(point):
                     continue
@@ -1305,14 +1573,17 @@ class BlueStacksEngine(WorldSwitchMixin):
         burning = 0
         cooling = 0
         blocked = 0
+        chrome = 0
         for candidate in candidates:
             point = (candidate[0], candidate[1])
             if not skip_burning and is_burning_candidate(image, point):
                 burning += 1
                 continue
             if is_offer_rail_point(point[0], point[1]):
+                chrome += 1
                 continue
-            if is_world_npc_kind(kind) and not self._world_map_npc_point(point):
+            if kind != "baron" and is_world_npc_kind(kind) and not self._world_map_npc_point(point):
+                chrome += 1
                 continue
             if not include_blocked and self._is_blocked_screen_target(point):
                 blocked += 1
@@ -1349,11 +1620,12 @@ class BlueStacksEngine(WorldSwitchMixin):
         if not found:
             logger.info(
                 "Нет доступной цели на экране: найдено {}, горят {}, "
-                "на перезарядке {}, заблокировано {}",
+                "на перезарядке {}, заблокировано {}, chrome {}",
                 len(candidates),
                 burning,
                 cooling,
                 blocked,
+                chrome,
             )
         return found
 
@@ -1368,6 +1640,16 @@ class BlueStacksEngine(WorldSwitchMixin):
         self.store.save()
         found: list[HuntTarget] = []
         seen: set[tuple[Any, ...]] = set()
+        if self._speed_burst_active() and is_world_npc_kind(kind):
+            image = self._image()
+            if is_inbox_screen(image):
+                self._dismiss_inbox_if_open(image)
+                image = self._image()
+            if not is_map_screen(image):
+                return []
+            if kind == "baron" and map_grass_ratio(image) < 0.12:
+                return []
+            return self._list_eligible_targets(image, kind)[:1]
 
         def ingest(image: Any) -> bool:
             if (
@@ -1413,6 +1695,25 @@ class BlueStacksEngine(WorldSwitchMixin):
         image = self._image()
         if self._dismiss_blocking_overlay() or self._dismiss_reward_popups(image):
             CONTROL.sleep(0.45)
+            image = self._image()
+        if self._dismiss_inbox_if_open(image):
+            CONTROL.sleep(0.4)
+            image = self._image()
+        if (
+            not is_map_screen(image)
+            or is_ruby_shop(image)
+            or is_special_offers_screen(image)
+            or is_overview_plaque(image)
+        ):
+            logger.info("Охота: экран не чистая карта — цели не ищу")
+            return []
+        if kind == "baron" and map_grass_ratio(image) < 0.12:
+            logger.info("Охота баронов: нет травы Великой империи — не сканирую чужой мир")
+            self._need_ge_home = True
+            self._switched_world_id = None
+            return []
+        if is_info_plaque(image) or find_target_attack_button(image) is not None or is_world_npc_kind(kind):
+            self._deselect_via_safe_grass()
             image = self._image()
         if not is_world_npc_kind(kind):
             image = self._recenter_on_main_castle(image)
@@ -1568,10 +1869,13 @@ class BlueStacksEngine(WorldSwitchMixin):
 
     def _focus_hunt_target(self, kind: str, target: HuntTarget) -> tuple[float, float] | None:
         """Open the next stored robber without a full map rescan."""
-        image = self._await_world_map()
+        if self._speed_burst_active():
+            image = self._image()
+        else:
+            image = self._await_world_map()
         if image is None:
             return None
-        if self._dismiss_special_offers_if_open(image):
+        if not self._speed_burst_active() and self._dismiss_special_offers_if_open(image):
             image = self._await_world_map(timeout=4) or self._image()
         self._selected_target_coords = target.coords
         if kind == "nomad":
@@ -1722,6 +2026,7 @@ class BlueStacksEngine(WorldSwitchMixin):
         image = capture_game_image(self.config, self.adb)
         if image is None:
             raise RuntimeError("Нет скрина BlueStacks — открой игру")
+        self._cached_size = image.size
         return image
 
     def _wait_for(
@@ -1737,9 +2042,13 @@ class BlueStacksEngine(WorldSwitchMixin):
             or (self.config.get("vision") or {}).get("screen_timeout_seconds")
             or 8
         )
+        if self._speed_burst_active():
+            timeout = min(timeout, 2.5)
+            heartbeat = min(float(heartbeat), 0.7)
         deadline = time.time() + timeout
         started = time.time()
-        next_heartbeat = started + max(0.5, float(heartbeat))
+        next_heartbeat = started + max(0.3, float(heartbeat))
+        poll = 0.02 if self._speed_burst_active() else 0.35
         while time.time() < deadline:
             CONTROL.check()
             image = self._image()
@@ -1748,7 +2057,7 @@ class BlueStacksEngine(WorldSwitchMixin):
             if label and time.time() >= next_heartbeat:
                 logger.info("Пикер: жду {}… ({:.0f}s)", label, time.time() - started)
                 next_heartbeat = time.time() + max(0.5, float(heartbeat))
-            CONTROL.sleep(0.35)
+            CONTROL.sleep(poll)
         return None
 
     def ensure_map(self) -> Any | None:
@@ -1845,25 +2154,36 @@ class BlueStacksEngine(WorldSwitchMixin):
         )
         return chosen.point
 
+    def _world_attack_button_safe(self, found: tuple[float, float]) -> bool:
+        """World plaque «Нападение» is lower-right (~0.76, 0.63). Never ruby/+ or the offer rail."""
+        nx, ny = float(found[0]), float(found[1])
+        if is_ruby_plus_hud_point(nx, ny) or is_offer_rail_point(nx, ny):
+            return False
+        return 0.30 <= nx <= 0.82 and 0.28 <= ny <= 0.72
+
     def _open_formation(self, point: tuple[float, float], kind: str) -> bool:
         already = self._image()
-        if self._picker_overlay_open(already) or is_travel_dialog(already):
-            logger.info("Планирование уже открыто — не закрываю и не жму карту")
+        if find_picker_cards(already):
+            logger.info("Пикер уже открыт — не закрываю и не жму карту")
             return True
+        if not self._speed_burst_active():
+            if is_travel_dialog(already):
+                logger.info("Планирование уже открыто — не закрываю и не жму карту")
+                return True
         world_attack = (
             find_world_parchment_attack_button(already) if is_world_npc_kind(kind) else None
         )
         if (
-            self._plan_or_picker_open(already)
+            not self._speed_burst_active()
+            and self._plan_or_picker_open(already)
             and world_attack is None
             and not (is_world_npc_kind(kind) and is_info_plaque(already))
         ):
             logger.info("Планирование уже открыто — не закрываю и не жму карту")
             return True
-        plaque_already = is_world_npc_kind(kind) and (
+        plaque_already = is_world_npc_kind(kind) and is_info_plaque(already) and (
             find_plaque_attack_button(already) is not None
-            or find_target_attack_button(already) is not None
-            or is_info_plaque(already)
+            or find_world_parchment_attack_button(already) is not None
         )
         if plaque_already:
             logger.info("Табличка мира уже открыта — не жму метку повторно")
@@ -1880,12 +2200,12 @@ class BlueStacksEngine(WorldSwitchMixin):
                 or is_difficulty_dialog(image)
                 or is_formation_screen(image)
             )
-            popup = self._wait_for(plaque_ready, timeout=3, label="табличка лагеря")
+            popup = self._wait_for(plaque_ready, timeout=1.2 if self._speed_burst_active() else 3, label="табличка лагеря")
             if popup is None:
                 lower = (float(point[0]), min(0.80, float(point[1]) + 0.04))
                 logger.info("Табличка не вышла — жму чуть ниже лагеря ({:.3f}, {:.3f})", lower[0], lower[1])
                 self._tap_norm(*lower)
-                popup = self._wait_for(plaque_ready, timeout=5, label="табличка после повторного клика")
+                popup = self._wait_for(plaque_ready, timeout=1.5 if self._speed_burst_active() else 5, label="табличка после повторного клика")
             if popup is not None and self._plan_or_picker_open(popup):
                 return True
             if popup is not None and is_overview_plaque(popup):
@@ -1926,7 +2246,7 @@ class BlueStacksEngine(WorldSwitchMixin):
                     or is_formation_screen(image)
                     or is_travel_dialog(image)
                 ),
-                timeout=5,
+                timeout=1.2 if self._speed_burst_active() else 5,
                 label="табличка мира",
             )
             if popup is None:
@@ -1952,44 +2272,45 @@ class BlueStacksEngine(WorldSwitchMixin):
                 self._dismiss_wrong_world_target(popup)
                 self._block_screen_target(point)
                 return False
-        x_region = self.layout.get("regions", {}).get("viewport_x")
-        y_region = self.layout.get("regions", {}).get("viewport_y")
-        target_x = parse_count(ocr_text(crop_rel(popup, x_region), psm=6)) if x_region else None
-        target_y = parse_count(ocr_text(crop_rel(popup, y_region), psm=6)) if y_region else None
-        if target_x is None or target_y is None:
-            logger.warning(
-                "Координаты цели с таблички не прочитались — оставляю координаты охоты {}",
-                self._selected_target_coords,
-            )
-        else:
-            if kind == "nomad" and self._selected_target_coords:
-                logger.info(
-                    "Табличка дала ({}, {}) — оставляю очередь лагеря {}",
-                    target_x,
-                    target_y,
-                    self._selected_target_coords,
-                )
-            elif (
-                kind in {"samurai", "nomad"}
-                and self._selected_target_coords
-                and abs(target_x - self._selected_target_coords[0])
-                + abs(target_y - self._selected_target_coords[1])
-                > 8
-            ):
+        if not self._speed_burst_active():
+            x_region = self.layout.get("regions", {}).get("viewport_x")
+            y_region = self.layout.get("regions", {}).get("viewport_y")
+            target_x = parse_count(ocr_text(crop_rel(popup, x_region), psm=6)) if x_region else None
+            target_y = parse_count(ocr_text(crop_rel(popup, y_region), psm=6)) if y_region else None
+            if target_x is None or target_y is None:
                 logger.warning(
-                    "Табличка дала ({}, {}) — оставляю охоту {}",
-                    target_x,
-                    target_y,
+                    "Координаты цели с таблички не прочитались — оставляю координаты охоты {}",
                     self._selected_target_coords,
                 )
             else:
-                self._selected_target_coords = (target_x, target_y)
-            kingdom = int((self.config.get("baron_attacks") or {}).get("kingdom", 0))
-            plaque = self._selected_target_coords or (target_x, target_y)
-            if not self.store.target_available(kind, kingdom, plaque[0], plaque[1]):
-                logger.info(f"Цель {plaque[0]}:{plaque[1]} ещё на локальной перезарядке")
-                self.tap_rel("map")
-                return False
+                if kind == "nomad" and self._selected_target_coords:
+                    logger.info(
+                        "Табличка дала ({}, {}) — оставляю очередь лагеря {}",
+                        target_x,
+                        target_y,
+                        self._selected_target_coords,
+                    )
+                elif (
+                    kind in {"samurai", "nomad"}
+                    and self._selected_target_coords
+                    and abs(target_x - self._selected_target_coords[0])
+                    + abs(target_y - self._selected_target_coords[1])
+                    > 8
+                ):
+                    logger.warning(
+                        "Табличка дала ({}, {}) — оставляю охоту {}",
+                        target_x,
+                        target_y,
+                        self._selected_target_coords,
+                    )
+                else:
+                    self._selected_target_coords = (target_x, target_y)
+                kingdom = int((self.config.get("baron_attacks") or {}).get("kingdom", 0))
+                plaque = self._selected_target_coords or (target_x, target_y)
+                if not self.store.target_available(kind, kingdom, plaque[0], plaque[1]):
+                    logger.info(f"Цель {plaque[0]}:{plaque[1]} ещё на локальной перезарядке")
+                    self.tap_rel("map")
+                    return False
         if kind in {"samurai", "nomad"}:
             title = ocr_text_ui(crop_rel(popup, [0.18, 0.14, 0.82, 0.32]), psm=6)
             body = ocr_text_ui(crop_rel(popup, [0.18, 0.20, 0.82, 0.55]), psm=6)
@@ -2089,56 +2410,40 @@ class BlueStacksEngine(WorldSwitchMixin):
             )
             return False
         if is_world_npc_kind(kind):
-            layout = (self.layout.get("buttons") or {}).get("start_attack_confirm") or [
-                0.765,
-                0.625,
-            ]
-            layout_pt = (float(layout[0]), float(layout[1]))
-            found = find_world_parchment_attack_button(popup)
-            if found is None:
-                raw = find_plaque_attack_button(popup) or find_target_attack_button(popup)
-                if raw is not None:
-                    logger.info(
-                        "Нападение мира: кнопка ({:.3f}, {:.3f}) не справа внизу, жму разметку",
-                        raw[0],
-                        raw[1],
-                    )
-                attack_point = layout_pt
-            else:
-                attack_point = found
-            logger.info("Нападение мира ({:.3f}, {:.3f})", attack_point[0], attack_point[1])
-            self._tap_norm(*attack_point)
-            opened = self._wait_for(
-                lambda img: is_formation_screen(img)
-                or is_no_commanders_parchment(img)
-                or is_travel_dialog(img),
-                timeout=8,
-                label="план мира",
-            )
-            shot = opened if opened is not None else self._image()
-            if self._dismiss_no_commanders(shot):
+            found_points: list[tuple[float, float]] = []
+            for finder in (
+                find_plaque_attack_button,
+                find_world_parchment_attack_button,
+                find_target_attack_button,
+            ):
+                found = finder(popup)
+                if found is None or not self._world_attack_button_safe(found):
+                    continue
+                if any((found[0] - other[0]) ** 2 + (found[1] - other[1]) ** 2 < 0.012**2 for other in found_points):
+                    continue
+                found_points.append(found)
+            if not found_points:
+                logger.warning("Без визуально подтверждённой кнопки Нападение мира ничего не жму")
+                self._deselect_via_safe_grass()
                 return False
-            if is_formation_screen(shot) or is_travel_dialog(shot):
-                return True
-            logger.info(
-                "План мира не открылся — ещё раз жму Нападение по разметке ({:.3f}, {:.3f})",
-                layout_pt[0],
-                layout_pt[1],
-            )
-            self._tap_norm(*layout_pt)
-            opened = self._wait_for(
-                lambda img: is_formation_screen(img)
-                or is_no_commanders_parchment(img)
-                or is_travel_dialog(img),
-                timeout=8,
-                label="повтор плана мира",
-            )
-            shot = opened if opened is not None else self._image()
-            if self._dismiss_no_commanders(shot):
-                return False
-            if is_formation_screen(shot) or is_travel_dialog(shot):
-                return True
-            logger.warning("Табличка мира есть, план не открылся — не жму слепую точку")
+            plan_timeout = 2.0 if self._speed_burst_active() else 8
+            for attack_point in found_points:
+                logger.info("Нападение мира ({:.3f}, {:.3f})", attack_point[0], attack_point[1])
+                self._tap_norm_exact(*attack_point)
+                opened = self._wait_for(
+                    lambda img: is_formation_screen(img)
+                    or is_no_commanders_parchment(img)
+                    or is_travel_dialog(img),
+                    timeout=plan_timeout,
+                    label="план мира",
+                )
+                shot = opened if opened is not None else self._image()
+                if self._dismiss_no_commanders(shot):
+                    return False
+                if is_formation_screen(shot) or is_travel_dialog(shot):
+                    return True
+            logger.warning("Табличка мира есть, план не открылся — закрываю табличку")
+            self._deselect_via_safe_grass()
             return False
         self.tap_rel("start_attack_confirm")
         opened = self._wait_for(
@@ -2240,7 +2545,31 @@ class BlueStacksEngine(WorldSwitchMixin):
         image = self._image()
         if not self._picker_overlay_open(image):
             return False
+        if bool(getattr(self, "_picker_max_adjusted", False)):
+            confirm = find_picker_confirm_button(image)
+            if confirm is not None:
+                logger.warning(
+                    "PACK: MAX уже был — жму галочку ({:.3f},{:.3f})",
+                    confirm[0],
+                    confirm[1],
+                )
+                self._tap_norm_exact(*confirm)
+                CONTROL.sleep(0.22)
+                after = self._image()
+                occupancy = self._read_ratio_from_image(
+                    after, "picker_units"
+                ) or self._read_ratio_from_image(after, "formation_units")
+                if self._positive_unit_fill(occupancy):
+                    self._last_picker_fill = occupancy
+                else:
+                    self._last_picker_fill = self._assume_picker_capacity(
+                        after, self._last_picker_fill
+                    )
+                return True
+            logger.info("Пикер fallback: adjustment уже выполнен — второй MAX/minus запрещён")
+            return False
         logger.warning("Пикер: OCR застрял — MAX по шаблону/разметке без ожидания 10/10")
+        self._picker_max_adjusted = True
         point = find_picker_max_control(image)
         if point is not None:
             self._tap_norm(*point)
@@ -2262,7 +2591,15 @@ class BlueStacksEngine(WorldSwitchMixin):
         wait_seconds = self._vision_seconds("picker_max_wait_seconds", 10)
         image = self._image()
         before = self._read_ratio_from_image(image, "picker_units")
+        if before and before[1] > 0 and before[0] >= before[1]:
+            self._last_picker_fill = before
+            logger.info("Пикер уже {}/{} — adjustment не жму", before[0], before[1])
+            return True
+        if bool(getattr(self, "_picker_max_adjusted", False)):
+            logger.info("Пикер MAX уже нажат в этом overlay — повтор stale-frame запрещён")
+            return False
         point = find_picker_max_control(image)
+        self._picker_max_adjusted = True
         if point is not None:
             logger.info("Жму MAX пикера по шаблону ({:.3f}, {:.3f})", point[0], point[1])
             self._tap_norm(*point)
@@ -2273,10 +2610,6 @@ class BlueStacksEngine(WorldSwitchMixin):
                 self._tap_norm_exact(float(layout[0]), float(layout[1]))
             else:
                 self.tap_rel("picker_max")
-        if before and before[1] > 0 and before[0] >= before[1]:
-            self._last_picker_fill = before
-            logger.info("Пикер уже {}/{} — MAX нажат, другого солдата не беру", before[0], before[1])
-            return True
         deadline = time.time() + wait_seconds
         started = time.time()
         next_heartbeat = started + 2.0
@@ -2338,6 +2671,7 @@ class BlueStacksEngine(WorldSwitchMixin):
             self._select_best_picker_card()
         max_attempts = int((self.config.get("vision") or {}).get("picker_max_attempts") or 3)
         wait_seconds = self._vision_seconds("picker_fill_timeout_seconds", 10)
+        seen: list[tuple[int, int]] = []
         for attempt in range(max(1, max_attempts)):
             if self._dump_picker_max():
                 return True
@@ -2345,6 +2679,17 @@ class BlueStacksEngine(WorldSwitchMixin):
             if live and live[1] > 0 and live[0] >= live[1]:
                 self._last_picker_fill = live
                 return True
+            if self._positive_unit_fill(live):
+                if live in seen or (seen and live[0] < seen[-1][0]):
+                    logger.warning(
+                        "Пикер без прогресса/осцилляция {} -> {} — не меняю тип в занятом слоте",
+                        seen[-1] if seen else None,
+                        live,
+                    )
+                    self._last_picker_fill = live
+                    return False
+                seen.append(live)
+                self._last_picker_fill = live
             if not self._positive_unit_fill(self._last_picker_fill):
                 self._select_best_picker_card()
             elif (
@@ -2353,14 +2698,16 @@ class BlueStacksEngine(WorldSwitchMixin):
                 and self._last_picker_fill[0] < self._last_picker_fill[1]
             ):
                 logger.info(
-                    "Пикер {}/{} после MAX — меняю карту в той же ячейке, не открываю второго солдата",
+                    "Пикер {}/{} после MAX — сохраняю стек; другой тип в этом слоте не выбираю",
                     self._last_picker_fill[0],
                     self._last_picker_fill[1],
                 )
-                self._select_best_picker_card()
+                return False
             if attempt + 1 < max_attempts:
                 logger.info("MAX без заполнения — повтор {}/{}", attempt + 2, max_attempts)
                 CONTROL.sleep(0.35)
+        if self._positive_unit_fill(self._last_picker_fill):
+            return False
         if self._vision_fill_picker_fallback():
             return True
         live = self._read_ratio_from_image(self._image(), "picker_units")
@@ -2396,12 +2743,110 @@ class BlueStacksEngine(WorldSwitchMixin):
             return True
         return self._vision_fill_picker_fallback()
 
+    def _fill_residual_unit_slots(
+        self,
+        formation: Any,
+        initial: tuple[int, int],
+    ) -> tuple[bool, str, Any]:
+        """Preserve a partial first stack, then fill adjacent empty slots left-to-right."""
+        current = initial
+        slots = [
+            key
+            for key in ("unit_slot_second", "unit_slot_third", "unit_slot_fourth")
+            if key in (self.layout.get("buttons") or {})
+        ]
+        if not slots:
+            logger.warning("Формирование {}/{}: соседнего пустого слота нет", *current)
+            return False, "residual_slot_not_found", formation
+        seen_totals = {current}
+        for slot_key in slots:
+            if current[1] > 0 and current[0] >= current[1]:
+                return True, "", formation
+            logger.info(
+                "Сохраняю занятый слот {}/{}; открываю следующий пустой {} для остатка {}",
+                current[0],
+                current[1],
+                slot_key,
+                max(0, current[1] - current[0]),
+            )
+            picker, reason = self._open_unit_picker(slot_key)
+            if picker is None:
+                return False, reason or "residual_picker_not_found", formation
+            self._last_picker_fill = None
+            if not self._fill_picker_to_capacity() and not self._positive_unit_fill(self._last_picker_fill):
+                return False, "residual_units_unavailable", formation
+            observed = self._last_picker_fill
+            confirmed, reason, latest = self.diagnose_unit_picker_confirm(
+                click=True,
+                observed_fill=observed,
+            )
+            if not confirmed or latest is None:
+                return False, reason or "residual_confirm_failed", formation
+            formation = latest
+            total = self._read_ratio_from_image(formation, "formation_units")
+            if not total:
+                return False, "center_capacity_not_read", formation
+            if total in seen_totals or total[0] <= current[0]:
+                logger.warning(
+                    "Добавочный слот не увеличил итог {} -> {} — стоп осцилляции",
+                    current,
+                    total,
+                )
+                return False, "unit_picker_oscillation", formation
+            if total[1] != current[1] or total[0] < current[0]:
+                logger.warning("Добавочный слот заменил прежний стек {} -> {} — не продолжаю", current, total)
+                return False, "unit_stack_replaced", formation
+            logger.info(
+                "Добавочный слот подтверждён: первый стек сохранён, итог {}/{}",
+                total[0],
+                total[1],
+            )
+            seen_totals.add(total)
+            current = total
+        if current[1] > 0 and current[0] >= current[1]:
+            return True, "", formation
+        return False, "residual_units_unavailable", formation
+
     def _prepare_single_center_wave(self) -> tuple[bool, str]:
         # Every attack, including the 4th+: cell → MAX → 10/10 → green check.
         # After OK the formation stays confirmed — never pick a different soldier.
+        if self._speed_burst_active():
+            shot = None
+            units = None
+            try:
+                shot = self._image()
+                units = self._read_ratio_from_image(shot, "formation_units")
+            except Exception:
+                pass
+            empty_seen = bool(getattr(self, "_pack_empty_wave_just_seen", False))
+            if empty_seen:
+                self._pack_empty_wave_just_seen = False
+                logger.warning("PACK: игра сказала волна пустая — игнорирую OCR {} и добираю", units)
+            elif units and units[0] > 0:
+                logger.warning(
+                    "PACK: волна {}/{} уже есть — отправляю без добора",
+                    units[0],
+                    units[1],
+                )
+                self._last_picker_fill = units
+                return True, ""
+            if shot is not None and find_picker_cards(shot):
+                confirm = find_picker_confirm_button(shot)
+                if confirm is not None and _center_parchment_ratio(shot) > 0.28:
+                    logger.warning(
+                        "PACK: пикер открыт, OCR пуст — жму галочку ({:.3f},{:.3f})",
+                        confirm[0],
+                        confirm[1],
+                    )
+                    self._tap_norm_exact(*confirm)
+                    CONTROL.sleep(0.22)
+                    self._last_picker_fill = (1, 1)
+                    return True, ""
         last_reason = ""
-        for sequence_attempt in range(2):
-            self._dismiss_empty_wave_warning()
+        attempts = 1 if self._speed_burst_active() else 2
+        for sequence_attempt in range(attempts):
+            if not self._speed_burst_active():
+                self._dismiss_empty_wave_warning()
             image = self._image()
             overlay_open = self._picker_overlay_open(image)
             picker_ratio = self._read_ratio_from_image(image, "picker_units")
@@ -2426,7 +2871,7 @@ class BlueStacksEngine(WorldSwitchMixin):
                         slot = self.layout.get("buttons", {}).get("unit_slot")
                         if slot:
                             self._tap_norm_exact(float(slot[0]), float(slot[1]))
-                            CONTROL.sleep(0.5)
+                            self._speed_sleep(0.5)
                     if not self._positive_unit_fill(self._last_picker_fill):
                         self._last_picker_fill = None
             elif not overlay_open and wave_assigned:
@@ -2451,7 +2896,7 @@ class BlueStacksEngine(WorldSwitchMixin):
                     slot = self.layout.get("buttons", {}).get("unit_slot")
                     if slot:
                         self._tap_norm_exact(float(slot[0]), float(slot[1]))
-                        CONTROL.sleep(0.5)
+                        self._speed_sleep(0.5)
                     self._last_picker_fill = formation_units
             elif picker_full:
                 self._last_picker_fill = picker_ratio
@@ -2527,15 +2972,47 @@ class BlueStacksEngine(WorldSwitchMixin):
                 picker_ratio = (0, 10)
             if not picker_ratio or picker_ratio[1] <= 0:
                 return False, "center_capacity_not_read"
-            if not self._fill_picker_to_capacity():
-                save_shot(self._image(), "unit-picker-selection-no-progress.png")
-                return False, "unit_picker_selection_no_progress"
+            picker_full = self._fill_picker_to_capacity()
             if not self._positive_unit_fill(self._last_picker_fill):
-                return False, "unit_picker_fill_not_retained"
+                shot = self._image()
+                occupancy = self._read_ratio_from_image(
+                    shot, "picker_units"
+                ) or self._read_ratio_from_image(shot, "formation_units")
+                if self._positive_unit_fill(occupancy):
+                    logger.warning(
+                        "PACK: last fill пустой, на экране {}/{} — набор есть, не abort",
+                        occupancy[0],
+                        occupancy[1],
+                    )
+                    self._last_picker_fill = occupancy
+                else:
+                    save_shot(shot, "unit-picker-selection-no-progress.png")
+                    return False, "unit_picker_fill_not_retained"
             confirmed, reason, formation = self.diagnose_unit_picker_confirm(
                 click=True,
                 observed_fill=self._last_picker_fill,
             )
+            if confirmed and formation is not None and not picker_full:
+                total = self._read_ratio_from_image(formation, "formation_units")
+                if not total:
+                    total = self._last_picker_fill
+                if total and total[1] > 0 and total[0] < total[1]:
+                    logger.info(
+                        "Частичный стек {}/{} подтверждён и сохранён — добираю в соседнем слоте",
+                        total[0],
+                        total[1],
+                    )
+                    additive_ok, additive_reason, formation = self._fill_residual_unit_slots(
+                        formation,
+                        total,
+                    )
+                    if not additive_ok:
+                        save_shot(formation, "unit-picker-residual-no-progress.png")
+                        return False, additive_reason
+                    self._last_picker_fill = self._read_ratio_from_image(
+                        formation, "formation_units"
+                    ) or total
+                    break
             if confirmed and formation is not None:
                 break
             latest = self._image()
@@ -2624,74 +3101,270 @@ class BlueStacksEngine(WorldSwitchMixin):
                 CONTROL.sleep(0.8)
 
     def _return_home_via_castle_hud(self) -> bool:
-        """After a baron send: top-center castle name → LEFT green wooden home. Never ruby/+ or right castle."""
+        """Always recenter through the canonical topmost navigation-list row."""
         if not getattr(self, "adb", None):
             return False
-        try:
-            image = self._image()
-        except Exception:
+        kind = str(self.config.get("current_target_kind") or "")
+        spec = spec_for_kind(kind)
+        world_id = str(getattr(self, "_switched_world_id", None) or (spec.id if spec else ""))
+        if not world_id:
             return False
-        if self._dismiss_quit_game_if_open(image):
-            image = self._image()
+        image = self._image()
         if self._plan_or_picker_open(image) or is_travel_dialog(image) or is_formation_screen(image):
             image = self._await_world_map(timeout=6) or image
-        try:
-            if self._plan_or_picker_open(image) or is_travel_dialog(image) or is_formation_screen(image):
-                logger.info("Домой через шапку — жду карту, план не закрываю")
-                return False
-        except Exception:
-            return False
-        if not is_castle_home_banner(image):
-            name = find_castle_name_hud_point(image)
-            if name is None:
-                name = (0.52, 0.028)
-            if is_ruby_plus_hud_point(*name) or name[0] >= 0.78:
-                name = (0.50, 0.028)
-            logger.info(
-                "После атаки — жму название замка в шапке ({:.3f}, {:.3f})",
-                name[0],
-                name[1],
-            )
-            self._tap_norm_exact(*name)
-            CONTROL.sleep(0.5)
-            image = self._image()
-            if self._dismiss_quit_game_if_open(image):
-                image = self._image()
-        home = find_home_sextant_button(image)
-        if home is None:
-            home = (0.32, 0.145)
-        if home[0] >= 0.50:
-            logger.warning(
-                "Правую иконку замка не жму ({:.3f}, {:.3f}) — беру левую кнопку домой",
-                home[0],
-                home[1],
-            )
-            home = (0.32, home[1] if home[1] < 0.28 else 0.145)
-        if is_ruby_plus_hud_point(*home):
-            logger.warning("Не жму рубины/+ вместо кнопки домой")
+        if self._plan_or_picker_open(image) or is_travel_dialog(image) or is_formation_screen(image):
+            logger.info("Canonical home ждёт завершения открытой формации/похода")
             return False
         logger.info(
-            "Жму левую зелёную кнопку домой ({:.3f}, {:.3f}), правый замок не трогаю",
-            home[0],
-            home[1],
+            "После атаки: HUD не жму; открываю Навигация → Выбери место → topmost row world={}",
+            world_id,
         )
-        self._tap_norm_exact(*home)
-        CONTROL.sleep(0.55)
-        self._dismiss_quit_game_if_open()
+        if not self._navigation_home_for_world(world_id):
+            return False
+        return self._finish_verified_home()
+
+    @staticmethod
+    def _castle_identity_matches(expected: dict[str, Any], observed: dict[str, Any]) -> bool:
+        """Diagnostic-only coordinate comparison; account-specific names are ignored."""
+        expected_coords = expected.get("coords")
+        observed_coords = observed.get("coords")
+        return bool(
+            isinstance(expected_coords, (list, tuple))
+            and len(expected_coords) == 2
+            and isinstance(observed_coords, (list, tuple))
+            and len(observed_coords) == 2
+            and tuple(map(int, expected_coords)) == tuple(map(int, observed_coords))
+        )
+
+    @staticmethod
+    def _normalize_castle_name(value: str) -> str:
+        clean = compact_ui(value)
+        for wrong in ("3amokk", "3amok", "zamok"):
+            clean = clean.replace(wrong, "замок")
+        return clean
+
+    def _read_castle_identity(self, image: Any, *, banner: bool) -> dict[str, Any]:
+        region = [0.08, 0.00, 0.92, 0.22] if banner else [0.18, 0.00, 0.82, 0.10]
+        text = ocr_text_ui(crop_rel(image, region), psm=6)
+        coord_match = re.search(
+            r"[XХ]\s*[:=]\s*(\d{1,4})\s*[/\\|]?\s*[YУ]\s*[:=]\s*(\d{1,4})",
+            text,
+            flags=re.IGNORECASE,
+        )
+        coords = (int(coord_match.group(1)), int(coord_match.group(2))) if coord_match else None
+        name = ""
+        for line in text.splitlines():
+            normalized = self._normalize_castle_name(line)
+            if any(token in normalized for token in ("замок", "castle")):
+                name = re.sub(r"[XХ]\s*[:=].*$", "", line, flags=re.IGNORECASE).strip(" |._-")
+                break
+        return {"name": name, "coords": list(coords) if coords else None, "ocr": text[:180]}
+
+    def _deselect_via_safe_grass(self) -> bool:
+        """Tap empty grass/water so a selected castle does not block pan/hunt."""
+        if self._speed_burst_active():
+            self._tap_norm_exact(0.24, 0.70)
+            CONTROL.sleep(0.05)
+            return True
+        latest = self._image()
+        candidates = (
+            (0.16, 0.54),
+            (0.84, 0.54),
+            (0.24, 0.70),
+            (0.76, 0.70),
+            (0.18, 0.34),
+            (0.82, 0.34),
+        )
+        ranked: list[tuple[float, tuple[float, float]]] = []
+        width, height = latest.size
+        for point in candidates:
+            px, py = int(point[0] * width), int(point[1] * height)
+            radius = max(10, int(min(width, height) * 0.025))
+            patch = latest.crop((px - radius, py - radius, px + radius, py + radius)).convert("L")
+            ranked.append((float(ImageStat.Stat(patch).stddev[0]), point))
+        for texture, point in sorted(ranked):
+            if texture > 34.0:
+                continue
+            logger.info(
+                "deselect: безопасная свободная область ({:.3f}, {:.3f}) texture={:.1f}",
+                point[0],
+                point[1],
+                texture,
+            )
+            self._tap_norm_exact(*point)
+            CONTROL.sleep(0.35)
+            plain = self._image()
+            if (
+                is_map_screen(plain)
+                and not is_info_plaque(plain)
+                and not is_overview_plaque(plain)
+                and find_target_attack_button(plain) is None
+                and not self._plan_or_picker_open(plain)
+                and not is_travel_dialog(plain)
+            ):
+                return True
+        return False
+
+    def _finish_verified_home(self) -> bool:
+        latest = self._image()
+        main, viewport = self._read_map_coords(latest)
+        marker = find_main_castle_marker(latest)
+        centered = bool(
+            marker
+            or (
+                main is not None
+                and viewport is not None
+                and abs(main[0] - viewport[0]) <= 6
+                and abs(main[1] - viewport[1]) <= 6
+            )
+        )
+        if not centered:
+            logger.warning("Домой нажато, но центральный замок не подтверждён — pending сохраняю")
+            return False
+        started = time.monotonic()
+        if not self._deselect_via_safe_grass():
+            logger.warning("Не нашёл подтверждённую свободную область — поиск не начинаю")
+            return False
+        logger.info(
+            "Домой → plain map подтверждён за {:.2f}с; pan/search разрешён",
+            time.monotonic() - started,
+        )
         self._hunt_queue = []
         self._blocked_screen_targets = []
-        logger.info("Дома — следующая охота с ближайшей небитой цели")
+        self.store.live.post_attack_home_pending = False
+        self.store.live.last_action = "домой после атаки · центральный замок подтверждён"
+        self.store.save()
+        logger.info("Дома подтверждено — pending снят; новая охота с ближайшей небитой цели")
         return True
 
+    def _open_messages(self) -> bool:
+        """Reveal and open Messages without tapping an unverified footer button."""
+        image = self._image()
+        if self._plan_or_picker_open(image):
+            self._report_check_queued = True
+            return False
+        if is_inbox_screen(image):
+            return True
+        point = find_messages_button(image)
+        for attempt in range(6):
+            if point is not None:
+                break
+            logger.info(
+                "Сообщения скрыты — короткий drag нижней панели справа налево ({}/6)",
+                attempt + 1,
+            )
+            self._swipe_norm((0.78, 0.94), (0.58, 0.94))
+            image = self._image()
+            point = find_messages_button(image)
+        if point is None:
+            logger.warning("После drag надпись «Сообщения» не найдена — ничего не нажимаю")
+            return False
+        logger.info("Открываю подтверждённую OCR кнопку «Сообщения» ({:.3f}, {:.3f})", *point)
+        self._tap_norm_exact(*point)
+        CONTROL.sleep(0.6)
+        return is_inbox_screen(self._image())
+
+    def process_unread_battle_reports(self, world_hint: str = "") -> int:
+        """Process green unread battle reports between attacks; never interrupt formation."""
+        if self._plan_or_picker_open():
+            self._report_check_queued = True
+            return 0
+        if not self._open_messages():
+            self._last_report_check = time.time()
+            self._report_check_queued = False
+            return 0
+        processed = 0
+        for _ in range(30):
+            inbox = self._image()
+            rows = unread_battle_rows(inbox)
+            if not rows:
+                break
+            x, y, subject, stamp = rows[0]
+            logger.info("Открываю зелёный боевой отчёт: {}", subject)
+            self._tap_norm_exact(x, y)
+            CONTROL.sleep(0.55)
+            detail = self._image()
+            if not is_victory_report(detail):
+                logger.warning("Строка не открылась как «Победа» — закрываю отчёт, данные не придумываю")
+            else:
+                shot_path = save_shot(detail, f"farm_report_{int(time.time() * 1000)}.png")
+                report = parse_victory_report(
+                    detail,
+                    world=world_hint,
+                    subject=subject,
+                    report_timestamp=stamp,
+                    screenshot=str(shot_path),
+                )
+                if self._farm_ledger.append(report):
+                    processed += 1
+                    summary = self._farm_ledger.summary()
+                    self.telegram.report_farm_report(report.to_dict())
+                    self.store.live.farm_summary = summary
+                    self.store.live.reports_processed = int(summary.get("reports") or 0)
+                    self.store.save()
+            # Victory report's lower-right green check is the documented close/next control.
+            self._tap_forced(0.80, 0.93)
+            CONTROL.sleep(0.5)
+            if not is_inbox_screen(self._image()):
+                break
+        self._last_report_check = time.time()
+        self._report_check_queued = False
+        summary = self._farm_ledger.write_summary()
+        write_progress(
+            reports_processed=int(summary.get("reports") or 0),
+            farm_summary=summary,
+            telegram_available=bool(self.telegram.ready),
+        )
+        logger.info("Проверка почты завершена: новых боевых отчётов {}", processed)
+        self._dismiss_inbox_if_open()
+        return processed
+
+    def delete_all_messages(self) -> bool:
+        """Final-cleanup only: process reports, then Delete all -> GREEN confirmation."""
+        self.process_unread_battle_reports()
+        if not self._open_messages():
+            return False
+        image = self._image()
+        text = ocr_text_ui(crop_rel(image, [0.55, 0.10, 0.94, 0.34]), psm=6).lower()
+        if "удалить" not in text and "delete" not in text:
+            logger.warning("«Удалить все» OCR не подтверждено — очистку не выполняю")
+            return False
+        self._tap_norm_exact(0.80, 0.22)
+        CONTROL.sleep(0.45)
+        confirm = self._image()
+        prompt = ocr_text_ui(crop_rel(confirm, [0.12, 0.10, 0.88, 0.55]), psm=6).lower()
+        if "удал" not in prompt and "delete" not in prompt:
+            logger.warning("Диалог удаления не подтверждён OCR — зелёную печать не жму")
+            return False
+        logger.warning("Финальная очистка: «Удалить все» — жму только ЗЕЛЁНУЮ галочку")
+        self._tap_forced(0.80, 0.86)
+        CONTROL.sleep(0.7)
+        cleared = not unread_battle_rows(self._image())
+        write_progress(inbox_cleared=cleared)
+        return cleared
+
     def _home_after_send(self, kind: str, result: str) -> None:
-        if result == kind and (kind == "baron" or is_world_npc_kind(kind)):
-            self._return_home_via_castle_hud()
+        if result != kind:
+            return
+        if self._speed_burst_active():
+            return
+        self._return_home_via_castle_hud()
+
+    def _ensure_post_attack_home(self) -> bool:
+        live = getattr(getattr(self, "store", None), "live", None)
+        if getattr(live, "post_attack_home_pending", False) is not True:
+            return True
+        logger.warning("Перед новой охотой выполняю сохранённый post_attack_home_pending")
+        return self._return_home_via_castle_hud()
 
     def _read_ratio_from_image(self, image: Any, key: str) -> tuple[int, int] | None:
         region = self.layout.get("regions", {}).get(key)
         return parse_ratio(ocr_text(crop_rel(image, region))) if region else None
 
     def _movement_option(self, image: Any) -> tuple[str, int | None]:
+        if self._speed_burst_active():
+            self.tap_rel("feather_option")
+            return "feather", 1
         region = self.layout.get("regions", {}).get("feather_count")
         feathers = parse_count(ocr_text(crop_rel(image, region), psm=6)) if region else None
         movement = choose_movement(feathers)
@@ -2712,11 +3385,302 @@ class BlueStacksEngine(WorldSwitchMixin):
         )
         return "search_disabled"
 
+    def _pack_hud_matches_world(self, image: Any, world_id: str) -> bool:
+        """Fast terrain/HUD gate. Do not hunt Great Empire grass on another world's pack."""
+        if (
+            is_travel_dialog(image)
+            or is_formation_screen(image)
+            or self._picker_overlay_open(image)
+        ):
+            return False
+        if is_loading_screen(image) or is_world_list_open(image) or is_choose_place_screen(image):
+            return False
+        if not is_map_screen(image):
+            return False
+        grass = map_grass_ratio(image)
+        if world_id == "great_empire":
+            return grass >= 0.12
+        if grass >= 0.12:
+            logger.warning("PACK HUD: зелёная империя, нужен {} — не охочусь", world_id)
+            return False
+        observed = getattr(self, "_pack_hud_observed", None)
+        if observed is not None and observed != world_id:
+            logger.warning("PACK HUD: мир {} а нужен {} — не охочусь", observed, world_id)
+            return False
+        return True
+
+    def _log_pack_hud(self, image: Any, world_id: str) -> None:
+        grass = map_grass_ratio(image)
+        if self._speed_burst_active():
+            if world_id == "great_empire":
+                self._pack_hud_observed = "great_empire" if grass >= 0.12 else None
+            else:
+                self._pack_hud_observed = None if grass >= 0.12 else world_id
+            logger.warning(
+                "PACK HUD after jump want={} grass={:.3f} (OCR skipped)",
+                world_id,
+                grass,
+            )
+            return
+        try:
+            hud = self._read_castle_identity(image, banner=True)
+        except Exception:
+            hud = {}
+        observed = match_world_id(f"{hud.get('ocr') or ''} {hud.get('name') or ''}")
+        self._pack_hud_observed = observed
+        logger.warning(
+            "PACK HUD after jump want={} got={} grass={:.3f} coords={}",
+            world_id,
+            observed,
+            grass,
+            hud.get("coords"),
+        )
+
+    def _pack_confirm_open_travel(self, kind: str) -> str:
+        """Finish a leftover movement-planning dialog instead of hunting behind it."""
+        travel = self._image()
+        if not is_travel_dialog(travel):
+            return "travel_dialog_not_found"
+        if self._dismiss_no_commanders(travel):
+            return "no_commanders"
+        self._mark_pack_prep(kind)
+        if self._speed_burst_active():
+            movement = "gold"
+        else:
+            movement, _feathers = self._movement_option(travel)
+            if movement == "unknown":
+                self.tap_rel("travel_cancel")
+                return "feather_count_not_read"
+        one_way = self._read_march_time(travel)
+        if one_way is None:
+            if self._speed_burst_active():
+                one_way = 1
+            else:
+                self.tap_rel("travel_cancel")
+                return "march_time_not_read"
+        logger.warning("PACK leftover travel — confirm {} one_way={}", kind, one_way)
+        fake_target = {
+            "kingdom": int((self.config.get("baron_attacks") or {}).get("kingdom", 0)),
+            "x": int(
+                self._selected_target_coords[0]
+                if getattr(self, "_selected_target_coords", None)
+                else 500
+            ),
+            "y": int(
+                self._selected_target_coords[1]
+                if getattr(self, "_selected_target_coords", None)
+                else 500
+            ),
+        }
+        return self._finish_attack(kind, fake_target, one_way, movement)
+
+    def _pack_dismiss_overlay(self, image: Any) -> bool:
+        """Close inbox/taxes parchment. Never the nav list. Never ruby/+. Never the map HUD."""
+        if is_travel_dialog(image) or is_formation_screen(image) or self._picker_overlay_open(image):
+            return False
+        if is_map_screen(image) and not is_info_plaque(image) and not is_inbox_screen(image):
+            return False
+        parchment = _center_parchment_ratio(image)
+        if parchment <= 0.40:
+            return False
+        if self._picker_overlay_open(image) or is_formation_screen(image):
+            return False
+        if len(find_world_list_sextants(image)) >= 3:
+            return False
+        now = time.time()
+        last = float(getattr(self, "_pack_last_x_at", 0.0) or 0.0)
+        if now - last < 1.0:
+            CONTROL.sleep(0.12)
+            return True
+        close = find_parchment_title_close(image)
+        if close is None:
+            alt = popup_action(image) or find_red_cross_force(image)
+            if alt is not None:
+                close = (float(alt[0]), float(alt[1]))
+        if (
+            close is None
+            or close[1] > 0.22
+            or close[0] < 0.68
+            or close[0] >= 0.88
+            or is_ruby_plus_hud_point(*close)
+            or is_offer_rail_point(*close)
+        ):
+            logger.warning(
+                "PACK overlay parchment={:.2f} — крестик небезопасен {}, не жму ruby/+",
+                parchment,
+                close,
+            )
+            return False
+        self._pack_last_x_at = now
+        logger.warning(
+            "PACK overlay parchment={:.2f} — X ({:.3f},{:.3f})",
+            parchment,
+            close[0],
+            close[1],
+        )
+        self._tap_forced(*close)
+        CONTROL.sleep(0.15)
+        return True
+
+    def _world_speed_pack(self, kind: str) -> str:
+        """5 real sends in this world; wall-clock from first prep to 5th send must be ≤40s."""
+        spec = spec_for_kind(kind)
+        world_id = spec.id if spec is not None else "great_empire"
+        self._begin_world_pack(kind)
+        logger.warning(
+            "PACK loop {} world={} cycles={}/10",
+            kind,
+            world_id,
+            int(getattr(self, "_qualifying_cycles", 0) or 0),
+        )
+        last = "no_targets"
+        try:
+            probe = self._image()
+        except Exception:
+            probe = None
+        if probe is not None and self._pack_hud_matches_world(probe, world_id):
+            self._switched_world_id = world_id
+        else:
+            current = getattr(self, "_switched_world_id", None)
+            if current != world_id and (current is not None or world_id != "great_empire"):
+                self._fast_world_home(world_id)
+                CONTROL.sleep(0.08)
+            elif current is None:
+                self._switched_world_id = world_id
+        attempts = 8 if kind == "storm_fort" else 28
+        for _ in range(attempts):
+            CONTROL.check()
+            if getattr(self, "_pack_finished", False):
+                return last if last != "no_targets" else kind
+            image = self._image()
+            if self._dismiss_empty_wave_warning():
+                continue
+            if is_travel_dialog(image):
+                logger.warning("PACK leftover travel — confirm send")
+                result = self._pack_confirm_open_travel(kind)
+                last = result
+                if result == kind:
+                    self._block_screen_target((0.50, 0.50))
+                elif result == "no_commanders":
+                    return result
+                continue
+            if self._picker_overlay_open(image) or is_formation_screen(image):
+                logger.warning("PACK picker/formation open — execute send")
+                result = self._execute_formation_attack(kind, (0.50, 0.50))
+                last = result
+                if result == kind:
+                    self._block_screen_target((0.50, 0.50))
+                    leftover = self._image()
+                    if is_formation_screen(leftover):
+                        self.close_formation_plan()
+                elif result == "no_commanders":
+                    return result
+                continue
+            if is_loading_screen(image):
+                CONTROL.sleep(0.12)
+                continue
+            if self._dismiss_special_offers_if_open(image):
+                continue
+            if is_world_list_open(image) or is_choose_place_screen(image):
+                self._tap_open_world_list_row(world_id, image)
+                continue
+            recent_jump = time.time() - float(
+                getattr(self, "_pack_last_list_tap_at", 0.0) or 0.0
+            ) < 5.0
+            if self._pack_dismiss_overlay(image):
+                continue
+            if not is_map_screen(image):
+                if recent_jump:
+                    CONTROL.sleep(0.12)
+                    continue
+                now = time.time()
+                last_home = float(getattr(self, "_pack_last_home_at", 0.0) or 0.0)
+                if now - last_home >= 2.5:
+                    self._fast_world_home(world_id)
+                    self._pack_last_home_at = now
+                else:
+                    CONTROL.sleep(0.12)
+                continue
+            if not self._pack_hud_matches_world(image, world_id):
+                now = time.time()
+                last_home = float(getattr(self, "_pack_last_home_at", 0.0) or 0.0)
+                if now - last_home >= 2.0:
+                    self._fast_world_home(world_id)
+                    self._pack_last_home_at = now
+                else:
+                    CONTROL.sleep(0.12)
+                continue
+            if is_info_plaque(image) or is_overview_plaque(image):
+                self._deselect_via_safe_grass()
+                image = self._image()
+            targets = self._list_eligible_targets(image, kind)
+            if not targets:
+                last = "no_targets"
+                if kind == "storm_fort":
+                    logger.warning(
+                        "PACK: острова ураганов не открыты или нет фортов — цикл без шторма не считаю"
+                    )
+                    if spec is not None:
+                        self.store.skip_mode(spec.mode_id)
+                    return "world_skip_empty"
+                streak = int(getattr(self, "_pack_no_target_streak", 0) or 0) + 1
+                self._pack_no_target_streak = streak
+                logger.warning(
+                    "PACK: на карте нет {} — streak={} (навигацию не открываю)",
+                    kind,
+                    streak,
+                )
+                pans = (
+                    ((0.70, 0.48), (0.32, 0.48)),
+                    ((0.32, 0.48), (0.70, 0.48)),
+                    ((0.50, 0.60), (0.50, 0.34)),
+                    ((0.50, 0.34), (0.50, 0.60)),
+                )
+                start, end = pans[(streak - 1) % 4]
+                logger.warning("PACK: пан карты ({:.2f},{:.2f})→({:.2f},{:.2f})", start[0], start[1], end[0], end[1])
+                self._swipe_norm(start, end)
+                CONTROL.sleep(0.05)
+                if streak >= 12:
+                    now = time.time()
+                    last_home = float(getattr(self, "_pack_last_home_at", 0.0) or 0.0)
+                    if now - last_home >= 8.0:
+                        self._fast_world_home(world_id)
+                        self._pack_last_home_at = now
+                    self._pack_no_target_streak = 0
+                continue
+            self._pack_no_target_streak = 0
+            point = targets[0].point
+            if not self._open_formation(point, kind):
+                self._blocked_screen_targets.append(point)
+                last = "popup_not_found"
+                continue
+            self._mark_pack_prep(kind)
+            result = self._execute_formation_attack(kind, point)
+            last = result
+            if result == kind:
+                self._block_screen_target(point)
+            elif result == "no_commanders":
+                return result
+        times = getattr(self, "_pack_send_times", None) or []
+        if times:
+            span = time.time() - float(self._pack_prep_started_at or times[0])
+            logger.warning("PACK floor {} {} sends spanned {:.2f}s", kind, len(times), span)
+        return last
+
+    def _baron_speed_burst(self) -> str:
+        return self._world_speed_pack("baron")
+
     def on_screen_attack(self, kind: str) -> str:
         if getattr(self, "_hunt_queue", None) is None:
             self._hunt_queue = []
         if getattr(self, "_blocked_screen_targets", None) is None:
             self._blocked_screen_targets = []
+        if kind == "baron" and self._speed_burst_active():
+            return self._baron_speed_burst()
+        if is_world_npc_kind(kind) and self._speed_burst_active():
+            return self._world_speed_pack(kind)
+        if not self._ensure_post_attack_home():
+            return "post_attack_home_pending"
         try:
             already = self._image()
         except Exception:
@@ -2734,6 +3698,22 @@ class BlueStacksEngine(WorldSwitchMixin):
                 result = self._execute_formation_attack(kind, (0.50, 0.50))
                 self._home_after_send(kind, result)
                 return result
+        if kind == "baron":
+            try:
+                probe = self._image()
+            except Exception:
+                probe = None
+            if probe is not None:
+                self._dismiss_inbox_if_open(probe)
+                probe = self._image()
+                if (
+                    not is_map_screen(probe)
+                    or is_inbox_screen(probe)
+                    or map_grass_ratio(probe) < 0.12
+                ):
+                    logger.info("Бароны: не Великая империя / оверлей — принудительно Навигация домой")
+                    self._need_ge_home = True
+                    self._switched_world_id = None
         switched = self._ensure_world(kind)
         if switched != "ok":
             if is_world_npc_kind(kind) or kind == "baron":
@@ -2764,6 +3744,8 @@ class BlueStacksEngine(WorldSwitchMixin):
                         self._hunt_queue = self._collect_hunt_batch(kind)
             if not self._hunt_queue:
                 logger.info("На карте нет доступных целей этого мира")
+                if is_world_npc_kind(kind):
+                    return self._handle_world_no_targets(kind)
                 return "no_targets"
             self._world_recenter_tries = 0
             logger.info(
@@ -2829,6 +3811,8 @@ class BlueStacksEngine(WorldSwitchMixin):
             self._world_recenter_tries = int(getattr(self, "_world_recenter_tries", 0) or 0) + 1
             if self._recenter_current_world_via_nav(kind):
                 return self.on_screen_attack(kind)
+        if is_world_npc_kind(kind):
+            return self._handle_world_no_targets(kind)
         return "no_targets"
 
     def _tap_formation_attack(self) -> None:
@@ -2841,7 +3825,8 @@ class BlueStacksEngine(WorldSwitchMixin):
         self.tap_rel("formation_attack")
 
     def _execute_formation_attack(self, kind: str, point: tuple[float, float]) -> str:
-        self._dismiss_empty_wave_warning()
+        if not self._speed_burst_active():
+            self._dismiss_empty_wave_warning()
         self._last_picker_fill = None
         if is_world_npc_kind(kind):
             ok, reason = self._prepare_waves_for_kind(kind)
@@ -2881,6 +3866,7 @@ class BlueStacksEngine(WorldSwitchMixin):
                 )
             return "unsafe_formation"
         self._picker_stall_count = 0
+        self._mark_pack_prep(kind)
         self._tap_formation_attack()
         travel = self._wait_for(
             lambda img: is_travel_dialog(img) or is_no_commanders_parchment(img),
@@ -2902,13 +3888,16 @@ class BlueStacksEngine(WorldSwitchMixin):
             self.tap_rel("travel_cancel")
             logger.warning("Атака отменена: число перьев не распознано")
             return "feather_count_not_read"
-        time.sleep(0.5)
+        time.sleep(0.05 if self._speed_burst_active() else 0.5)
         travel = self._image()
         one_way = self._read_march_time(travel)
         if one_way is None:
-            self.tap_rel("travel_cancel")
-            logger.warning("Атака отменена: не удалось прочитать время похода")
-            return "march_time_not_read"
+            if self._speed_burst_active():
+                one_way = 1
+            else:
+                self.tap_rel("travel_cancel")
+                logger.warning("Атака отменена: не удалось прочитать время похода")
+                return "march_time_not_read"
         if movement == "gold":
             logger.warning(f"Перьев нет ({feathers}); выбран разрешённый вариант за золото")
         fake_target = {
@@ -2942,7 +3931,7 @@ class BlueStacksEngine(WorldSwitchMixin):
         dry_run = bool(self.config.get("dry_run", True))
         kid = int(target.get("kingdom", 0))
         x, y = int(target["x"]), int(target["y"])
-        commander_no = parse_commander_number(self.read_region("commander_number"))
+        commander_no = None if self._speed_burst_active() else parse_commander_number(self.read_region("commander_number"))
         if commander_no is None:
             commander_no = self._next_commander
         self._next_commander = int(commander_no) + 1
@@ -2950,7 +3939,7 @@ class BlueStacksEngine(WorldSwitchMixin):
         if one_way is None:
             self.tap_rel("travel_cancel")
             return "march_time_not_read"
-        shot = capture_game_image(self.config, self.adb)
+        shot = None if self._speed_burst_active() else capture_game_image(self.config, self.adb)
         shot_path = None
         if shot is not None:
             shot_path = save_shot(shot, f"{kind}_{x}_{y}_{int(time.time())}.png")
@@ -2967,7 +3956,8 @@ class BlueStacksEngine(WorldSwitchMixin):
                 f"время {one_way} сек"
             )
             return kind
-        wait_for_send_slot(self.store, self.config)
+        if not self._speed_burst_active():
+            wait_for_send_slot(self.store, self.config)
         confirmed, reason, _ = self.diagnose_movement_confirm(click=True)
         if reason == "no_commanders":
             return "no_commanders"
@@ -2987,20 +3977,38 @@ class BlueStacksEngine(WorldSwitchMixin):
             str(shot_path) if shot_path else "",
             movement=movement,
         )
-        self.telegram.report_attack(
-            self.store.live.account or "BlueStacks",
-            kind,
-            kid,
-            x,
-            y,
-            commander_no,
-            one_way,
-            int(march.return_at - march.sent_at),
-            shot_path,
-            dry_run=False,
-        )
+        if not self._speed_burst_active():
+            self.telegram.report_attack(
+                self.store.live.account or "BlueStacks",
+                kind,
+                kid,
+                x,
+                y,
+                commander_no,
+                one_way,
+                int(march.return_at - march.sent_at),
+                shot_path,
+                dry_run=False,
+            )
         mark_successful_send(self.store, self.config)
         self.store.save()
+        now = time.time()
+        times = getattr(self, "_burst_send_times", None)
+        if times is None:
+            self._burst_send_times = []
+            times = self._burst_send_times
+        times.append(now)
+        window = times[-5:] if len(times) >= 5 else times
+        span = window[-1] - window[0] if window else 0.0
+        logger.warning(
+            "SPEED attack.sent #{} kind={} last{}={:.2f}s (need 5 in 40s pack)",
+            len(times),
+            kind,
+            len(window),
+            span,
+        )
+        if self._speed_burst_active():
+            self._note_pack_send(kind)
         emit(
             "attack.sent",
             mode=self.store.live.active_mode or kind,

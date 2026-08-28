@@ -103,6 +103,7 @@ def build_checkpoint(
         "last_action": str(live.last_action or ""),
         "switched_world_id": str(switched or ""),
         "live_mode": str(live.mode or ""),
+        "post_attack_home_pending": bool(getattr(live, "post_attack_home_pending", False)),
         "resume_window_sec": RESUME_WINDOW_SEC,
     }
 
@@ -148,6 +149,7 @@ def restore_into_store(store: Any, payload: dict[str, Any]) -> None:
     store.live.pinned_mode = str(payload.get("mode_id") or payload.get("pinned_mode") or "")
     store.live.current_world = str(payload.get("current_world") or store.live.current_world or "")
     store.live.last_action = str(payload.get("last_action") or store.live.last_action or "")
+    store.live.post_attack_home_pending = bool(payload.get("post_attack_home_pending"))
     nxt = float(payload.get("next_attack_at") or 0)
     live_mode = str(payload.get("live_mode") or "")
     if nxt > time.time() or payload.get("waiting_commanders") or live_mode == "wait_commanders":
@@ -180,12 +182,14 @@ def start_fresh_from_great_empire(
     mode_id = "robber_barons"
     title = "Замки баронов"
     if config:
-        from e4kbot.runtime.scheduler import pick_next_step
+        from e4kbot.runtime.scheduler import enabled_mode_ids, pick_next_step
 
-        step = pick_next_step(config, store)
-        if step is not None:
-            mode_id = step.mode_id
-            title = step.spec.title_ru
+        enabled = set(enabled_mode_ids(config))
+        if "robber_barons" not in enabled:
+            step = pick_next_step(config, store)
+            if step is not None:
+                mode_id = step.mode_id
+                title = step.spec.title_ru
     store.live.active_mode = mode_id
     store.live.pinned_mode = ""
     ge_modes = {

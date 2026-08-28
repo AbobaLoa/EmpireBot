@@ -178,6 +178,29 @@ class CampaignSchedulerTests(unittest.TestCase):
         self.assertEqual(again.mode_id, "barbarian_towers")
         self.assertEqual(int((store.live.session_by_mode or {}).get("barbarian_towers") or 0), 0)
 
+    def test_skip_mode_does_not_fake_successful_sends(self) -> None:
+        store = StateStore(path=self._tmp("state.json"))
+        config = deep_merge(
+            DEFAULTS,
+            {
+                "campaign": {
+                    "enabled": True,
+                    "queue": [
+                        {"mode": "robber_barons", "count": 5, "enabled": True},
+                        {"mode": "barbarian_towers", "count": 5, "enabled": True},
+                    ],
+                }
+            },
+        )
+        store.live.session_by_mode = {"robber_barons": 2}
+        store.skip_mode("robber_barons")
+        barons = next(item for item in steps(config, store) if item.mode_id == "robber_barons")
+        self.assertEqual(barons.sent, 2)
+        self.assertEqual(barons.remaining, 0)
+        nxt = pick_next_step(config, store)
+        self.assertIsNotNone(nxt)
+        self.assertEqual(nxt.mode_id, "barbarian_towers")
+
     def test_numeric_commander_caps_never_stop(self) -> None:
         from e4kbot.safety import commander_number_ok, concurrent_ok
 

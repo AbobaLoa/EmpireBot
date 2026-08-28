@@ -57,6 +57,74 @@ class FastApiPanelTests(unittest.TestCase):
         self.assertTrue(saved["barons"])
         self.assertFalse(saved["nomads"])
 
+    def test_farm_reports_endpoint_returns_summary_and_rows(self) -> None:
+        with patch("e4kbot.miniapp.FarmLedger") as ledger:
+            ledger.return_value.summary.return_value = {"reports": 2}
+            ledger.return_value.rows.return_value = [{"id": "one"}, {"id": "two"}]
+            body = self.client.get("/api/farm-reports").json()
+        self.assertEqual(body["summary"]["reports"], 2)
+        self.assertEqual(len(body["reports"]), 2)
+
+
+    def test_state_exposes_live_phase_and_next_action(self) -> None:
+        body = self.client.get("/api/state").json()
+        self.assertIn(
+            body["phase"],
+            {"paused", "search", "returned_home", "deselect_home", "formation", "report_check"},
+        )
+        self.assertTrue(body["next_action"])
+        self.assertIn("attacks_world", body)
+        self.assertIn("timing_summary", body)
+        self.assertIn("paused", body)
+        self.assertIn("enabled", body)
+
+    def test_player_attack_draft_persists_without_launching(self) -> None:
+        payload = {
+            "world": "great_empire",
+            "x": 612,
+            "y": 740,
+            "attacks": 3,
+            "commander": "auto",
+            "formation": "default",
+            "waves": 2,
+            "flank": "center",
+            "tools": "none",
+            "delay_seconds": 12,
+            "schedule": "",
+            "stop_conditions": ["no_commanders"],
+        }
+        with patch("e4kbot.miniapp.DATA_DIR", Path(self._tmp.name)):
+            saved = self.client.post("/api/player-attack-draft", json=payload).json()
+            self.assertTrue(saved["ok"])
+            self.assertFalse(saved["implemented"])
+            self.assertFalse(saved["draft"]["implemented"])
+            self.assertEqual(saved["draft"]["x"], 612)
+            self.assertEqual(saved["draft"]["commander"], "auto")
+            self.assertIn("не реализован", saved["draft"]["notice"])
+            got = self.client.get("/api/player-attack-draft").json()
+            self.assertFalse(got["implemented"])
+            self.assertEqual(got["draft"]["attacks"], 3)
+            deleted = self.client.delete("/api/player-attack-draft").json()
+            self.assertTrue(deleted["ok"])
+            self.assertIsNone(deleted["draft"])
+            empty = self.client.get("/api/player-attack-draft").json()
+            self.assertIsNone(empty["draft"])
+
+    def test_player_attack_draft_rejects_bad_coords(self) -> None:
+        with patch("e4kbot.miniapp.DATA_DIR", Path(self._tmp.name)):
+            res = self.client.post(
+                "/api/player-attack-draft",
+                json={
+                    "world": "great_empire",
+                    "x": 5000,
+                    "y": 1,
+                    "attacks": 1,
+                    "waves": 1,
+                    "delay_seconds": 0,
+                },
+            )
+        self.assertEqual(res.status_code, 422)
+
 
 if __name__ == "__main__":
     unittest.main()

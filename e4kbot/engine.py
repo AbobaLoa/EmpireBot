@@ -16,6 +16,7 @@ from e4kbot.campaign_checkpoint import (
 )
 from e4kbot.client import BlueStacksEngine
 from e4kbot.control import CONTROL, BotPaused, hotkey_label
+from e4kbot.farm_reports import WORLD_BY_MODE, write_progress
 from e4kbot.protocol import ProtocolEngine
 from e4kbot.runtime.live import emit, emit_state
 from e4kbot.runtime.scheduler import pick_next_step, snapshot, steps
@@ -49,6 +50,7 @@ FAST_RETRY_RESULTS = {
     "world_skip_empty",
     "world_switch_failed",
     "nav_not_found",
+    "post_attack_home_pending",
 }
 
 
@@ -65,6 +67,7 @@ class AttackBot:
         self._announced = False
         self._resume_now = False
         self._armed_for_report = False
+        self._started_at = time.time()
         CONTROL.on_change(self._on_control_change)
 
     def start(self) -> None:
@@ -159,9 +162,12 @@ class AttackBot:
 
                 skip_send_wait = self._resume_now
                 self._resume_now = False
+                burst = bool(getattr(self.client, "_speed_burst_active", lambda: False)())
+                if not burst and self._maybe_process_due_reports():
+                    continue
                 self.store.prune()
                 commander_wait = float(self.store.live.next_attack_at or 0)
-                if not skip_send_wait and commander_wait > time.time():
+                if not burst and not skip_send_wait and commander_wait > time.time():
                     wait_for = max(1.0, commander_wait - time.time())
                     self.store.live.mode = "wait_commanders"
                     self.store.save()
@@ -171,7 +177,19 @@ class AttackBot:
                 self.store.live.mode = "attack"
                 self.store.live.paused = False
                 self.store.save()
+                cycle_started = time.perf_counter()
                 result = self._run_scheduled_cycle()
+                cycle_seconds = time.perf_counter() - cycle_started
+                self.store.record_timing("attack_cycle", cycle_seconds)
+                write_progress(
+                    started_at=getattr(self, "_started_at", time.time()),
+                    attacks=int(self.store.live.session_attacks),
+                    sends_by_world=dict(self.store.live.session_by_mode),
+                    action_timings=dict(self.store.live.action_timings),
+                    last_result=result,
+                    last_error=self.store.live.last_error,
+                    worlds_unavailable=list(self.store.live.unopened_worlds),
+                )
                 write_checkpoint(self.store, self.client)
             except BotPaused:
                 mark_paused(self.store, self.client)
@@ -218,6 +236,12 @@ class AttackBot:
                     logger.info("Лимит прогонов достигнут — останавливаюсь")
                     break
             if result == "no_commanders":
+                if bool(getattr(self.client, "_speed_burst_active", lambda: False)()):
+                    try:
+                        CONTROL.sleep(0.05)
+                    except BotPaused:
+                        continue
+                    continue
                 self.handle_no_commanders_result()
                 continue
             if str(result).startswith("stub:"):
@@ -225,7 +249,8 @@ class AttackBot:
                 continue
             if str(result) in FAST_RETRY_RESULTS or str(result).startswith("movement_"):
                 try:
-                    CONTROL.sleep(0.4)
+                    fast = bool(getattr(self.client, "_speed_burst_active", lambda: False)())
+                    CONTROL.sleep(0.05 if fast else 0.4)
                 except BotPaused:
                     continue
                 continue
@@ -233,6 +258,48 @@ class AttackBot:
         self.store.live.running = False
         self.store.live.mode = "stopped"
         self.store.save()
+
+    def _maybe_process_due_reports(self) -> bool:
+        """Queue at 4–5 seconds, then check only between complete attack actions."""
+        if self.client is None:
+            return False
+        if getattr(self.client, "_speed_burst_active", lambda: False)():
+            return False
+        now = time.time()
+        candidates = [
+            march
+            for march in self.store.live.marches
+            if march.return_at >= now - 120
+        ]
+        nearest = min(candidates, key=lambda march: abs(march.return_at - now), default=None)
+        queued = bool(getattr(self.client, "_report_check_queued", False))
+        last_check = float(getattr(self.client, "_last_report_check", 0.0) or 0.0)
+        if last_check and now - last_check < 60:
+            return False
+        if nearest is not None:
+            left = nearest.return_at - now
+            if -120 <= left <= 5:
+                self.client._report_check_queued = True
+                if not queued:
+                    logger.info("Возврат через {:.1f}с — ставлю проверку боевых отчётов в очередь", max(0.0, left))
+                if left > 0:
+                    CONTROL.sleep(left + 1.2)
+                queued = True
+        if not queued:
+            return False
+        try:
+            assembling = bool(self.client._plan_or_picker_open())
+        except Exception:
+            assembling = False
+        if assembling:
+            logger.info("Отчёт ждёт в очереди — сначала завершаю открытую формацию/отправку")
+            return False
+        mode = nearest.kind if nearest is not None else self.store.live.active_mode
+        world = WORLD_BY_MODE.get(str(mode), "")
+        self.store.live.mode = "reports"
+        self.store.save()
+        self.client.process_unread_battle_reports(world_hint=world)
+        return True
 
     def _run_scheduled_cycle(self) -> str:
         campaign = self.config.get("campaign") or {}
@@ -298,7 +365,10 @@ class AttackBot:
         if self.protocol:
             result = self.protocol.run_cycle()
         elif self.client:
-            if self.client.wait_out_loading():
+            if (
+                not bool(getattr(self.client, "_speed_burst_active", lambda: False)())
+                and self.client.wait_out_loading()
+            ):
                 result = "map_loading"
             else:
                 mode_id = self.store.live.active_mode

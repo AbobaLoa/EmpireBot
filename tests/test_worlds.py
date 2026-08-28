@@ -15,7 +15,10 @@ from e4kbot.vision import (
 )
 from e4kbot.worlds import (
     CONTINUE_ONE_WORLD_LINE,
+    NavRow,
+    NavigationScan,
     STORM_UNOPENED_LINE,
+    is_world_npc_kind,
     looks_like_wrong_world_target,
     match_target_kind,
     match_world_id,
@@ -32,6 +35,39 @@ ROWS_SHOT = ROOT / "assets" / "world_list_rows.png"
 
 
 class WorldOcrTests(unittest.TestCase):
+    def test_canonical_ge_row_is_topmost_and_lower_duplicate_never_selected(self) -> None:
+        from e4kbot.world_switch import WorldSwitchMixin
+
+        top = NavRow(None, "", "Main OCR unknown", None, (0.20, 0.22), "main")
+        lower = NavRow("great_empire", "Великая империя", "Outpost", None, (0.20, 0.48), "outpost")
+        scan = NavigationScan(rows=[lower, top])
+        chosen = WorldSwitchMixin._central_row_for_world(object(), scan, "great_empire")
+        self.assertIs(chosen, top)
+        self.assertIsNot(chosen, lower)
+
+    def test_canonical_single_other_world_row_is_selected(self) -> None:
+        from e4kbot.world_switch import WorldSwitchMixin
+
+        row = NavRow("everwinter", "Вечнохолодный ледник", "Any account", None, (0.20, 0.35), "row")
+        scan = NavigationScan(rows=[row])
+        self.assertIs(WorldSwitchMixin._central_row_for_world(object(), scan, "everwinter"), row)
+
+    def test_fast_sextant_ignores_poisoned_store_outpost_row(self) -> None:
+        from e4kbot.world_switch import FAST_WORLD_SEXTANTS, WorldSwitchMixin
+        from unittest.mock import Mock
+
+        engine = WorldSwitchMixin()
+        engine.store = Mock()
+        engine.store.live = Mock()
+        engine.store.live.central_castles = {
+            "everwinter": {"row": {"sextant": [0.199, 0.2867]}},
+        }
+        self.assertEqual(
+            engine._world_list_expected_sextant("everwinter"),
+            FAST_WORLD_SEXTANTS["everwinter"],
+        )
+        self.assertAlmostEqual(FAST_WORLD_SEXTANTS["everwinter"][1], 0.343, places=3)
+
     def test_garbled_list_ocr_detects_open_worlds_and_missing_storm(self) -> None:
         blob = (
             "3amokthirdabobbenukanvmnepnax605y736ganevbenukaavmnepuaxst4y744"
@@ -78,18 +114,59 @@ class WorldOcrTests(unittest.TestCase):
             )
         )
 
-    def test_fill_policy_first_skip_fifth_wait(self) -> None:
+    def test_fill_policy_always_skips_world_on_insufficient_troops(self) -> None:
+        self.assertTrue(is_world_npc_kind("baron"))
         self.assertEqual(world_fill_decision(0, 5, 0, first_must_skip=True), "world_skip_empty")
-        self.assertEqual(world_fill_decision(0, 5, 0, first_must_skip=False), "wait_return")
-        self.assertEqual(world_fill_decision(4, 5, 2, first_must_skip=True), "wait_return")
-        self.assertEqual(world_fill_decision(1, 5, 1, first_must_skip=True), "wait_return")
+        self.assertEqual(world_fill_decision(0, 5, 0, first_must_skip=False), "world_skip_empty")
+        self.assertEqual(world_fill_decision(4, 5, 2, first_must_skip=True), "world_skip_empty")
+        self.assertEqual(world_fill_decision(1, 5, 1, first_must_skip=True), "world_skip_empty")
         self.assertEqual(
             world_fill_decision(4, 5, 2, first_must_skip=True, wait_last=False),
             "world_skip_empty",
         )
 
     def test_storm_does_not_wait_forever_on_first(self) -> None:
-        self.assertEqual(world_fill_decision(0, 5, 0, first_must_skip=False), "wait_return")
+        self.assertEqual(world_fill_decision(0, 5, 0, first_must_skip=False), "world_skip_empty")
+
+    def test_empty_hunt_does_not_skip_world_before_five_sends(self) -> None:
+        from e4kbot.state import StateStore
+        from e4kbot.world_switch import WorldSwitchMixin
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+
+        folder = TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        store = StateStore(path=Path(folder.name) / "state.json")
+        store.live.session_by_mode = {"robber_barons": 2}
+
+        class Dummy(WorldSwitchMixin):
+            def __init__(self) -> None:
+                self.store = store
+                self.telegram = None
+                self._world_scan = None
+                self._world_recenter_tries = 3
+
+        dummy = Dummy()
+        self.assertEqual(dummy._handle_world_no_targets("baron"), "no_targets")
+        self.assertNotIn("robber_barons", store.live.skipped_modes)
+        self.assertEqual(dummy._world_recenter_tries, 0)
+
+    def test_world_castle_templates_match_on_map_canvas(self) -> None:
+        from e4kbot.vision import WORLD_CASTLE_TEMPLATES, find_world_castle_candidates
+
+        self.assertEqual(
+            set(WORLD_CASTLE_TEMPLATES),
+            {"barbarian_tower", "desert_tower", "cultist_tower", "storm_fort"},
+        )
+        self.assertEqual(len(WORLD_CASTLE_TEMPLATES["storm_fort"]), 2)
+        for kind, paths in WORLD_CASTLE_TEMPLATES.items():
+            for path in paths:
+                self.assertTrue(path.exists(), path.name)
+                canvas = Image.new("RGB", (900, 1600), (104, 151, 57))
+                sprite = Image.open(path).convert("RGB")
+                canvas.paste(sprite, (280, 720))
+                hits = find_world_castle_candidates(canvas, kind, threshold=0.55)
+                self.assertTrue(hits, f"{kind} / {path.name} should match itself")
 
     def test_report_written_to_disk(self) -> None:
         scan = scan_from_blob("beyhoxonog necku orhehh")
@@ -178,7 +255,37 @@ class WorldScreenshotTests(unittest.TestCase):
         image = Image.open(shot)
         self.assertTrue(is_place_list_exhausted(image))
 
-    def test_live_modules_are_not_stubs(self) -> None:
+    def test_inbox_parchment_is_not_special_offers(self) -> None:
+        from PIL import ImageDraw
+        from e4kbot.vision import is_special_offers_screen
+
+        water = Image.new("RGB", (900, 1600), (42, 98, 150))
+        inbox = water.copy()
+        draw = ImageDraw.Draw(inbox)
+        draw.rectangle((80, 300, 820, 1160), fill=(214, 186, 138))
+        self.assertFalse(is_special_offers_screen(inbox, recognized_text="Входящие"))
+
+
+        from PIL import ImageDraw
+        from e4kbot.vision import find_robber_candidates, is_map_screen, map_grass_ratio
+
+        grass = Image.new("RGB", (900, 1600), (104, 151, 57))
+        self.assertTrue(is_map_screen(grass))
+        self.assertGreater(map_grass_ratio(grass), 0.12)
+        water = Image.new("RGB", (900, 1600), (42, 98, 150))
+        inbox = water.copy()
+        draw = ImageDraw.Draw(inbox)
+        draw.rectangle((80, 300, 820, 1160), fill=(214, 186, 138))
+        self.assertFalse(is_map_screen(inbox))
+        self.assertEqual(find_robber_candidates(inbox), [])
+
+    def test_nav_fallback_point_is_inside_star_band(self) -> None:
+        point = (0.198, 0.937)
+        self.assertGreaterEqual(point[0], 0.07)
+        self.assertLess(point[0], 0.26)
+        self.assertGreaterEqual(point[1], 0.87)
+
+
         for mode_id in ("barbarian_towers", "desert_towers", "cultist_towers", "storm_forts"):
             self.assertEqual(MODE_BY_ID[mode_id].status, "live")
             module = get_attack_module(mode_id)

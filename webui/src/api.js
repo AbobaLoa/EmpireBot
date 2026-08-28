@@ -30,3 +30,18 @@ export function setControl(payload) {
     body: JSON.stringify(payload),
   });
 }
+
+export function getPlayerAttackDraft() {
+  return request("/api/player-attack-draft");
+}
+
+export function savePlayerAttackDraft(payload) {
+  return request("/api/player-attack-draft", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deletePlayerAttackDraft() {
+  return request("/api/player-attack-draft", { method: "DELETE" });
+}

@@ -94,6 +94,14 @@ class TelegramReporter:
         )
         self.thread_samurai = self._coerce_thread(cfg.get("thread_samurai"))
         self.thread_nomad = self._coerce_thread(cfg.get("thread_nomad"))
+        self.thread_summary = self._coerce_thread(cfg.get("thread_summary"))
+        self.world_threads = {
+            "Великая империя": self._coerce_thread(cfg.get("thread_great_empire")),
+            "Вечнохолодный Ледник": self._coerce_thread(cfg.get("thread_everwinter_glacier")),
+            "Пылающие Пески": self._coerce_thread(cfg.get("thread_burning_sands")),
+            "Огненные Вершины": self._coerce_thread(cfg.get("thread_fire_peaks")),
+            "Острова ураганов": self._coerce_thread(cfg.get("thread_storm_islands")),
+        }
         self._base = f"https://api.telegram.org/bot{self.token}"
 
     @staticmethod
@@ -196,6 +204,49 @@ class TelegramReporter:
         if self.public_webapp_url:
             extra["reply_markup"] = json.dumps(_webapp_markup(self.public_webapp_url))
         return bool(self._post("sendMessage", extra).get("ok"))
+
+    def _send_to_explicit_thread(self, text: str, thread: int | None) -> bool:
+        if not self.ready or not thread:
+            return False
+        return bool(
+            self._post(
+                "sendMessage",
+                {
+                    "chat_id": self.chat_id,
+                    "text": text[:4096],
+                    "message_thread_id": int(thread),
+                },
+            ).get("ok")
+        )
+
+    def report_farm_report(self, report: dict[str, Any]) -> bool:
+        world = str(report.get("world") or "")
+        thread = self.world_threads.get(world)
+        if not thread:
+            logger.info("Telegram topic для мира «{}» не настроен — отчёт только на диске", world or "не определён")
+            return False
+        resources = ", ".join(f"{key} {value}" for key, value in (report.get("resources") or {}).items()) or "не распознано"
+        return self._send_to_explicit_thread(
+            "⚔️ Боевой отчёт\n"
+            f"Мир: {world}\n"
+            f"Цель: {report.get('target') or report.get('subject') or 'не распознано'}\n"
+            f"Свои потери: {report.get('own_losses') if report.get('own_losses') is not None else 'не распознано'}\n"
+            f"Добыча: {resources}",
+            thread,
+        )
+
+    def report_farm_summary(self, summary: dict[str, Any]) -> bool:
+        if not self.thread_summary:
+            logger.info("Telegram topic «сводный отчет» не настроен — сводка только на диске")
+            return False
+        resources = ", ".join(f"{key} {value}" for key, value in (summary.get("resources") or {}).items()) or "нет"
+        return self._send_to_explicit_thread(
+            "📊 Сводный отчёт фермы\n"
+            f"Отчётов: {int(summary.get('reports') or 0)}\n"
+            f"Свои потери: {int(summary.get('own_losses') or 0)}\n"
+            f"Добыча: {resources}",
+            self.thread_summary,
+        )
 
     def send_photo(self, image_path: Path, caption: str, kind: str | None = None) -> bool:
         if not self.ready or not image_path.exists():

@@ -43,6 +43,9 @@ h2 { margin: 0 0 8px; font-size: 13px; letter-spacing: 0.06em; text-transform: u
   line-height: 1.45;
   font-family: "Segoe UI", sans-serif;
 }
+.loot-grid { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.loot-grid div { background: #101522; border: 1px solid var(--line); border-radius: 10px; padding: 7px 10px; }
+.loot-grid span { color: var(--muted); margin-right: 8px; font-size: 12px; }
 .binds { display: flex; gap: 8px; }
 .bind {
   flex: 1;
@@ -79,6 +82,8 @@ button {
 .off { background: #8a3030; }
 .save { background: #3d4a2f; margin-top: 12px; }
 .save:disabled { opacity: 0.6; }
+.delete { background: #6f3030; margin-top: 12px; }
+button:disabled { opacity: 0.5; cursor: not-allowed; background: #383d49; margin-top: 10px; }
 .check, .field { display: block; margin-top: 10px; color: var(--muted); font-size: 13px; }
 input, select {
   width: 100%;
@@ -91,6 +96,10 @@ input, select {
 }
 .check input { width: auto; margin-right: 8px; }
 .row { display: flex; gap: 8px; }
+.player-draft .warn { margin: 0 0 10px; }
+.save:disabled { opacity: 0.45; cursor: not-allowed; }
+.check-row { display: flex; flex-wrap: wrap; gap: 12px; }
+.summary { margin-top: 12px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: #101522; font-size: 13px; }
 .world { margin-top: 14px; padding-top: 12px; border-top: 1px solid #31384c; }
 .world:first-of-type { margin-top: 8px; }
 .world-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
@@ -131,4 +140,5 @@ input, select {
 .warn { color: var(--warn); }
 @media (max-width: 640px) {
   .grid.status, .binds { grid-template-columns: 1fr; display: grid; }
+  .form-grid { grid-template-columns: 1fr 1fr; }
 }

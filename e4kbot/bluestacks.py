@@ -185,10 +185,21 @@ class AdbClient:
             )
             if proc.returncode == 0:
                 return
+            err = (proc.stderr or "").strip()
+            if "closed" in err.lower() or "device not found" in err.lower():
+                self.connect()
+                if self.serial:
+                    proc = self._run(
+                        ["-s", self.serial, "shell", "input", "keyevent", str(int(keycode))],
+                        timeout=8,
+                    )
+                    if proc.returncode == 0:
+                        return
+                    err = (proc.stderr or "").strip()
             logger.warning(
                 "ADB keyevent {} не прошёл ({}) — Escape в окно не шлю (это выход из игры)",
                 keycode,
-                (proc.stderr or "").strip(),
+                err,
             )
             return
         logger.warning("Нет ADB serial — Escape в окно не шлю (это выход из игры)")
@@ -270,6 +281,7 @@ class AdbClient:
 
 def press_escape_on_game(config: dict[str, Any]) -> None:
     """VK_ESCAPE to the BlueStacks HWND — closes mid-map offer / hire overlays."""
+    import win32api
     import win32con
     import win32gui
 
@@ -285,14 +297,14 @@ def press_escape_on_game(config: dict[str, Any]) -> None:
         pass
     time.sleep(0.05)
     try:
-        win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, win32con.VK_ESCAPE, 0)
-        win32gui.PostMessage(hwnd, win32con.WM_KEYUP, win32con.VK_ESCAPE, 0)
-    except Exception:
-        try:
-            ctypes.windll.user32.keybd_event(0x1B, 0, 0, 0)
-            ctypes.windll.user32.keybd_event(0x1B, 0, 2, 0)
-        except Exception as exc:
-            logger.debug("Escape в окно BlueStacks не отправился: {}", exc)
+        # BlueStacks acknowledges posted WM_KEYDOWN messages but ignores them.
+        # A foreground keyboard event is required for the Android overlay to
+        # receive Back/Escape. Callers only invoke this after confirming an
+        # overlay, never on a clean map.
+        win32api.keybd_event(win32con.VK_ESCAPE, 0, 0, 0)
+        win32api.keybd_event(win32con.VK_ESCAPE, 0, win32con.KEYEVENTF_KEYUP, 0)
+    except Exception as exc:
+        logger.debug("Escape в окно BlueStacks не отправился: {}", exc)
 
 
 def _ensure_dpi_aware() -> None:
@@ -461,7 +473,7 @@ def _mouse_down_up() -> None:
         packet.type = 0
         packet.mi = MOUSEINPUT(0, 0, 0, flags, 0, ctypes.pointer(extra))
         ctypes.windll.user32.SendInput(1, ctypes.byref(packet), ctypes.sizeof(INPUT))
-        time.sleep(0.04)
+        time.sleep(0.015)
 
 
 def click_game_window(
@@ -471,18 +483,35 @@ def click_game_window(
     source_size: tuple[int, int],
 ) -> None:
     """Click an Android-space point through the visible BlueStacks window."""
+    global _SHOT_CACHE, _CAPTURE_HWND, _CAPTURE_HWND_AT
+    _SHOT_CACHE = None
     import win32api
     import win32con
     import win32gui
 
-    hints = (config.get("bluestacks") or {}).get("window_title_hints")
-    window = find_game_window(list(hints) if hints else None)
-    if not window:
-        raise RuntimeError("Окно BlueStacks не найдено для клика")
-    hwnd = _render_window(window[0])
+    now = time.time()
+    hwnd = _CAPTURE_HWND if now - _CAPTURE_HWND_AT < 3.0 and _CAPTURE_HWND else 0
+    title = "BlueStacks"
+    parent = hwnd
+    if not hwnd:
+        hints = (config.get("bluestacks") or {}).get("window_title_hints")
+        window = find_game_window(list(hints) if hints else None)
+        if not window:
+            raise RuntimeError("Окно BlueStacks не найдено для клика")
+        parent, title = window
+        hwnd = _render_window(parent)
+        _CAPTURE_HWND = hwnd
+        _CAPTURE_HWND_AT = now
+    else:
+        try:
+            parent = win32gui.GetAncestor(hwnd, 2) or hwnd
+        except Exception:
+            parent = hwnd
     try:
-        win32gui.ShowWindow(window[0], win32con.SW_RESTORE)
-        win32gui.SetForegroundWindow(window[0])
+        fg = win32gui.GetForegroundWindow()
+        if fg != parent and fg != hwnd:
+            win32gui.ShowWindow(parent, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(parent)
     except Exception:
         pass
     CONTROL.check()
@@ -490,7 +519,7 @@ def click_game_window(
     logger.debug(
         "BlueStacks click '{}' hwnd={} screenshot=({}, {}) source={} -> screen=({}, {}), "
         "playfield={} origin={} dpi={}",
-        window[1],
+        title,
         hwnd,
         x,
         y,
@@ -515,14 +544,14 @@ def click_game_window(
         )
     CONTROL.check()
     win32api.SetCursorPos((px, py))
-    time.sleep(0.05)
+    time.sleep(0.02)
     CONTROL.check()
     _mouse_down_up()
     try:
         client_x, client_y = win32gui.ScreenToClient(hwnd, (px, py))
         lparam = win32api.MAKELONG(int(client_x), int(client_y))
         win32gui.PostMessage(hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lparam)
-        time.sleep(0.03)
+        time.sleep(0.01)
         win32gui.PostMessage(hwnd, win32con.WM_LBUTTONUP, 0, lparam)
     except Exception:
         pass
@@ -696,7 +725,37 @@ def find_game_window(hints: list[str] | None = None) -> tuple[int, str] | None:
     return hwnd, title
 
 
+_CAPTURE_HWND: int = 0
+_CAPTURE_HWND_AT: float = 0.0
+_SHOT_CACHE: tuple[float, Image.Image] | None = None
+_MSS = None
+
+
 def screenshot_window(hwnd: int) -> Image.Image | None:
+    global _MSS
+    try:
+        import win32gui
+
+        left, top, right, bottom = win32gui.GetClientRect(hwnd)
+        width, height = right - left, bottom - top
+        if width < 50 or height < 50:
+            return None
+        sl, st = win32gui.ClientToScreen(hwnd, (left, top))
+        import mss
+
+        if _MSS is None:
+            _MSS = mss.mss()
+        shot = _MSS.grab(
+            {
+                "left": int(sl),
+                "top": int(st),
+                "width": int(width),
+                "height": int(height),
+            }
+        )
+        return Image.frombytes("RGB", shot.size, shot.rgb)
+    except Exception:
+        pass
     try:
         import win32gui
         import win32ui
@@ -706,7 +765,6 @@ def screenshot_window(hwnd: int) -> Image.Image | None:
         width, height = right - left, bottom - top
         if width < 50 or height < 50:
             return None
-        left, top = win32gui.ClientToScreen(hwnd, (left, top))
         hwnd_dc = win32gui.GetWindowDC(hwnd)
         mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
         save_dc = mfc_dc.CreateCompatibleDC()
@@ -731,39 +789,38 @@ def screenshot_window(hwnd: int) -> Image.Image | None:
         win32gui.ReleaseDC(hwnd, hwnd_dc)
         return image.convert("RGB")
     except Exception:
-        try:
-            import mss
-            import win32gui
-
-            rect = win32gui.GetWindowRect(hwnd)
-            with mss.mss() as sct:
-                shot = sct.grab(
-                    {
-                        "left": rect[0],
-                        "top": rect[1],
-                        "width": max(1, rect[2] - rect[0]),
-                        "height": max(1, rect[3] - rect[1]),
-                    }
-                )
-                return Image.frombytes("RGB", shot.size, shot.rgb)
-        except Exception as exc:
-            logger.debug(f"window screenshot failed: {exc}")
-            return None
+        return None
 
 
 def capture_game_image(config: dict[str, Any], adb: AdbClient | None = None) -> Image.Image | None:
+    global _CAPTURE_HWND, _CAPTURE_HWND_AT, _SHOT_CACHE
+    now = time.time()
+    if _SHOT_CACHE is not None and now - _SHOT_CACHE[0] < 0.10:
+        return _SHOT_CACHE[1]
+    hwnd = _CAPTURE_HWND if now - _CAPTURE_HWND_AT < 3.0 and _CAPTURE_HWND else 0
+    if not hwnd:
+        hints = (config.get("bluestacks") or {}).get("window_title_hints") or [
+            "BlueStacks",
+            "HD-Player",
+        ]
+        window = find_game_window(list(hints))
+        if window:
+            hwnd = _render_window(window[0])
+            _CAPTURE_HWND = hwnd
+            _CAPTURE_HWND_AT = now
+    if hwnd:
+        image = screenshot_window(hwnd)
+        if image is not None:
+            if adb is not None:
+                adb.display_size = image.size
+            _SHOT_CACHE = (time.time(), image)
+            return image
     if adb:
         image = adb.screencap()
         if image is not None:
+            _SHOT_CACHE = (time.time(), image)
             return image
-    hints = (config.get("bluestacks") or {}).get("window_title_hints") or [
-        "BlueStacks",
-        "HD-Player",
-    ]
-    window = find_game_window(list(hints))
-    if not window:
-        return None
-    return screenshot_window(_render_window(window[0]))
+    return None
 
 
 def diagnose_targeting(config: dict[str, Any], adb: AdbClient | None = None) -> dict[str, Any]:

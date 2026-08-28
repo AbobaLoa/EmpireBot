@@ -98,6 +98,16 @@ class VisionTests(unittest.TestCase):
         self.assertGreater(action[0], 0.7)
         self.assertLess(action[0], 0.82)
 
+    def test_mid_offer_close_wins_over_subscription_footer_text(self) -> None:
+        image = Image.new("RGB", (900, 1600), (70, 70, 70))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((720, 900, 750, 940), fill=(205, 35, 20))
+        draw.rectangle((751, 900, 790, 940), fill=(205, 35, 20))
+        with patch("e4kbot.vision.ocr_text_ui", return_value="Подписка"):
+            point = special_offers_close_point(image)
+        self.assertGreater(point[0], 0.84)
+        self.assertGreater(point[1], 0.54)
+
     def test_reads_authoritative_travel_duration_fixture(self) -> None:
         fixture = ROBBER_TEMPLATE.parent / "travel_duration_fixture.png"
         self.assertEqual(ocr_text(Image.open(fixture), psm=6), "00:03:08")
@@ -694,9 +704,13 @@ class HuntTests(unittest.TestCase):
         engine._image = Mock(return_value=green)
         engine._plan_or_picker_open = Mock(return_value=False)
         engine._collect_hunt_batch = Mock(return_value=[])
+        engine._ensure_world = Mock(return_value="ok")
+        engine._world_recenter_tries = 3
+        engine._handle_world_no_targets = Mock(return_value="world_skip_empty")
         result = engine.on_screen_attack("baron")
-        self.assertEqual(result, "no_targets")
+        self.assertEqual(result, "world_skip_empty")
         engine._collect_hunt_batch.assert_called_once_with("baron")
+        engine._handle_world_no_targets.assert_called_once_with("baron")
 
     def test_on_screen_attack_goes_napadenie_feather_then_send(self) -> None:
         engine = BlueStacksEngine.__new__(BlueStacksEngine)
@@ -961,6 +975,45 @@ class HuntTests(unittest.TestCase):
         engine._tap_norm_exact.assert_not_called()
         engine._select_best_picker_card.assert_not_called()
 
+    def test_partial_nine_of_fourteen_fills_second_slot_additively(self) -> None:
+        dummy = Image.new("RGB", (900, 1600), (80, 50, 30))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.layout = {"buttons": {"unit_slot_second": [0.21, 0.70]}}
+        engine._last_picker_fill = (9, 14)
+        engine._open_unit_picker = Mock(return_value=(dummy, ""))
+
+        def fill_second() -> bool:
+            engine._last_picker_fill = (5, 5)
+            return True
+
+        engine._fill_picker_to_capacity = Mock(side_effect=fill_second)
+        engine.diagnose_unit_picker_confirm = Mock(return_value=(True, "confirmed", dummy))
+        engine._read_ratio_from_image = Mock(return_value=(14, 14))
+        ok, reason, _ = engine._fill_residual_unit_slots(dummy, (9, 14))
+        self.assertTrue(ok)
+        self.assertEqual(reason, "")
+        engine._open_unit_picker.assert_called_once_with("unit_slot_second")
+        self.assertEqual(engine._last_picker_fill, (5, 5))
+
+    def test_residual_slot_oscillation_guard_breaks_without_replacing(self) -> None:
+        dummy = Image.new("RGB", (900, 1600), (80, 50, 30))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.layout = {"buttons": {"unit_slot_second": [0.21, 0.70]}}
+        engine._last_picker_fill = (9, 14)
+        engine._open_unit_picker = Mock(return_value=(dummy, ""))
+
+        def unchanged_fill() -> bool:
+            engine._last_picker_fill = (5, 5)
+            return True
+
+        engine._fill_picker_to_capacity = Mock(side_effect=unchanged_fill)
+        engine.diagnose_unit_picker_confirm = Mock(return_value=(True, "confirmed", dummy))
+        engine._read_ratio_from_image = Mock(return_value=(9, 14))
+        ok, reason, _ = engine._fill_residual_unit_slots(dummy, (9, 14))
+        self.assertFalse(ok)
+        self.assertEqual(reason, "unit_picker_oscillation")
+        self.assertEqual(engine._open_unit_picker.call_count, 1)
+
 
 class StateTests(unittest.TestCase):
     def test_failed_movement_transition_is_never_registered(self) -> None:
@@ -1093,6 +1146,19 @@ class QuitDialogAndHomeHudTests(unittest.TestCase):
         self.assertFalse(is_special_offers_screen(image))
         self.assertIsNone(popup_action(image))
 
+    def test_confirmed_formation_close_is_allowed_near_ruby_hud(self) -> None:
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.layout = {"buttons": {"formation_close": [0.94, 0.035]}}
+        engine._image = Mock(return_value=Image.new("RGB", (900, 1600)))
+        engine._tap_forced = Mock()
+        with (
+            patch("e4kbot.client.is_formation_screen", return_value=True),
+            patch("e4kbot.client.find_red_cross_force", return_value=(0.94, 0.035)),
+            patch("e4kbot.client.CONTROL.sleep"),
+        ):
+            self.assertTrue(engine.close_formation_plan())
+        engine._tap_forced.assert_called_once_with(0.94, 0.035)
+
     def test_quit_dialog_clicks_net_never_da(self) -> None:
         image = _quit_dialog_image()
         self.assertTrue(is_quit_game_dialog(image))
@@ -1121,6 +1187,7 @@ class QuitDialogAndHomeHudTests(unittest.TestCase):
     def test_ruby_plus_hud_is_never_tapped_on_map(self) -> None:
         self.assertTrue(is_ruby_plus_hud_point(0.93, 0.04))
         self.assertFalse(is_ruby_plus_hud_point(0.52, 0.028))
+        self.assertFalse(is_ruby_plus_hud_point(0.86, 0.055))
         green = Image.new("RGB", (900, 1600), (104, 151, 57))
         engine = BlueStacksEngine.__new__(BlueStacksEngine)
         engine.adb = Mock()
@@ -1140,30 +1207,163 @@ class QuitDialogAndHomeHudTests(unittest.TestCase):
         self.assertGreater(point[1], 0.04)
         self.assertLess(point[1], 0.22)
 
-    def test_return_home_clicks_name_then_left_button(self) -> None:
+    def test_return_home_never_clicks_current_hud_and_uses_navigation(self) -> None:
         map_shot = Image.new("RGB", (900, 1600), (104, 151, 57))
-        draw = ImageDraw.Draw(map_shot)
-        draw.rectangle((300, 4, 620, 70), fill=(230, 210, 170))
-        banner = _castle_home_banner_image()
         engine = BlueStacksEngine.__new__(BlueStacksEngine)
         engine.adb = Mock()
-        engine._size = Mock(return_value=(900, 1600))
-        engine._image = Mock(side_effect=[map_shot, banner, banner, banner])
+        engine.config = {"current_target_kind": "baron"}
+        engine._switched_world_id = "great_empire"
+        engine.store = Mock()
+        engine.store.live.post_attack_home_pending = True
+        engine._navigation_home_for_world = Mock(return_value=True)
+        engine._finish_verified_home = Mock(return_value=True)
+        engine._image = Mock(return_value=map_shot)
         engine._plan_or_picker_open = Mock(return_value=False)
-        engine._dismiss_quit_game_if_open = Mock(return_value=False)
-        engine._await_world_map = Mock(return_value=map_shot)
         with patch("e4kbot.client.is_travel_dialog", return_value=False):
             with patch("e4kbot.client.is_formation_screen", return_value=False):
-                with patch("e4kbot.client.CONTROL") as control:
-                    control.sleep = Mock()
-                    with patch("e4kbot.client.time.sleep"):
-                        ok = engine._return_home_via_castle_hud()
+                ok = engine._return_home_via_castle_hud()
         self.assertTrue(ok)
-        xs = [call.args[0] / 900 for call in engine.adb.tap.call_args_list]
-        self.assertGreaterEqual(len(xs), 2)
-        self.assertLess(xs[0], 0.78)
-        self.assertLess(xs[-1], 0.50)
-        self.assertFalse(any(x >= 0.78 for x in xs))
+        engine.adb.tap.assert_not_called()
+        engine._navigation_home_for_world.assert_called_once_with("great_empire")
+        engine._finish_verified_home.assert_called_once()
+
+    def test_pending_home_is_retried_before_next_hunt(self) -> None:
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.store = Mock()
+        engine.store.live.post_attack_home_pending = True
+        engine._return_home_via_castle_hud = Mock(return_value=True)
+        self.assertTrue(engine._ensure_post_attack_home())
+        engine._return_home_via_castle_hud.assert_called_once()
+
+    def test_account_name_never_gates_coordinate_diagnostic(self) -> None:
+        expected = {"name": "Замок AccountA", "coords": [605, 736]}
+        observed = {"name": "Замок AccountB", "coords": [605, 736]}
+        self.assertTrue(BlueStacksEngine._castle_identity_matches(expected, observed))
+
+    def test_coordinates_are_diagnostic_only(self) -> None:
+        expected = {"name": "Замок AccountA", "coords": [605, 736]}
+        observed = {"name": "Замок AccountA", "coords": [603, 738]}
+        self.assertFalse(BlueStacksEngine._castle_identity_matches(expected, observed))
+
+    def test_unreadable_hud_falls_back_to_navigation_without_hud_click(self) -> None:
+        dummy = Image.new("RGB", (900, 1600), (104, 151, 57))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.config = {"current_target_kind": "baron"}
+        engine._switched_world_id = "great_empire"
+        engine.adb = Mock()
+        engine._image = Mock(return_value=dummy)
+        engine._read_castle_identity = Mock(return_value={"name": "", "coords": None})
+        engine._navigation_home_for_world = Mock(return_value=True)
+        engine._finish_verified_home = Mock(return_value=True)
+        engine._tap_norm_exact = Mock()
+        self.assertTrue(engine._return_home_via_castle_hud())
+        engine._navigation_home_for_world.assert_called_once_with("great_empire")
+        engine._tap_norm_exact.assert_not_called()
+
+    def test_current_hud_outpost_is_irrelevant_and_never_clicked(self) -> None:
+        dummy = Image.new("RGB", (900, 1600), (104, 151, 57))
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.config = {"current_target_kind": "baron"}
+        engine._switched_world_id = "great_empire"
+        engine.adb = Mock()
+        engine._image = Mock(return_value=dummy)
+        engine._read_castle_identity = Mock(
+            return_value={"name": "Любое имя", "coords": [603, 738]}
+        )
+        engine._dismiss_quit_game_if_open = Mock(return_value=False)
+        engine._plan_or_picker_open = Mock(return_value=False)
+        engine._navigation_home_for_world = Mock(return_value=True)
+        engine._finish_verified_home = Mock(return_value=True)
+        engine._tap_norm_exact = Mock()
+        engine._wait_for = Mock(return_value=dummy)
+        with patch("e4kbot.client.is_castle_home_banner", return_value=False):
+            with patch("e4kbot.client.is_travel_dialog", return_value=False):
+                with patch("e4kbot.client.is_formation_screen", return_value=False):
+                    with patch("e4kbot.client.find_castle_name_hud_point", return_value=(0.50, 0.03)):
+                        with patch("e4kbot.client.find_home_sextant_button", return_value=None):
+                            self.assertTrue(engine._return_home_via_castle_hud())
+        engine._tap_norm_exact.assert_not_called()
+        engine._navigation_home_for_world.assert_called_once_with("great_empire")
+
+
+class PickerAdjustmentDebounceTests(unittest.TestCase):
+    def _engine(self, ratio: tuple[int, int]) -> BlueStacksEngine:
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine.config = {"vision": {}}
+        engine._image = Mock(return_value=Image.new("RGB", (540, 960)))
+        engine._read_ratio_from_image = Mock(return_value=ratio)
+        engine._tap_norm = Mock()
+        engine._last_picker_fill = None
+        return engine
+
+    def test_full_picker_never_clicks_adjustment(self) -> None:
+        engine = self._engine((10, 10))
+        self.assertTrue(engine._dump_picker_max())
+        engine._tap_norm.assert_not_called()
+
+    def test_stale_picker_frame_is_debounced(self) -> None:
+        engine = self._engine((9, 10))
+        engine._picker_max_adjusted = True
+        self.assertFalse(engine._dump_picker_max())
+        engine._tap_norm.assert_not_called()
+
+
+class PackHudAndLeftoverTravelTests(unittest.TestCase):
+    def _engine(self) -> BlueStacksEngine:
+        engine = BlueStacksEngine.__new__(BlueStacksEngine)
+        engine._pack_hud_observed = None
+        engine._pack_last_list_tap_at = 0.0
+        engine._selected_target_coords = None
+        engine.config = {"baron_attacks": {"kingdom": 1}}
+        return engine
+
+    def test_pack_hud_rejects_green_empire_for_glacier(self) -> None:
+        engine = self._engine()
+        grassy = Image.new("RGB", (900, 1600), (104, 151, 57))
+        self.assertTrue(engine._pack_hud_matches_world(grassy, "great_empire"))
+        self.assertFalse(engine._pack_hud_matches_world(grassy, "everwinter"))
+
+    def test_pack_hud_accepts_snow_for_glacier_not_empire(self) -> None:
+        engine = self._engine()
+        snow = Image.new("RGB", (900, 1600), (230, 235, 240))
+        self.assertTrue(engine._pack_hud_matches_world(snow, "everwinter"))
+        self.assertFalse(engine._pack_hud_matches_world(snow, "great_empire"))
+
+    def test_world_attack_button_allows_lower_right_plaque(self) -> None:
+        engine = self._engine()
+        self.assertTrue(engine._world_attack_button_safe((0.763, 0.683)))
+        self.assertTrue(engine._world_attack_button_safe((0.771, 0.600)))
+        self.assertTrue(engine._world_attack_button_safe((0.579, 0.492)))
+        self.assertFalse(engine._world_attack_button_safe((0.90, 0.04)))
+        self.assertFalse(engine._world_attack_button_safe((0.20, 0.50)))
+
+    def test_pack_confirms_leftover_travel_instead_of_hunting(self) -> None:
+        engine = self._engine()
+        engine._qualifying_cycles = 0
+        engine._burst_send_times = []
+        engine._switched_world_id = "everwinter"
+        engine._pack_finished = False
+        engine._image = Mock(return_value=Image.new("RGB", (900, 1600)))
+        engine._dismiss_empty_wave_warning = Mock(return_value=False)
+        engine._picker_overlay_open = Mock(return_value=False)
+        engine._block_screen_target = Mock()
+        engine._begin_world_pack = Mock()
+        engine._fast_world_home = Mock()
+
+        def confirm(kind: str) -> str:
+            engine._pack_finished = True
+            return kind
+
+        engine._pack_confirm_open_travel = Mock(side_effect=confirm)
+        with (
+            patch("e4kbot.client.is_travel_dialog", return_value=True),
+            patch("e4kbot.client.is_formation_screen", return_value=False),
+            patch("e4kbot.client.CONTROL.check"),
+        ):
+            result = engine._world_speed_pack("barbarian_tower")
+        self.assertEqual(result, "barbarian_tower")
+        engine._pack_confirm_open_travel.assert_called_once()
+        engine._block_screen_target.assert_called_once()
 
 
 if __name__ == "__main__":

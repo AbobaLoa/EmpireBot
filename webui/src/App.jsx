@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { getSettings, getState, saveSettings, setControl } from "./api.js";
+import {
+  deletePlayerAttackDraft,
+  getPlayerAttackDraft,
+  getSettings,
+  getState,
+  savePlayerAttackDraft,
+  saveSettings,
+  setControl,
+} from "./api.js";
 
 function fmt(sec) {
   sec = Math.max(0, Number(sec) || 0);
@@ -15,6 +23,27 @@ function fmt(sec) {
 function shotName(path) {
   if (!path) return "";
   return String(path).split(/[\\/]/).pop();
+}
+
+const STOP_CONDITIONS = [
+  { id: "no_commanders", label: "Нет военачальников" },
+  { id: "insufficient_troops", label: "Нехватка войск" },
+  { id: "target_unavailable", label: "Цель недоступна" },
+];
+
+function campaignProgress(state) {
+  const row = state?.attacks_world;
+  if (row && (row.quota || row.sent)) {
+    return `${row.sent || 0}/${row.quota || 0} · осталось ${row.remaining ?? 0}`;
+  }
+  return String(state?.session_attacks ?? 0);
+}
+
+function timingLine(state) {
+  if (state?.timing_summary) return state.timing_summary;
+  const cycle = state?.action_timings?.attack_cycle;
+  if (!cycle) return "—";
+  return `последний ${cycle.last_seconds}с · средний ${cycle.average_seconds}с · n=${cycle.count}`;
 }
 
 function Toggle({ checked, onChange, disabled, label }) {
@@ -43,6 +72,22 @@ export default function App() {
   const [maxConcurrent, setMaxConcurrent] = useState(30);
   const [delayMin, setDelayMin] = useState(8);
   const [delayMax, setDelayMax] = useState(10);
+  const [playerDraft, setPlayerDraft] = useState({
+    world: "great_empire",
+    x: 500,
+    y: 500,
+    attacks: 1,
+    commander: "auto",
+    formation: "default",
+    waves: 1,
+    flank: "center",
+    tools: "none",
+    delay_seconds: 10,
+    schedule: "",
+    stop_conditions: ["no_commanders", "insufficient_troops"],
+  });
+  const [draftStatus, setDraftStatus] = useState("");
+  const [draftConfirmed, setDraftConfirmed] = useState(false);
 
   const worlds = settings?.worlds || [];
   const flags = useMemo(() => {
@@ -78,6 +123,12 @@ export default function App() {
         setDelayMax(data.attack_delay_max || 10);
       })
       .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    getPlayerAttackDraft().then((data) => {
+      if (data.draft) setPlayerDraft(data.draft);
+    }).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -182,6 +233,14 @@ export default function App() {
             {state?.dry_run ? " · DRY-RUN" : ""}
           </strong>
         </article>
+        <article><span>Текущий мир</span><strong>{state?.current_world || "—"}</strong></article>
+        <article><span>Фаза</span><strong>{state?.phase || "—"}</strong></article>
+        <article><span>Следующее действие</span><strong>{state?.next_action || "—"}</strong></article>
+        <article><span>Пауза / включено</span><strong>{state?.paused ? "пауза" : "включено"} · {state?.enabled === false ? "выкл" : "вкл"}</strong></article>
+        <article><span>Атаки / мир</span><strong>{campaignProgress(state)}</strong></article>
+        <article><span>Атак за сессию</span><strong>{state?.session_attacks ?? 0}</strong></article>
+        <article><span>Тайминги цикла</span><strong>{timingLine(state)}</strong></article>
+        <article><span>Ошибка / восстановление</span><strong>{state?.last_error || "нет"}</strong></article>
       </section>
 
       <div className="coords">{state?.last_coords || "—"}</div>
@@ -192,6 +251,23 @@ export default function App() {
           <pre className="report">{state.attack_report}</pre>
         </section>
       ) : null}
+      <section className="card">
+        <h2>Сводный отчёт фермы</h2>
+        <div className="grid status">
+          <article><span>Обработано отчётов</span><strong>{state?.farm_summary?.reports ?? state?.reports_processed ?? 0}</strong></article>
+          <article><span>Свои потери</span><strong>{state?.farm_summary?.own_losses ?? 0}</strong></article>
+        </div>
+        <div className="loot-grid">
+          {Object.entries(state?.farm_summary?.resources || {}).map(([name, value]) => (
+            <div key={name}><span>{name}</span><strong>{value}</strong></div>
+          ))}
+        </div>
+        {Object.entries(state?.farm_summary?.by_world || {}).map(([world, row]) => (
+          <div className="march" key={world}>
+            <b>{world}</b> · отчётов {row.reports} · потери {row.own_losses}
+          </div>
+        ))}
+      </section>
 
       <section className="binds">
         <div className="bind">
@@ -285,6 +361,153 @@ export default function App() {
             </div>
           );
         })}
+      </section>
+
+      <section className="card player-draft">
+        <h2>Атака игрока <span className="badge stub">В разработке</span></h2>
+        <p className="warn">
+          Атаки на игроков не реализованы. Кнопка запуска отключена. Можно только сохранить черновик через FastAPI.
+        </p>
+        <div className="form-grid">
+          <label className="field">
+            Мир
+            <select value={playerDraft.world} onChange={(e) => setPlayerDraft({ ...playerDraft, world: e.target.value })}>
+              <option value="great_empire">Великая империя</option>
+              <option value="everwinter">Вечнохолодный ледник</option>
+              <option value="burning_sands">Пылающие пески</option>
+              <option value="fire_peaks">Огненные вершины</option>
+              <option value="storm_islands">Острова ураганов</option>
+            </select>
+          </label>
+          <label className="field">
+            X
+            <input type="number" min="0" max="999" value={playerDraft.x} onChange={(e) => setPlayerDraft({ ...playerDraft, x: e.target.value })} />
+          </label>
+          <label className="field">
+            Y
+            <input type="number" min="0" max="999" value={playerDraft.y} onChange={(e) => setPlayerDraft({ ...playerDraft, y: e.target.value })} />
+          </label>
+          <label className="field">
+            Количество атак
+            <input type="number" min="1" max="20" value={playerDraft.attacks} onChange={(e) => setPlayerDraft({ ...playerDraft, attacks: e.target.value })} />
+          </label>
+          <label className="field">
+            Военачальник
+            <select
+              value={playerDraft.commander === "auto" || playerDraft.commander === "" || playerDraft.commander == null ? "auto" : "number"}
+              onChange={(e) => setPlayerDraft({ ...playerDraft, commander: e.target.value === "auto" ? "auto" : 1 })}
+            >
+              <option value="auto">Auto</option>
+              <option value="number">Номер</option>
+            </select>
+          </label>
+          {playerDraft.commander !== "auto" && playerDraft.commander !== "" && playerDraft.commander != null ? (
+            <label className="field">
+              Номер военачальника
+              <input
+                type="number"
+                min="1"
+                max="99"
+                value={playerDraft.commander}
+                onChange={(e) => setPlayerDraft({ ...playerDraft, commander: e.target.value })}
+              />
+            </label>
+          ) : null}
+          <label className="field">
+            Формация / пресет
+            <select value={playerDraft.formation} onChange={(e) => setPlayerDraft({ ...playerDraft, formation: e.target.value })}>
+              <option value="default">По умолчанию</option>
+              <option value="saved_1">Сохранённая 1</option>
+            </select>
+          </label>
+          <label className="field">
+            Волны
+            <input type="number" min="1" max="6" value={playerDraft.waves} onChange={(e) => setPlayerDraft({ ...playerDraft, waves: e.target.value })} />
+          </label>
+          <label className="field">
+            Фланги
+            <select value={playerDraft.flank} onChange={(e) => setPlayerDraft({ ...playerDraft, flank: e.target.value })}>
+              <option value="left">Левый</option>
+              <option value="center">Центр</option>
+              <option value="right">Правый</option>
+              <option value="all">Все</option>
+            </select>
+          </label>
+          <label className="field">
+            Инструменты
+            <select value={playerDraft.tools} onChange={(e) => setPlayerDraft({ ...playerDraft, tools: e.target.value })}>
+              <option value="none">Без инструментов</option>
+              <option value="preset_1">Пресет 1</option>
+            </select>
+          </label>
+          <label className="field">
+            Задержка, сек
+            <input type="number" min="0" max="86400" value={playerDraft.delay_seconds} onChange={(e) => setPlayerDraft({ ...playerDraft, delay_seconds: e.target.value })} />
+          </label>
+          <label className="field">
+            Расписание
+            <input value={playerDraft.schedule} placeholder="не задано" onChange={(e) => setPlayerDraft({ ...playerDraft, schedule: e.target.value })} />
+          </label>
+        </div>
+        <div className="check-row">
+          {STOP_CONDITIONS.map((item) => (
+            <label className="check" key={item.id}>
+              <input
+                type="checkbox"
+                checked={(playerDraft.stop_conditions || []).includes(item.id)}
+                onChange={(e) =>
+                  setPlayerDraft({
+                    ...playerDraft,
+                    stop_conditions: e.target.checked
+                      ? [...new Set([...(playerDraft.stop_conditions || []), item.id])]
+                      : (playerDraft.stop_conditions || []).filter((id) => id !== item.id),
+                  })
+                }
+              />
+              {item.label}
+            </label>
+          ))}
+        </div>
+        <div className="summary">
+          Подтверждение черновика: {playerDraft.world} · ({playerDraft.x}, {playerDraft.y}) · атак {playerDraft.attacks} · командир{" "}
+          {playerDraft.commander || "auto"} · волн {playerDraft.waves} · {playerDraft.flank}
+        </div>
+        <label className="check">
+          <input type="checkbox" checked={draftConfirmed} onChange={(e) => setDraftConfirmed(e.target.checked)} />
+          Подтверждаю: это только черновик, атаки на игроков не запускаются
+        </label>
+        <div className="row">
+          <button
+            className="save"
+            type="button"
+            disabled={!draftConfirmed}
+            onClick={async () => {
+              try {
+                const result = await savePlayerAttackDraft(playerDraft);
+                setPlayerDraft(result.draft);
+                setDraftStatus("Черновик сохранён. Запуск атак на игроков не выполнялся.");
+              } catch {
+                setDraftStatus("Проверь поля черновика.");
+              }
+            }}
+          >
+            Сохранить черновик
+          </button>
+          <button
+            className="delete"
+            type="button"
+            onClick={async () => {
+              await deletePlayerAttackDraft();
+              setDraftStatus("Черновик удалён.");
+            }}
+          >
+            Удалить
+          </button>
+        </div>
+        <button type="button" disabled>
+          Запуск атак на игроков пока не реализован
+        </button>
+        {draftStatus ? <p className="ok">{draftStatus}</p> : null}
       </section>
 
       <section className="card">

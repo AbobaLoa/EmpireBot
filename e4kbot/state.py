@@ -77,6 +77,11 @@ class LiveState:
     unopened_worlds: list[str] = field(default_factory=list)
     attack_report: str = ""
     current_world: str = ""
+    reports_processed: int = 0
+    farm_summary: dict[str, Any] = field(default_factory=dict)
+    action_timings: dict[str, dict[str, float]] = field(default_factory=dict)
+    post_attack_home_pending: bool = False
+    central_castles: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         from e4kbot.control import CONTROL, hotkey_label
@@ -108,6 +113,11 @@ class LiveState:
             "unopened_worlds": list(self.unopened_worlds),
             "attack_report": self.attack_report,
             "current_world": self.current_world,
+            "reports_processed": int(self.reports_processed),
+            "farm_summary": dict(self.farm_summary),
+            "action_timings": dict(self.action_timings),
+            "post_attack_home_pending": bool(self.post_attack_home_pending),
+            "central_castles": dict(self.central_castles),
             "hotkey": CONTROL.hotkey,
             "hotkey_label": hotkey_label(CONTROL.hotkey),
             "start_hotkey": CONTROL.start_hotkey,
@@ -205,6 +215,11 @@ class StateStore:
             ]
             self.live.attack_report = str(raw.get("attack_report") or "")
             self.live.current_world = str(raw.get("current_world") or "")
+            self.live.reports_processed = int(raw.get("reports_processed") or 0)
+            self.live.farm_summary = dict(raw.get("farm_summary") or {})
+            self.live.action_timings = dict(raw.get("action_timings") or {})
+            self.live.post_attack_home_pending = bool(raw.get("post_attack_home_pending"))
+            self.live.central_castles = dict(raw.get("central_castles") or {})
             self.live.history = list(raw.get("history") or [])
             march_fields = set(March.__dataclass_fields__)
             self.live.marches = [
@@ -301,6 +316,7 @@ class StateStore:
         target_key = self.target_key(kind, kingdom, x, y)
         self.live.cooldowns[target_key] = march.cooldown_until
         self.live.last_attack_at = now
+        self.live.post_attack_home_pending = True
         self.live.last_coords = f"K{kingdom} ({x}, {y})"
         if screenshot:
             self.live.last_screenshot = screenshot
@@ -491,6 +507,17 @@ class StateStore:
     def record_loot(self, gold: int = 0, rubies: int = 0) -> None:
         self.live.session_gold += max(0, int(gold or 0))
         self.live.session_rubies += max(0, int(rubies or 0))
+
+    def record_timing(self, action: str, seconds: float) -> None:
+        row = dict(self.live.action_timings.get(action) or {})
+        count = int(row.get("count") or 0) + 1
+        total = float(row.get("total_seconds") or 0.0) + max(0.0, float(seconds))
+        self.live.action_timings[action] = {
+            "count": count,
+            "total_seconds": round(total, 3),
+            "average_seconds": round(total / count, 3),
+            "last_seconds": round(max(0.0, float(seconds)), 3),
+        }
 
     def session_summary(self) -> dict[str, int]:
         return {

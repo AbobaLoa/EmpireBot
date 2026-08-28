@@ -133,8 +133,8 @@ MODES: tuple[ModeSpec, ...] = (
         status="live",
         target_kind="storm_fort",
         default_quota=5,
-        priority=20,
-        campaign_priority=2,
+        priority=34,
+        campaign_priority=3,
     ),
     ModeSpec(
         id="nomad_camps",
