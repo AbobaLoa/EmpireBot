@@ -1616,6 +1616,7 @@ class PackHudAndLeftoverTravelTests(unittest.TestCase):
         engine._execute_formation_attack = Mock(return_value="baron")
         engine._recenter_after_pack_send = Mock()
         engine._pack_hud_matches_world = Mock(return_value=True)
+        engine._wait_for = Mock(return_value=None)
 
         def tap_green(*_args: float) -> None:
             engine._pack_finished = True
