@@ -3893,7 +3893,12 @@ class BlueStacksEngine(WorldSwitchMixin):
 
     def _pack_dismiss_overlay(self, image: Any) -> bool:
         """Close inbox/taxes parchment. Never the nav list. Never ruby/+. Never the map HUD."""
-        if is_travel_dialog(image) or is_formation_screen(image) or self._picker_overlay_open(image):
+        if (
+            is_travel_dialog(image)
+            or is_formation_screen(image)
+            or is_start_attack_gate(image)
+            or self._picker_overlay_open(image)
+        ):
             return False
         if is_map_screen(image) and not is_info_plaque(image) and not is_inbox_screen(image):
             return False

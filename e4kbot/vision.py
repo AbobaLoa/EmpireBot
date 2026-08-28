@@ -813,18 +813,21 @@ def choose_nearest_main_castle(
     return min(ranked, key=lambda item: item[0])[1]
 
 
-_BGR_CACHE: tuple[int, np.ndarray] | None = None
+_BGR_CACHE: tuple[tuple[Any, ...], np.ndarray] | None = None
 
 
 def _reference_bgr(image: Image.Image) -> np.ndarray:
     global _BGR_CACHE
-    key = id(image)
-    if _BGR_CACHE is not None and _BGR_CACHE[0] == key:
-        return _BGR_CACHE[1]
     rgb = np.asarray(image.convert("RGB"))
+    step_y = max(1, rgb.shape[0] // 8)
+    step_x = max(1, rgb.shape[1] // 8)
+    sample = rgb[::step_y, ::step_x]
+    fingerprint = (rgb.shape, int(sample.sum()))
+    if _BGR_CACHE is not None and _BGR_CACHE[0] == fingerprint:
+        return _BGR_CACHE[1]
     bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     resized = cv2.resize(bgr, REFERENCE_SIZE, interpolation=cv2.INTER_AREA)
-    _BGR_CACHE = (key, resized)
+    _BGR_CACHE = (fingerprint, resized)
     return resized
 
 
@@ -994,7 +997,9 @@ def is_start_attack_gate(image: Image.Image) -> bool:
     )
     if any(token in text for token in markers):
         return True
-    return _center_parchment_ratio(image) > 0.10 and find_formation_attack_button(image) is None
+    # Seals + parchment are enough. The gold footer matcher false-positives on grass,
+    # and the real plan is already excluded via is_formation_screen (wave header).
+    return _center_parchment_ratio(image) > 0.10
 
 
 def is_travel_dialog(image: Image.Image) -> bool:

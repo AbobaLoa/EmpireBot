@@ -462,7 +462,9 @@ class VisionTests(unittest.TestCase):
         engine.tap_rel = Mock()
         engine._dismiss_empty_wave_warning = Mock(return_value=False)
         engine._dismiss_no_commanders = Mock(return_value=False)
+        engine.layout = {"buttons": {"center_flank": [0.50, 0.50]}}
         engine._prepare_single_center_wave = Mock(return_value=(True, ""))
+        engine._prepare_waves_for_kind = Mock(return_value=(True, ""))
         engine._speed_burst_active = Mock(return_value=True)
         engine._last_picker_fill = None
         engine._picker_stall_count = 0
